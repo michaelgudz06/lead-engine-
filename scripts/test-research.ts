@@ -25,6 +25,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { runLimitMessage, startRun } from "../src/app/api/_lib/api";
 import { claudeModelInfo, defineTool, generateObject, runToolAgent } from "../src/lib/claude";
 import type { LinkedInProfile } from "../src/lib/providers/linkedin";
 import { listEvents } from "../src/lib/repo/events";
@@ -697,8 +698,10 @@ async function fullRun(url: string): Promise<void> {
     leadId = err.existingId;
     console.log(`lead already exists: ${leadId} (re-running research)`);
   }
-  if (!(await claimResearch(leadId))) {
-    console.log("Research is already running for this lead (claimed less than 15 minutes ago). Try again later.");
+  // A run slot under the shared hourly and daily caps (le_run_starts), then the claim, as the API does.
+  const start = await startRun(leadId, "research");
+  if (!start.ok) {
+    console.log(start.reason === "limit" ? runLimitMessage(start.window, start.limits) : "Research is already running for this lead (claimed less than 15 minutes ago). Try again later.");
     return;
   }
   const t = Date.now();
@@ -710,8 +713,9 @@ async function fullRun(url: string): Promise<void> {
 
 async function steerRun(leadId: string, instruction: string): Promise<void> {
   console.log(`\n== steerLead ${leadId} ==`);
-  if (!(await claimResearch(leadId))) {
-    console.log("Research is already running for this lead.");
+  const start = await startRun(leadId, "steer");
+  if (!start.ok) {
+    console.log(start.reason === "limit" ? runLimitMessage(start.window, start.limits) : "Research is already running for this lead.");
     return;
   }
   const t = Date.now();

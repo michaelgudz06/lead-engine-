@@ -193,24 +193,38 @@ export interface RunLimits {
   perDay: number;
 }
 
-export type RunWindow = "hour" | "day";
+/** Which cap refused a run: the last hour, the last 24 hours, or both at once. */
+export type RunWindow = "hour" | "day" | "both";
 
-function positiveInt(value: string | undefined, fallback: number): number {
+/** A whole number of 0 or more (0 pauses runs), else the fallback. */
+function wholeNumber(value: string | undefined, fallback: number): number {
   if (!value || !/^\d+$/.test(value)) return fallback;
   const n = Number(value);
-  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+  return Number.isSafeInteger(n) ? n : fallback;
 }
 
-/** The caps in force: RUN_LIMIT_PER_HOUR and RUN_LIMIT_PER_DAY when set to a whole number above 0, else the defaults. */
+/**
+ * The caps in force: RUN_LIMIT_PER_HOUR and RUN_LIMIT_PER_DAY when set to a whole number
+ * (0 pauses all runs; new leads are still saved), else the defaults.
+ */
 export function runLimits(): RunLimits {
   return {
-    perHour: positiveInt(optionalEnv("RUN_LIMIT_PER_HOUR"), DEFAULT_RUNS_PER_HOUR),
-    perDay: positiveInt(optionalEnv("RUN_LIMIT_PER_DAY"), DEFAULT_RUNS_PER_DAY),
+    perHour: wholeNumber(optionalEnv("RUN_LIMIT_PER_HOUR"), DEFAULT_RUNS_PER_HOUR),
+    perDay: wholeNumber(optionalEnv("RUN_LIMIT_PER_DAY"), DEFAULT_RUNS_PER_DAY),
   };
+}
+
+/** A limit set to 0 is a pause, not a busy hour: waiting will not help, so say so. */
+function paused(window: RunWindow, limits: RunLimits): boolean {
+  return (window !== "day" && limits.perHour === 0) || (window !== "hour" && limits.perDay === 0);
 }
 
 /** The 429 message for a full window. */
 export function runLimitMessage(window: RunWindow, limits: RunLimits): string {
+  if (paused(window, limits)) return "Research runs are paused on this server (a run limit is set to 0).";
+  if (window === "both") {
+    return `Too many research runs in the last hour and the last 24 hours (the limits are ${limits.perHour} and ${limits.perDay}). Try again later.`;
+  }
   return window === "hour"
     ? `Too many research runs in the last hour (the limit is ${limits.perHour}). Try again later.`
     : `Too many research runs in the last 24 hours (the limit is ${limits.perDay}). Try again later.`;
@@ -218,8 +232,11 @@ export function runLimitMessage(window: RunWindow, limits: RunLimits): string {
 
 /** Why a new lead was saved without a run, for its activity log. */
 export function runLimitEvent(window: RunWindow, limits: RunLimits): string {
-  const limit = window === "hour" ? `${limits.perHour} research runs an hour` : `${limits.perDay} research runs a day`;
-  return `Research did not start: the limit of ${limit} was reached. Run it from this page later.`;
+  if (paused(window, limits)) return "Research did not start: research runs are paused on this server. Run it from this page later.";
+  const hour = `${limits.perHour} research runs an hour`;
+  const day = `${limits.perDay} research runs a day`;
+  const limit = window === "both" ? `limits of ${hour} and ${day} were` : `limit of ${window === "hour" ? hour : day} was`;
+  return `Research did not start: the ${limit} reached. Run it from this page later.`;
 }
 
 /** Any fixed number, the same everywhere: the advisory lock that puts reservations in a queue. */
@@ -247,7 +264,7 @@ export async function reserveRun(leadId: string, kind: "research" | "steer"): Pr
           where created_at > now() - interval '24 hours'
        ), taken as (
          insert into le_run_starts (lead_id, kind)
-         select $1::uuid, $2::text from counts where hour < $3 and day < $4
+         select $1::uuid, $2::text from counts where hour < $3::bigint and day < $4::bigint
          returning id
        )
        select (select id::text from taken) as id, hour, day from counts`,
@@ -256,7 +273,9 @@ export async function reserveRun(leadId: string, kind: "research" | "steer"): Pr
   ]);
   const row = (rows as Array<{ id: string | null; hour: number; day: number }>)[0];
   if (row?.id) return { ok: true, id: row.id };
-  return { ok: false, window: (row?.hour ?? 0) >= limits.perHour ? "hour" : "day", limits };
+  const hourFull = (row?.hour ?? 0) >= limits.perHour;
+  const dayFull = (row?.day ?? 0) >= limits.perDay;
+  return { ok: false, window: hourFull && dayFull ? "both" : hourFull ? "hour" : "day", limits };
 }
 
 /** Gives a slot back when its run did not start after all (the lead was busy or gone). Never throws. */

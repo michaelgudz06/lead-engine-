@@ -372,7 +372,9 @@ async function testProxy(): Promise<void> {
 async function testRoutes(): Promise<void> {
   section("3. routes (Neon)");
   restoreEnv();
-  setEnv({ APP_PASSWORD: undefined, HUBSPOT_ACCESS_TOKEN: undefined });
+  // The run caps share le_run_starts with the live app: limits far above any real count
+  // keep a busy day there from failing these checks (section 5 tests the caps themselves).
+  setEnv({ APP_PASSWORD: undefined, HUBSPOT_ACCESS_TOKEN: undefined, RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "100000" });
 
   check("research routes allow 300 s", leadsRoute.maxDuration === 300 && researchRoute.maxDuration === 300 && steerRoute.maxDuration === 300);
 
@@ -960,13 +962,28 @@ async function testRunGuards(): Promise<void> {
   );
   setEnv({ RUN_LIMIT_PER_HOUR: "5", RUN_LIMIT_PER_DAY: "40" });
   check("run limits read RUN_LIMIT_PER_HOUR and RUN_LIMIT_PER_DAY", runLimits().perHour === 5 && runLimits().perDay === 40, runLimits());
-  for (const bad of ["0", "-3", "1.5", "abc", "1e3", "  "]) {
+  for (const bad of ["-3", "1.5", "abc", "1e3", "  ", "99999999999999999999"]) {
     setEnv({ RUN_LIMIT_PER_HOUR: bad, RUN_LIMIT_PER_DAY: bad });
     const l = runLimits();
     check(`run limit "${bad}" falls back to the defaults`, l.perHour === DEFAULT_RUNS_PER_HOUR && l.perDay === DEFAULT_RUNS_PER_DAY, l);
   }
-  setEnv({ RUN_LIMIT_PER_HOUR: undefined, RUN_LIMIT_PER_DAY: undefined });
-  check("429 messages name the window and the limit", /last hour \(the limit is 20\)/.test(runLimitMessage("hour", defaults)) && /last 24 hours \(the limit is 25\)/.test(runLimitMessage("day", defaults)));
+  setEnv({ RUN_LIMIT_PER_HOUR: "0", RUN_LIMIT_PER_DAY: "3000000000" });
+  check("run limit 0 is kept (it pauses runs), and a limit past 32 bits is kept", runLimits().perHour === 0 && runLimits().perDay === 3_000_000_000, runLimits());
+  check(
+    "429 messages name the window and the limit",
+    /last hour \(the limit is 20\)/.test(runLimitMessage("hour", defaults)) &&
+      /last 24 hours \(the limit is 25\)/.test(runLimitMessage("day", defaults)) &&
+      /last hour and the last 24 hours \(the limits are 20 and 25\)/.test(runLimitMessage("both", defaults)),
+  );
+  check(
+    "a limit of 0 reads as paused, in the 429 and in the new-lead event",
+    /paused/.test(runLimitMessage("hour", { perHour: 0, perDay: 25 })) &&
+      /paused/.test(runLimitMessage("both", { perHour: 20, perDay: 0 })) &&
+      /paused/.test(runLimitEvent("day", { perHour: 20, perDay: 0 })) &&
+      !/paused/.test(runLimitMessage("hour", { perHour: 20, perDay: 0 })),
+  );
+  // Limits far above any real count for the rest of this section, except where a check sets its own.
+  setEnv({ RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "100000" });
 
   const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
   check("stale window is 6 minutes", STALE_RUN_MS === 6 * 60_000);
@@ -1134,6 +1151,31 @@ async function testRunGuards(): Promise<void> {
       burst.map((r) => r.status),
     );
 
+    // Both windows full: the reply names both limits.
+    await query("insert into le_run_starts (lead_id, kind) values ($1::uuid, 'research')", [bid]);
+    c = await counts();
+    setEnv({ RUN_LIMIT_PER_HOUR: String(c.hour), RUN_LIMIT_PER_DAY: String(c.day) });
+    limits = runLimits();
+    const both = await callRoute(research, { method: "POST", path: `/api/leads/${did}/research`, id: did });
+    check("cap: with both windows full the 429 names both limits", both.status === 429 && both.data?.error === runLimitMessage("both", limits), both.data);
+
+    // A limit of 0 pauses runs: 429 that says so, and a new lead is saved with an event saying so.
+    setEnv({ RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "0" });
+    limits = runLimits();
+    const pausedRun = await callRoute(research, { method: "POST", path: `/api/leads/${did}/research`, id: did });
+    check("cap: RUN_LIMIT_PER_DAY=0 pauses runs (429, says paused)", pausedRun.status === 429 && /paused/.test(String(pausedRun.data?.error)), pausedRun.data);
+    const pausedLead = await createWithoutRun();
+    check(
+      "cap: while paused a new lead is saved, with an event that says runs are paused",
+      pausedLead.res.status === 201 && pausedLead.events.some((e) => e.type === "error" && e.message === runLimitEvent("day", limits)),
+      pausedLead.events.map((e) => `${e.type}: ${e.message}`),
+    );
+
+    // A limit past 32 bits still binds in SQL (compared as bigint), so runs start normally.
+    setEnv({ RUN_LIMIT_PER_HOUR: "3000000000", RUN_LIMIT_PER_DAY: "3000000000" });
+    const huge = await callRoute(research, { method: "POST", path: `/api/leads/${did}/research`, id: did });
+    check("cap: a limit of 3,000,000,000 works (202, not a database error)", huge.status === 202, huge.data);
+
     // A claim that fails gives its slot back; deleting the lead does not.
     setEnv({ RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "100000" });
     const kid = await tempLead();
@@ -1168,8 +1210,12 @@ async function main(): Promise<void> {
     globalThis.fetch = realFetch;
     // The tests' run slots: without this they would count against the real caps for a day.
     if (runLeadIds.size) {
-      const removed = await query("delete from le_run_starts where lead_id = any($1::uuid[]) returning id", [[...runLeadIds]]).catch(() => []);
-      console.log(`  (removed ${removed.length} run slots taken by the tests)`);
+      try {
+        const removed = await query("delete from le_run_starts where lead_id = any($1::uuid[]) returning id", [[...runLeadIds]]);
+        console.log(`  (removed ${removed.length} run slots taken by the tests)`);
+      } catch (err) {
+        check("remove the run slots taken by the tests", false, err instanceof Error ? err.message : String(err));
+      }
     }
   }
   console.log(`\n${passed} passed, ${failed} failed in ${((Date.now() - started) / 1000).toFixed(1)} s (after() tasks recorded, never run: ${afterTasks.length})`);

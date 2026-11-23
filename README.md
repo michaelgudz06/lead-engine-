@@ -105,6 +105,8 @@ A research run costs about $0.15 and reads LinkedIn 4 times, so the daily defaul
 LinkedIn near 100 reads a day and spend near $4. Each slot is taken in one transaction
 (`le_run_starts`), so a burst of requests cannot get past the caps, and deleting leads
 does not give runs back. Over a cap, the API answers 429 and a new lead is saved without a run.
+Set either limit to 0 to pause all runs. Runs started from `scripts/test-research.ts --full`
+or `--steer` count toward the same caps.
 
 Vercel's Hobby plan is for non-commercial use. It is fine for a prototype; move the
 project to a team on a paid plan for real company use.

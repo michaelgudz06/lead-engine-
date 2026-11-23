@@ -4,13 +4,13 @@ import { finishResearch, getLead } from "../repo/leads";
 import { getSettings } from "../repo/settings";
 import { DEFAULT_SETTINGS, type Settings } from "../types";
 import { runGapFill } from "./agent";
-import { note, step } from "./context";
+import { LeadGoneError, note, step } from "./context";
 import { extract } from "./extract";
 import { writeVerifySave } from "./finish";
 import { gather } from "./gather";
 import { identify } from "./identify";
 import { steer } from "./steer";
-import { Deadline, errorMessage, truncate } from "./util";
+import { Deadline, errorMessage, runBudget, truncate } from "./util";
 
 /**
  * The research agent. CONTRACT: these two exports are what the API routes call
@@ -62,10 +62,11 @@ async function finish(leadId: string, started: number, failure?: unknown): Promi
 export async function runResearch(leadId: string): Promise<void> {
   const started = Date.now();
   try {
-    const deadline = new Deadline(RUN_BUDGET_MS);
     const lead = await getLead(leadId);
     // Nothing to record against: the lead was deleted (or the id is wrong) between the claim and this call.
     if (!lead) return;
+    // The platform's 300 s started at the request; count what was spent before this call.
+    const deadline = new Deadline(runBudget(RUN_BUDGET_MS, lead.researchStartedAt));
 
     await step(leadId, "Starting research");
     const settings = await loadSettings(leadId);
@@ -100,6 +101,8 @@ export async function runResearch(leadId: string): Promise<void> {
       },
     );
   } catch (err) {
+    // Deleted mid-run: stop quietly, there is no row to record the outcome on.
+    if (err instanceof LeadGoneError) return;
     await finish(leadId, started, err);
   }
 }
@@ -112,9 +115,9 @@ export async function runResearch(leadId: string): Promise<void> {
 export async function steerLead(leadId: string, instruction: string): Promise<void> {
   const started = Date.now();
   try {
-    const deadline = new Deadline(RUN_BUDGET_MS);
     const lead = await getLead(leadId);
     if (!lead) return;
+    const deadline = new Deadline(runBudget(RUN_BUDGET_MS, lead.researchStartedAt));
     const settings = await loadSettings(leadId);
 
     const outcome = await steer(lead, settings, String(instruction ?? ""), deadline);
@@ -129,6 +132,8 @@ export async function steerLead(leadId: string, instruction: string): Promise<vo
       { mode: outcome.mode, newFindings: outcome.added },
     );
   } catch (err) {
+    // Deleted mid-run: stop quietly, there is no row to record the outcome on.
+    if (err instanceof LeadGoneError) return;
     await finish(leadId, started, err);
   }
 }

@@ -4,11 +4,22 @@ import { useState } from "react";
 import { ApiError, errorMessage, login } from "@/lib/api-client";
 import { Button, Label, Notice } from "@/components/ui";
 
-/** Only same-site paths are accepted, so `?next=` cannot send anyone to another site. */
+/**
+ * Only paths on this site are accepted, so `?next=` cannot send anyone to another site.
+ * The browser drops tabs and newlines when it resolves a URL ("/\t/evil.example" becomes
+ * "//evil.example"), so the value is resolved the same way and its origin compared.
+ */
 function safeNext(): string {
   const next = new URLSearchParams(window.location.search).get("next");
-  if (!next || !next.startsWith("/") || next.startsWith("//") || next.includes("\\") || next.startsWith("/login")) return "/";
-  return next;
+  if (!next || !next.startsWith("/") || /[\u0000-\u001f\u007f\\]/.test(next)) return "/";
+  try {
+    const origin = window.location.origin;
+    const url = new URL(next, origin);
+    if (url.origin !== origin || url.pathname.startsWith("/login")) return "/";
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return "/";
+  }
 }
 
 export default function LoginPage() {

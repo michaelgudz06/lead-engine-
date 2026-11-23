@@ -186,10 +186,13 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
   if (person.domain) patch.companyDomain = person.domain;
   // An address found on a rejected variant of the domain (jane@amazon.de for amazon.com) was
   // derived from the wrong site: clear it so the email lookup runs again with the right one.
-  const staleEmail = emailOnStaleDomain(lead.email, lead.companyDomain, person.domain);
+  // Only an address that came from a lookup (it has a confidence): one the teammate typed by
+  // hand has none, and is never replaced.
+  const staleEmail = lead.emailConfidence != null && emailOnStaleDomain(lead.email, lead.companyDomain, person.domain);
   if (staleEmail) {
     patch.email = null;
     patch.emailConfidence = null;
+    await note(leadId, "tool", `Email ${lead.email} was found on ${lead.companyDomain}; looking it up again for ${person.domain}`);
   }
   if (apolloPerson?.email && (!lead.email || staleEmail)) {
     patch.email = apolloPerson.email;

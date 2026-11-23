@@ -204,5 +204,6 @@ export function sameCompanyName(a: string | null | undefined, b: string | null |
   if (!x || !y) return false;
   if (x === y) return true;
   const [short, long] = x.length <= y.length ? [x, y] : [y, x];
-  return short.length >= 4 && long.includes(short);
+  // A prefix, not any substring: "CFDT Transports Amazon" is not Amazon.
+  return short.length >= 4 && long.startsWith(short);
 }

@@ -64,7 +64,8 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
 
   const emailOk = !form.senderEmail.trim() || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.senderEmail.trim());
   const calendlyOk = !form.calendlyUrl.trim() || /^https?:\/\/\S+\.\S+/i.test(form.calendlyUrl.trim());
-  const daysOk = Number.isInteger(form.followUpDays) && form.followUpDays >= 1 && form.followUpDays <= 60;
+  // Same range as PUT /api/settings.
+  const daysOk = Number.isInteger(form.followUpDays) && form.followUpDays >= 1 && form.followUpDays <= 30;
   const valid = emailOk && calendlyOk && daysOk;
 
   async function onSubmit(e: React.FormEvent) {
@@ -126,7 +127,7 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
                 id="followUpDays"
                 type="number"
                 min={1}
-                max={60}
+                max={30}
                 step={1}
                 className="field w-24"
                 value={Number.isFinite(form.followUpDays) ? form.followUpDays : ""}
@@ -135,7 +136,7 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
               />
               <span className="text-quiet">days after a message is marked as sent</span>
             </div>
-            {!daysOk && <p className="mt-1.5 text-[13px] text-danger">Use a whole number from 1 to 60.</p>}
+            {!daysOk && <p className="mt-1.5 text-[13px] text-danger">Use a whole number from 1 to 30.</p>}
           </div>
         </div>
       </Section>

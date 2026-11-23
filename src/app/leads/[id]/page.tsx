@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, startResearch, steerLead, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
 import { nextAction } from "@/lib/next-action";
 import type { Finding, Lead, LeadDetail } from "@/lib/types";
-import { formatDate, formatDateTime, fromDateInput, hostOf, leadName, safeUrl, titleAtCompany, toDateInput } from "@/components/format";
+import { formatDate, formatDateTime, fromDateInput, hostOf, isRunning, leadName, safeUrl, settleLostRun, titleAtCompany, toDateInput } from "@/components/format";
 import { AnglesSection } from "@/components/lead/angles";
 import { Panel } from "@/components/lead/panel";
 import { ActivitySection, BriefSection, CompanySection, FindingsSection, PendingPanel, ResearchProgress } from "@/components/lead/sections";
@@ -19,7 +19,8 @@ export default function LeadPage() {
   const params = useParams<{ id: string }>();
   const id = typeof params?.id === "string" ? params.id : "";
 
-  // Poll every 2 seconds while research runs so progress shows live.
+  // Poll every 2 seconds while research runs so progress shows live. A lost run
+  // (see isRunning) never finishes, so polling stops for it.
   const { data, error, loading, reload, setData } = useLoad<Loaded>(
     async () => {
       try {
@@ -29,7 +30,7 @@ export default function LeadPage() {
         throw err;
       }
     },
-    (d) => (d && d !== "missing" && d.lead.researchStatus === "running" ? 2000 : null),
+    (d) => (d && d !== "missing" && isRunning(d.lead) ? 2000 : null),
   );
 
   if (loading) return <PageSkeleton />;
@@ -47,7 +48,10 @@ export default function LeadPage() {
 function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetail; refreshError: string | null; reload: () => Promise<void>; setLead: (lead: Lead) => void }) {
   const { lead, findings, events } = detail;
   const router = useRouter();
-  const running = lead.researchStatus === "running";
+  const running = isRunning(lead);
+  // A run that never finished (server time limit or restart) is a failed run: it can be retried.
+  const lost = lead.researchStatus === "running" && !running;
+  const failed = lead.researchStatus === "error" || lost;
 
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
@@ -152,7 +156,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   const linkedin = safeUrl(lead.linkedinUrl);
   const companyUrl = lead.companyDomain ? safeUrl(`https://${lead.companyDomain.replace(/^https?:\/\//, "")}`) : null;
   const xHandle = lead.xHandle?.replace(/^@/, "").trim();
-  const action = nextAction(lead);
+  const action = nextAction(settleLostRun(lead));
   const hasResearch = Boolean(lead.brief || lead.companyPicture || lead.angles.length > 0);
 
   return (
@@ -178,7 +182,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
                 <a href={`mailto:${lead.email}`} className="text-link underline-offset-2 hover:underline">
                   {lead.email}
                 </a>
-                {typeof lead.emailConfidence === "number" && <span className="text-quiet"> · {Math.round(lead.emailConfidence <= 1 ? lead.emailConfidence * 100 : lead.emailConfidence)}% sure</span>}
+                {typeof lead.emailConfidence === "number" && <span className="text-quiet"> · {Math.round(lead.emailConfidence)}% sure</span>}
               </span>
             )}
             {xHandle && <ExternalLink href={`https://x.com/${encodeURIComponent(xHandle)}`}>@{xHandle} ↗</ExternalLink>}
@@ -187,7 +191,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={rerun} busy={starting} disabledReason={running ? "Research is already running." : null}>
-            {hasResearch || lead.researchStatus === "error" ? "Re-run research" : "Run research"}
+            {hasResearch || failed ? "Re-run research" : "Run research"}
           </Button>
           <Button onClick={hubspot} busy={pushing} disabledReason={hubspotReason} tipEnd>
             Push to HubSpot
@@ -202,9 +206,10 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         {actionError && <Notice>{actionError}</Notice>}
         {notice && <Notice tone="success">{notice}</Notice>}
         {refreshError && <Notice>Live updates paused: {refreshError} Retrying…</Notice>}
-        {lead.researchStatus === "error" && (
+        {failed && (
           <Notice action={<Button size="sm" onClick={rerun} busy={starting}>Retry research</Button>}>
-            <span className="font-medium">Research failed.</span> {lead.researchError || "The agent stopped before it finished."}
+            <span className="font-medium">Research failed.</span>{" "}
+            {lost ? "It stopped before it finished (server time limit or restart)." : lead.researchError || "The agent stopped before it finished."}
           </Notice>
         )}
       </div>
@@ -213,7 +218,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         <div className="min-w-0 space-y-6">
           {running && <ResearchProgress lead={lead} events={events} />}
 
-          {!running && !hasResearch && lead.researchStatus !== "error" && (
+          {!running && !hasResearch && !failed && (
             <div className="card px-5 py-8 text-center">
               <h2 className="font-serif text-[21px]">No research yet</h2>
               <p className="mx-auto mt-1.5 max-w-md text-quiet">Run research to get a sourced brief, a picture of the company and drafted outreach.</p>

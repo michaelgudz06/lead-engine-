@@ -4,7 +4,7 @@ import "server-only";
  * Typed access to environment variables. Server-only: importing this from a
  * client component fails the build, so no key can reach the browser bundle.
  */
-const KEYS = [
+export const KEYS = [
   "DATABASE_URL",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_MODEL",

@@ -53,6 +53,10 @@ export interface HubspotResult {
 // Requests only read or write our own database, so they are quick. Research itself
 // runs in the background after the response, which is why 30 s is generous.
 const TIMEOUT_MS = 30_000;
+// The HubSpot push is the exception: the server gives it up to 45 s of HubSpot calls
+// inside a 60 s function limit. Stopping sooner would report a push that went through
+// as failed, and a retry would log a second note.
+const HUBSPOT_TIMEOUT_MS = 65_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -65,9 +69,9 @@ function statusMessage(status: number): string {
   return `Request failed (${status}).`;
 }
 
-async function request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+async function request<T>(path: string, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(path, {
@@ -174,7 +178,7 @@ export async function logEvent(id: string, type: "copied" | "note", message: str
 }
 
 export async function pushToHubspot(id: string): Promise<HubspotResult> {
-  return request<HubspotResult>(`/api/leads/${enc(id)}/hubspot`, { method: "POST" });
+  return request<HubspotResult>(`/api/leads/${enc(id)}/hubspot`, { method: "POST", timeoutMs: HUBSPOT_TIMEOUT_MS });
 }
 
 function settingsFrom(data: unknown): Settings {

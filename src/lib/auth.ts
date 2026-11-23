@@ -4,7 +4,8 @@ import { optionalEnv } from "./env";
 /**
  * The access gate: one shared team password, no user accounts (BUILD_SPEC 8b).
  *
- * - The gate is on exactly when APP_PASSWORD is set. Local dev leaves it unset.
+ * - The gate is on exactly when APP_PASSWORD is set. Local dev leaves it unset; on
+ *   Vercel (VERCEL=1) the proxy then refuses every request with 503 instead.
  * - A login sets `le_session`, a token signed with HMAC-SHA256 under SESSION_SECRET.
  * - Only Web Crypto and other Web APIs are used, so this module runs unchanged in
  *   the proxy (src/proxy.ts), in route handlers and in plain Node scripts.
@@ -28,7 +29,7 @@ const MAX_PASSWORD_LENGTH = 1024;
 const TOKEN_RE = /^v1\.(\d{12,15})\.([A-Za-z0-9_-]{43})$/;
 const encoder = new TextEncoder();
 
-/** True when the app requires the team password (APP_PASSWORD is set). */
+/** True when the app requires the team password (APP_PASSWORD is set). When false, see the Vercel lock in src/proxy.ts. */
 export function authEnabled(): boolean {
   return optionalEnv("APP_PASSWORD") !== undefined;
 }

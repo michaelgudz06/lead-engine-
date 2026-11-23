@@ -8,6 +8,8 @@ import {
   definedOnly,
   errorText,
   fail,
+  failStaleRun,
+  isStaleRun,
   json,
   leadIdFrom,
   leadNotFound,
@@ -74,7 +76,14 @@ export async function GET(_request: NextRequest, ctx: LeadRouteContext) {
     // One round trip of wall time: the id is a valid UUID, so the list queries are safe to start blind.
     const [lead, findings, events] = await Promise.all([getLead(id), listFindings(id), listEvents(id)]);
     if (!lead) return leadNotFound();
-    const detail: LeadDetail = { lead, findings, events };
+    let detail: LeadDetail = { lead, findings, events };
+    // A run that outlived its function was lost: fail it now, so the page stops polling and
+    // can retry. Re-read so this reply (the last one the page polls) shows the error event.
+    if (isStaleRun(lead) && (await failStaleRun(id))) {
+      const [fresh, freshEvents] = await Promise.all([getLead(id), listEvents(id)]);
+      if (!fresh) return leadNotFound();
+      detail = { lead: fresh, findings, events: freshEvents };
+    }
     return json(detail);
   } catch (err) {
     return serverError("GET /api/leads/[id]", err);

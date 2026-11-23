@@ -17,7 +17,7 @@ import { findXHandle, getXPosts, xStatus, type XPost } from "../providers/xsearc
 import { addUsage, updateLead } from "../repo/leads";
 import { attempt, isConfigured, note, raw, step, type RunContext } from "./context";
 import { sameCompanyName } from "./domain";
-import { cleanXHandle, compact, isoDateMonthsAgo, normaliseName, uniqueBy, urlKey } from "./util";
+import { cleanXHandle, compact, emailScore, isoDateMonthsAgo, normaliseName, uniqueBy, urlKey } from "./util";
 
 /**
  * Step 2: collect raw material from every source, in parallel. Each source is
@@ -70,7 +70,10 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
   await step(leadId, "Searching LinkedIn, the web, Hugging Face and X");
 
   const budget = deadline.budget(GATHER_CAP_MS, RESERVE_AFTER_GATHER_MS);
-  const within = (ms: number) => Math.min(ms, budget);
+  // One clock for the whole phase: a call that starts late (job postings after the company
+  // lookup) only gets what is left, so sequential calls cannot add up past the budget.
+  const endsAt = Date.now() + budget;
+  const within = (ms: number) => Math.max(0, Math.min(ms, endsAt - Date.now()));
   const searchName = person.name;
   const count = (delta: Record<string, number>) => addUsage(leadId, delta).catch(() => undefined);
 
@@ -233,12 +236,11 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
   // Contact details go on the lead as soon as they are known.
   try {
     if (out.email && !ctx.lead.email) {
-      const score = out.email.score;
       ctx.lead =
         (await updateLead(leadId, {
           email: out.email.email,
           // le_leads.email_confidence is an integer 0..100 (Hunter's score scale).
-          emailConfidence: score == null ? null : Math.round(score <= 1 ? score * 100 : score),
+          emailConfidence: emailScore(out.email.score),
         })) ?? ctx.lead;
     }
     if (out.x?.handle && ctx.lead.xHandle !== out.x.handle) {
@@ -268,13 +270,13 @@ export function matchHubAccounts(
       .slice(0, 1)
       .map((a) => ({ ...a, matched: kind }));
   }
-  // The company's own account: the id is its name, or an organisation carries its name. A user
-  // who merely calls themselves "Amazon" only counts when there is nothing better.
-  const own = accounts.filter((a) => idOf(a) === want || (a.type === "org" && fullOf(a) === want));
-  const exact = own.length ? own : accounts.filter((a) => fullOf(a) === want);
+  // A company is matched only among organisations: anyone can name a personal account
+  // "Amazon", and its models would then be attributed to the company.
+  const orgs = accounts.filter((a) => a.type === "org");
+  const exact = orgs.filter((a) => idOf(a) === want || fullOf(a) === want);
   // Prefix matches ("amazon-sagemaker-community" for "Amazon") are other teams or communities
-  // more often than the company: use them only when no account carries the exact name.
-  const loose = exact.length ? [] : accounts.filter((a) => want.length >= 5 && (idOf(a).startsWith(want) || fullOf(a).startsWith(want)));
+  // more often than the company: use them only when no organisation carries the exact name.
+  const loose = exact.length ? [] : orgs.filter((a) => want.length >= 5 && (idOf(a).startsWith(want) || fullOf(a).startsWith(want)));
   return [...exact, ...loose].slice(0, 2).map((a) => ({ ...a, matched: kind }));
 }
 

@@ -133,6 +133,9 @@ async function recordUsage(leadId: string | null | undefined, usage: ClaudeUsage
   }
 }
 
+/** Below this much time left, a (second) attempt is not started. */
+const MIN_ATTEMPT_MS = 3_000;
+
 export interface GenerateObjectOptions<S extends z.ZodType> {
   /** Usage is added to this lead's counters. Omit for calls that belong to no lead. */
   leadId?: string | null;
@@ -143,6 +146,7 @@ export interface GenerateObjectOptions<S extends z.ZodType> {
   /** zod v4 schema. Avoid numeric/string length constraints: the API ignores them and the SDK then enforces them client-side. */
   schema: S;
   maxTokens?: number;
+  /** Wall-clock limit for the whole call, retries included. */
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -158,7 +162,14 @@ export async function generateObject<S extends z.ZodType>(opts: GenerateObjectOp
   let maxTokens = Math.min(opts.maxTokens ?? DEFAULT_MAX_TOKENS, MAX_TOKENS_CEILING);
   let lastError: ClaudeError | null = null;
 
+  // timeoutMs covers the whole call: the SDK's own retry and the larger second attempt
+  // included. The SDK's `timeout` option is per HTTP attempt, so the cap is an abort signal.
+  const stopAt = Date.now() + timeoutMs;
+
   for (let attempt = 0; attempt < 2; attempt++) {
+    const left = stopAt - Date.now();
+    if (left < MIN_ATTEMPT_MS) throw lastError ?? new ClaudeError("timeout", `${label}: timed out`);
+    const cap = AbortSignal.timeout(left);
     let message;
     try {
       message = await anthropic().messages.parse(
@@ -169,7 +180,7 @@ export async function generateObject<S extends z.ZodType>(opts: GenerateObjectOp
           messages: [{ role: "user", content: prompt }],
           output_config: { effort: CLAUDE_EFFORT, format: zodOutputFormat(schema) },
         },
-        { timeout: timeoutMs, signal },
+        { timeout: left, signal: signal ? AbortSignal.any([signal, cap]) : cap },
       );
     } catch (err) {
       const mapped = toClaudeError(err, label);

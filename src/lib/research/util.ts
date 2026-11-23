@@ -67,6 +67,21 @@ export class Deadline {
   }
 }
 
+/** Time spent before the run started (between the claim and the pipeline) that is charged to the run, at most. */
+const MAX_CHARGED_HEAD_START_MS = 30_000;
+
+/**
+ * The run's time budget, less the time already spent since research was claimed
+ * (`researchStartedAt`). The platform's clock starts at the request, not when the
+ * pipeline starts. Capped, so a stale or skewed timestamp cannot starve the run. Pure.
+ */
+export function runBudget(totalMs: number, startedAt: string | null | undefined, now: number = Date.now()): number {
+  const started = startedAt ? Date.parse(startedAt) : NaN;
+  if (!Number.isFinite(started)) return totalMs;
+  const spent = Math.max(0, Math.min(MAX_CHARGED_HEAD_START_MS, now - started));
+  return totalMs - spent;
+}
+
 export function truncate(text: string | null | undefined, max: number): string {
   const t = (text ?? "").replace(/\s+\n/g, "\n").trim();
   if (t.length <= max) return t;
@@ -76,6 +91,12 @@ export function truncate(text: string | null | undefined, max: number): string {
 export function clamp01(n: unknown, fallback: number): number {
   const v = typeof n === "number" && Number.isFinite(n) ? n : fallback;
   return Math.max(0, Math.min(1, v));
+}
+
+/** An email confidence as stored and shown: an integer 0 to 100 (Hunter's scale), or null when unknown. Never a fraction. */
+export function emailScore(score: unknown): number | null {
+  if (typeof score !== "number" || !Number.isFinite(score)) return null;
+  return Math.max(0, Math.min(100, Math.round(score)));
 }
 
 export function wordCount(text: string): number {

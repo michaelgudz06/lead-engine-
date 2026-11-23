@@ -3,7 +3,8 @@ import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { query } from "@/lib/db";
 import { addEvent } from "@/lib/repo/events";
-import { finishResearch } from "@/lib/repo/leads";
+import { failStaleResearch, finishResearch } from "@/lib/repo/leads";
+import type { Lead } from "@/lib/types";
 
 /**
  * Shared plumbing for the route handlers in src/app/api. The leading underscore
@@ -61,6 +62,11 @@ export async function readJson<S extends z.ZodType>(request: Request, schema: S)
     return { ok: false, response: fail(400, "Could not read the request body.") };
   }
   if (text.length > MAX_BODY_BYTES) return { ok: false, response: fail(413, "The request body is too large.") };
+  // A cross-site form or no-cors fetch can only send "simple" types such as text/plain;
+  // requiring JSON refuses those even where the proxy's Origin check cannot see them.
+  if (text.trim() && !/^application\/json\b/i.test(request.headers.get("content-type") ?? "")) {
+    return { ok: false, response: fail(415, "Send the body as JSON (content-type: application/json).") };
+  }
   let raw: unknown = {};
   if (text.trim()) {
     try {
@@ -168,6 +174,66 @@ export async function leadIdBySlug(slug: string | null): Promise<string | null> 
   if (!slug) return null;
   const rows = await query<{ id: string }>("select id from le_leads where linkedin_slug = $1 limit 1", [slug]);
   return rows[0]?.id ?? null;
+}
+
+// ------------------------------------------------------------------ research run limits
+
+/** Research and steer runs (paid Claude and provider calls) allowed per hour, across all leads. */
+export const MAX_RUNS_PER_HOUR = 20;
+
+/**
+ * The first step event of every run: runResearch logs "Starting research" and steerLead
+ * "Reading your instruction" (src/lib/research/pipeline.ts and steer.ts). scripts/test-api.ts
+ * checks that the research code still logs them.
+ */
+export const RUN_START_STEPS = ["Starting research", "Reading your instruction"] as const;
+
+export const RUN_LIMIT_MESSAGE = `Too many research runs in the last hour (the limit is ${MAX_RUNS_PER_HOUR}). Try again later.`;
+
+/**
+ * True when the last hour already saw MAX_RUNS_PER_HOUR runs. Counted in the database,
+ * so the cap holds across server instances. Check it before claimResearch.
+ */
+export async function overRunBudget(): Promise<boolean> {
+  const rows = await query<{ n: number }>(
+    `select count(*)::int as n from le_events
+      where type = 'step' and message = any($1::text[]) and created_at > now() - interval '1 hour'`,
+    [RUN_START_STEPS],
+  );
+  return (rows[0]?.n ?? 0) >= MAX_RUNS_PER_HOUR;
+}
+
+/**
+ * A run still 'running' after this long was lost. On Vercel a run cannot outlive its
+ * 300 s function (after() dies with it): it was killed at maxDuration, crashed or was
+ * redeployed. Without this the lead page would poll and keep Re-run disabled forever.
+ */
+export const STALE_RUN_MS = 6 * 60_000;
+
+const STALE_RUN_MESSAGE = "Research stopped before it finished (server time limit or restart). Run it again.";
+
+export function isStaleRun(lead: Pick<Lead, "researchStatus" | "researchStartedAt">): boolean {
+  if (lead.researchStatus !== "running" || !lead.researchStartedAt) return false;
+  const started = Date.parse(lead.researchStartedAt);
+  return Number.isFinite(started) && Date.now() - started > STALE_RUN_MS;
+}
+
+/**
+ * Marks a lost run as failed and logs an error event, so the UI stops polling and
+ * claimResearch accepts a retry at once. True when it did. Never throws: a GET that
+ * calls this still answers with the lead as stored.
+ */
+export async function failStaleRun(id: string): Promise<boolean> {
+  try {
+    if (!(await failStaleResearch(id, STALE_RUN_MS, STALE_RUN_MESSAGE))) return false;
+  } catch (err) {
+    console.error(`[api] could not mark the lost run of lead ${id} as failed: ${errorText(err)}`);
+    return false;
+  }
+  await addEvent(id, "error", STALE_RUN_MESSAGE).catch((err) =>
+    console.error(`[api] could not log the lost run of lead ${id}: ${errorText(err)}`),
+  );
+  return true;
 }
 
 /**

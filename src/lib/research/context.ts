@@ -3,7 +3,7 @@ import type { ApolloOrg, ApolloPerson } from "../providers/apollo";
 import type { LinkedInCompany, LinkedInProfile } from "../providers/linkedin";
 import { addEvent } from "../repo/events";
 import { saveRaw } from "../repo/findings";
-import { setResearchStep } from "../repo/leads";
+import { updateLead } from "../repo/leads";
 import type { EventType, Lead, ProviderStatus, Settings } from "../types";
 import type { DomainSource } from "./domain";
 import { Deadline, errorMessage, withTimeout } from "./util";
@@ -38,13 +38,23 @@ export interface RunContext {
   apolloOrg?: ApolloOrg | null;
 }
 
+/** The lead was deleted while its research was running. Nothing is left to record against. */
+export class LeadGoneError extends Error {
+  constructor() {
+    super("The lead was deleted while research was running");
+    this.name = "LeadGoneError";
+  }
+}
+
 /**
  * Progress goes to le_leads.research_step (the live label in the UI) and to
  * le_events (the timeline). Both are best-effort: a failed progress write must
- * never fail the research itself.
+ * never fail the research itself. The one exception: when the lead row is gone
+ * (deleted mid-run), step() throws LeadGoneError so the run stops spending.
  */
 export async function step(leadId: string, message: string): Promise<void> {
-  await Promise.allSettled([setResearchStep(leadId, message), addEvent(leadId, "step", message)]);
+  const [res] = await Promise.allSettled([updateLead(leadId, { researchStep: message }), addEvent(leadId, "step", message)]);
+  if (res.status === "fulfilled" && res.value === null) throw new LeadGoneError();
 }
 
 export async function note(leadId: string, type: EventType, message: string, data?: unknown): Promise<void> {

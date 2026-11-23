@@ -23,13 +23,28 @@ export function timeAgo(iso: string | null | undefined, now: number = Date.now()
   return formatDate(iso);
 }
 
-/** "Nov 23, 2026" (the year is dropped for dates in the current year). */
-export function formatDate(iso: string | null | undefined): string {
-  const t = parse(iso);
-  if (t === null) return "";
-  const d = new Date(t);
+function dayLabel(d: Date): string {
   const sameYear = d.getFullYear() === new Date().getFullYear();
   return d.toLocaleDateString("en-US", sameYear ? { month: "short", day: "numeric" } : { month: "short", day: "numeric", year: "numeric" });
+}
+
+/**
+ * "Nov 23, 2026" (the year is dropped for dates in the current year). Date-only values,
+ * as findings carry them ("2026", "2026-03", "2026-03-14"), are calendar dates: never
+ * shifted by the time zone, and never shown more precisely than they are ("Mar 2026").
+ */
+export function formatDate(iso: string | null | undefined): string {
+  const m = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/.exec(iso?.trim() ?? "");
+  if (m) {
+    const [, y, mo, d] = m;
+    if (!mo) return y;
+    const date = new Date(Number(y), Number(mo) - 1, d ? Number(d) : 1);
+    // "2026-13" or "2026-02-30" roll over into another month: not a real date.
+    if (date.getMonth() !== Number(mo) - 1) return "";
+    return d ? dayLabel(date) : date.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+  }
+  const t = parse(iso);
+  return t === null ? "" : dayLabel(new Date(t));
 }
 
 export function formatDateTime(iso: string | null | undefined): string {
@@ -60,6 +75,21 @@ export function fromDateInput(value: string): string | null {
   if (!m) return null;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 9, 0, 0);
   return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
+/** Same window as claimResearch: a run still 'running' after this was lost (function killed or server restarted). */
+const STALE_RUN_MS = 15 * MINUTE;
+
+/** True while a research run is live. A lost run is not, and the server accepts a new run for it. */
+export function isRunning(lead: Pick<Lead, "researchStatus" | "researchStartedAt">, now: number = Date.now()): boolean {
+  if (lead.researchStatus !== "running") return false;
+  const started = parse(lead.researchStartedAt);
+  return !(started !== null && now - started > STALE_RUN_MS);
+}
+
+/** Shows a lost run as the failed run it is, the way the server records it once it notices. */
+export function settleLostRun(lead: Lead): Lead {
+  return lead.researchStatus === "running" && !isRunning(lead) ? { ...lead, researchStatus: "error" } : lead;
 }
 
 /** The best name we have: the person's name, else the LinkedIn slug, else a placeholder. */

@@ -5,12 +5,12 @@ import { useState } from "react";
 import { errorMessage, listLeads, updateLead } from "@/lib/api-client";
 import { nextAction, sortNeedsYouFirst } from "@/lib/next-action";
 import { STAGES, STAGE_LABELS, type Lead, type Stage } from "@/lib/types";
-import { leadName, titleAtCompany } from "@/components/format";
+import { isRunning, leadName, settleLostRun, titleAtCompany } from "@/components/format";
 import { ButtonLink, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageSelect, cx } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
 export default function PipelinePage() {
-  const { data, error, loading, reload, setData } = useLoad(listLeads, (leads) => (leads?.some((l) => l.researchStatus === "running") ? 4000 : null));
+  const { data, error, loading, reload, setData } = useLoad(listLeads, (leads) => (leads?.some((l) => isRunning(l)) ? 4000 : null));
   const [moveError, setMoveError] = useState<string | null>(null);
   const [moving, setMoving] = useState<Record<string, boolean>>({});
 
@@ -31,7 +31,7 @@ export default function PipelinePage() {
     }
   }
 
-  const sorted = sortNeedsYouFirst(data ?? []);
+  const sorted = sortNeedsYouFirst((data ?? []).map(settleLostRun));
 
   return (
     <>

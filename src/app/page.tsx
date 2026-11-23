@@ -5,16 +5,16 @@ import { useMemo, useState } from "react";
 import { listLeads } from "@/lib/api-client";
 import { nextAction, sortNeedsYouFirst } from "@/lib/next-action";
 import type { Lead } from "@/lib/types";
-import { leadName, timeAgo, titleAtCompany } from "@/components/format";
+import { isRunning, leadName, settleLostRun, timeAgo, titleAtCompany } from "@/components/format";
 import { ButtonLink, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageChip, cx } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
 export default function LeadsPage() {
   // Refresh while any lead is being researched so its row updates by itself.
-  const { data, error, loading, reload } = useLoad(listLeads, (leads) => (leads?.some((l) => l.researchStatus === "running") ? 4000 : null));
+  const { data, error, loading, reload } = useLoad(listLeads, (leads) => (leads?.some((l) => isRunning(l)) ? 4000 : null));
   const [query, setQuery] = useState("");
 
-  const sorted = useMemo(() => sortNeedsYouFirst(data ?? []), [data]);
+  const sorted = useMemo(() => sortNeedsYouFirst((data ?? []).map(settleLostRun)), [data]);
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sorted;
@@ -97,7 +97,7 @@ function LeadRow({ lead }: { lead: Lead }) {
           <StageChip stage={lead.stage} />
         </div>
         <div className="col-span-2 flex items-center gap-2 sm:col-span-1 sm:justify-end">
-          {lead.researchStatus === "running" ? <span className="spinner" aria-hidden /> : <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", action.tone === "urgent" ? "bg-danger" : action.tone === "normal" ? "bg-ink" : "bg-hairline")} />}
+          {isRunning(lead) ? <span className="spinner" aria-hidden /> : <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", action.tone === "urgent" ? "bg-danger" : action.tone === "normal" ? "bg-ink" : "bg-hairline")} />}
           <span className={cx("truncate text-[13.5px]", action.tone === "urgent" ? "font-medium text-danger" : action.tone === "normal" ? "text-ink" : "text-quiet")}>{action.label}</span>
           <span className="ml-auto text-[12.5px] text-quiet sm:hidden">{timeAgo(lead.updatedAt)}</span>
         </div>

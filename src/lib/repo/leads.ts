@@ -126,6 +126,15 @@ export async function setResearchStep(id: string, step: string): Promise<void> {
   await query("update le_leads set research_step = $2, updated_at = now() where id = $1", [id, step]);
 }
 
+/**
+ * SQL: the lead still has a brief or angles from an earlier run. A run that ends
+ * without 'done' (a failed re-run or steer) then leaves the lead 'researched', not
+ * 'new'. Typed checks, so a JSON null or an odd shape counts as nothing instead of
+ * failing the update.
+ */
+const HAS_RESEARCH = `(jsonb_typeof(brief) = 'object'
+  or (case when jsonb_typeof(angles) = 'array' then jsonb_array_length(angles) > 0 else false end))`;
+
 export async function finishResearch(
   id: string,
   status: Exclude<ResearchStatus, "running" | "idle">,
@@ -134,11 +143,30 @@ export async function finishResearch(
   await query(
     `update le_leads
         set research_status = $2, research_error = $3, research_step = null, research_finished_at = now(),
-            stage = case when stage = 'researching' then (case when $2 = 'done' then 'researched' else 'new' end) else stage end,
+            stage = case when stage = 'researching' then (case when $2 = 'done' or ${HAS_RESEARCH} then 'researched' else 'new' end) else stage end,
             updated_at = now()
       where id = $1`,
     [id, status, error ?? null],
   );
+}
+
+/**
+ * Marks a run that has been 'running' for longer than `olderThanMs` as failed (it was
+ * lost: the function was killed or the server restarted), with finishResearch's stage
+ * rule. False when there is no such run: it finished meanwhile, or it is younger.
+ */
+export async function failStaleResearch(id: string, olderThanMs: number, error: string): Promise<boolean> {
+  const rows = await query(
+    `update le_leads
+        set research_status = 'error', research_error = $2, research_step = null, research_finished_at = now(),
+            stage = case when stage = 'researching' then (case when ${HAS_RESEARCH} then 'researched' else 'new' end) else stage end,
+            updated_at = now()
+      where id = $1 and research_status = 'running'
+        and research_started_at < now() - make_interval(secs => $3)
+      returning id`,
+    [id, error, olderThanMs / 1000],
+  );
+  return rows.length > 0;
 }
 
 /** Adds to the lead's usage counters, e.g. { claudeInputTokens: 1200 }. */

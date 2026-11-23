@@ -10,7 +10,7 @@ import { note, step, type Person, type RunContext } from "./context";
 import { dropLowConfidence, normaliseVerdict } from "./criteria";
 import type { Gathered } from "./gather";
 import { EXTRACT_SYSTEM, extractPrompt } from "./prompts";
-import { clamp01, cleanDate, cleanUrl, collectUrls, compact, errorMessage, sameFact, truncate, uniqueBy, urlKey } from "./util";
+import { clamp01, cleanDate, cleanUrl, collectUrls, compact, emailScore, errorMessage, sameFact, truncate, uniqueBy, urlKey } from "./util";
 
 /**
  * Step 3: turn raw source data into atomic findings.
@@ -333,7 +333,7 @@ export function hubFindings(hub: Gathered["hub"]): NewFinding[] {
 
 export function emailFinding(email: Gathered["email"], person: Person): NewFinding[] {
   if (!email) return [];
-  const score = email.score == null ? null : Math.round(email.score <= 1 ? email.score * 100 : email.score);
+  const score = emailScore(email.score);
   return [
     {
       source: "hunter",
@@ -593,11 +593,18 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
   await step(leadId, bundles.length ? `Reading ${bundles.length} ${bundles.length === 1 ? "source" : "sources"} for facts` : "Recording the facts found");
 
   // Leave room for writing and verifying even if extraction is slow.
-  const timeoutMs = deadline.budget(EXTRACT_TIMEOUT_MS, 75_000);
+  // One clock for the whole step: bundles that start in a later wave only get what is left.
+  const stepEndsAt = Date.now() + deadline.budget(EXTRACT_TIMEOUT_MS, 75_000);
   let fatal: ClaudeError | null = null;
+  let outOfTime = 0;
   const extracted = await mapLimit(bundles, EXTRACT_CONCURRENCY, async (bundle) => {
     // A rejected key or missing config fails every call the same way: stop spending time on the rest.
-    if (fatal || timeoutMs < 5_000) return [] as NewFinding[];
+    if (fatal) return [] as NewFinding[];
+    const timeoutMs = stepEndsAt - Date.now();
+    if (timeoutMs < 5_000) {
+      outOfTime++;
+      return [] as NewFinding[];
+    }
     try {
       return await extractBundle({ leadId, person, criteria: settings.criteria, bundle, known, timeoutMs });
     } catch (err) {
@@ -606,6 +613,8 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
       return [] as NewFinding[];
     }
   });
+
+  if (outOfTime) await note(leadId, "tool", `Left ${outOfTime} ${outOfTime === 1 ? "source" : "sources"} unread to finish in time`);
 
   const { kept, dropped } = dropLowConfidence(extracted.flat());
   // Code-made facts first, then the model's findings best first, so a repeat loses to the better version.

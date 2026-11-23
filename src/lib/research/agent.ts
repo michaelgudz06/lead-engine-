@@ -34,6 +34,25 @@ export interface AgentOutcome {
   result: ToolAgentResult | null;
 }
 
+/**
+ * What read_page may fetch for a URL the model asked for: nothing unless the URL was
+ * already seen in a tool result (or is the company homepage), and then without the
+ * query string and hash. Text planted on a page can ask the model to "read" an
+ * attacker's URL with private context in it; this is the guard. Pure.
+ */
+export function readableTarget(url: string, seenUrls: ReadonlySet<string>): string | null {
+  const clean = cleanUrl(url);
+  if (!clean || !seenUrls.has(urlKey(clean))) return null;
+  try {
+    const target = new URL(clean);
+    target.search = "";
+    target.hash = "";
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
 const slim = (results: ExaResult[], chars: number) =>
   results.slice(0, 6).map((r) => ({
     url: r.url,
@@ -60,9 +79,14 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
   }
 
   await step(leadId, opts.focus ? "Digging into what you asked for" : "Filling the gaps with a deeper search");
+  // A tool must not outlive the agent: the loop's abort only stops the model call, not a running tool.
+  const agentEndsAt = Date.now() + timeoutMs;
+  const toolTimeout = (capMs: number = TOOL_TIMEOUT_MS) => Math.min(capMs, Math.max(1_000, agentEndsAt - Date.now()));
 
-  /** URLs the agent has actually seen in tool results. record_finding only accepts these. */
+  /** URLs the agent has actually seen in tool results. record_finding and read_page only accept these. */
   const seenUrls = new Set<string>();
+  // The company's own site is known from identify, so it may be read without a search first.
+  if (person.domain) seenUrls.add(urlKey(`https://${person.domain}`));
   const recorded: Finding[] = [];
   const see = (data: unknown) => {
     for (const u of collectUrls(data)) seenUrls.add(u);
@@ -85,7 +109,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
       run: async ({ query, recent_only }) => {
         const results = await withTimeout(
           exaSearch(query, { numResults: 5, textChars: 1200, ...(recent_only ? { startPublishedDate: isoDateMonthsAgo(12) } : {}) }),
-          TOOL_TIMEOUT_MS,
+          toolTimeout(),
           "Web search",
         );
         await count({ exaSearches: 1 });
@@ -100,7 +124,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
         "Search for people, for example who leads ML infrastructure or robotics at a company. Returns profile-like results (often LinkedIn) with name, headline and excerpt. Query with a role and a company, for example 'head of machine learning infrastructure Acme Robotics'.",
       inputSchema: z.object({ query: z.string().describe("Role and company, 3 to 10 words") }),
       run: async ({ query }) => {
-        const results = await withTimeout(exaSearch(query, { category: "people", numResults: 5, textChars: 600 }), TOOL_TIMEOUT_MS, "People search");
+        const results = await withTimeout(exaSearch(query, { category: "people", numResults: 5, textChars: 600 }), toolTimeout(), "People search");
         await count({ exaSearches: 1 });
         await raw(leadId, "agent.people_search", { query }, results);
         see(results);
@@ -110,12 +134,14 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
     defineTool({
       name: "read_page",
       description:
-        "Read the text of one web page by URL (a search result, the company's site, a careers or docs page). Use when an excerpt looked promising but was cut off.",
-      inputSchema: z.object({ url: z.string().describe("Full https URL") }),
+        "Read the text of one web page that appeared in an earlier tool result, or the company's own homepage. Use when an excerpt looked promising but was cut off. Other URLs are refused: search for the page first.",
+      inputSchema: z.object({ url: z.string().describe("Full https URL, copied exactly from a tool result") }),
       run: async ({ url }) => {
         const clean = cleanUrl(url);
         if (!clean) return "That is not a valid http(s) URL.";
-        const results = await withTimeout(exaContents([clean], { textChars: 6000 }), TOOL_TIMEOUT_MS, "Reading the page");
+        const target = readableTarget(clean, seenUrls);
+        if (!target) return "Not read: read_page only opens pages that appeared in your earlier tool results. Search for the page first.";
+        const results = await withTimeout(exaContents([target], { textChars: 6000 }), toolTimeout(), "Reading the page");
         await count({ exaContents: 1 });
         const page = results[0];
         if (!page?.text?.trim()) return "The page could not be read or has no text.";
@@ -136,7 +162,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
         run: async ({ author }) => {
           const id = author.trim().replace(/^https?:\/\/huggingface\.co\//i, "").split("/")[0];
           if (!/^[\w.-]{2,96}$/.test(id)) return "That is not a valid Hugging Face account id.";
-          const models = await withTimeout(getHubModels(id, 20), TOOL_TIMEOUT_MS, "Hugging Face");
+          const models = await withTimeout(getHubModels(id, 20), toolTimeout(), "Hugging Face");
           see(models);
           seenUrls.add(urlKey(`https://huggingface.co/${id}`));
           return models.length
@@ -156,7 +182,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
         run: async ({ domain }) => {
           const clean = domainFromUrl(domain);
           if (!clean) return "That is not a valid company domain.";
-          const res = await withTimeout(enrichOrganization(clean), TOOL_TIMEOUT_MS, "Apollo");
+          const res = await withTimeout(enrichOrganization(clean), toolTimeout(), "Apollo");
           if (!res.org) return `No company data for ${clean}${res.error ? ` (${truncate(res.error, 120)})` : ""}.`;
           see(res.org);
           seenUrls.add(urlKey(`https://${clean}`));
@@ -176,7 +202,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
         run: async ({ topic }) => {
           if (xCalls >= 1) return "x_posts was already used in this run.";
           xCalls++;
-          const res = await withTimeout(getXPosts(xHandle, { fromDate: isoDateMonthsAgo(6), focus: truncate(topic, 200), maxPosts: 10 }), 60_000, "X search");
+          const res = await withTimeout(getXPosts(xHandle, { fromDate: isoDateMonthsAgo(6), focus: truncate(topic, 200), maxPosts: 10 }), toolTimeout(60_000), "X search");
           await count({ xSearches: 1, xPosts: res.posts?.length ?? 0 });
           await raw(leadId, "agent.x_posts", { handle: xHandle, topic }, res);
           if (!res.posts?.length) return `No posts found${res.error ? ` (${truncate(res.error, 120)})` : ""}.`;

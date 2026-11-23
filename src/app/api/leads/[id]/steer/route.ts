@@ -2,7 +2,18 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 import { claimResearch, getLead } from "@/lib/repo/leads";
 import { steerLead } from "@/lib/research/pipeline";
-import { fail, json, leadIdFrom, leadNotFound, readJson, runAfterResponse, serverError, type LeadRouteContext } from "../../../_lib/api";
+import {
+  fail,
+  json,
+  leadIdFrom,
+  leadNotFound,
+  overRunBudget,
+  readJson,
+  RUN_LIMIT_MESSAGE,
+  runAfterResponse,
+  serverError,
+  type LeadRouteContext,
+} from "../../../_lib/api";
 
 // Steering may research before it rewrites; it runs after the 202 inside after().
 export const maxDuration = 300;
@@ -15,7 +26,7 @@ const SteerBody = z.object({
     .max(1200, "Keep the instruction under 1,200 characters."),
 });
 
-/** POST /api/leads/[id]/steer { instruction } -> 202 { ok: true }; 409 while a run is going. */
+/** POST /api/leads/[id]/steer { instruction } -> 202 { ok: true }; 409 while a run is going; 429 over the hourly run cap. */
 export async function POST(request: NextRequest, ctx: LeadRouteContext) {
   const id = await leadIdFrom(ctx);
   if (!id) return leadNotFound();
@@ -23,6 +34,8 @@ export async function POST(request: NextRequest, ctx: LeadRouteContext) {
   if (!body.ok) return body.response;
   const { instruction } = body.data;
   try {
+    // A steer is a run too (it may research before it rewrites), so it counts toward the cap.
+    if (await overRunBudget()) return fail(429, RUN_LIMIT_MESSAGE);
     if (!(await claimResearch(id))) {
       return (await getLead(id)) ? fail(409, "The agent is already working on this lead. Try again when it finishes.") : leadNotFound();
     }

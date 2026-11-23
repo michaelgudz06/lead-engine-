@@ -153,7 +153,8 @@ The fixed signatures are in `src/lib/providers/*.ts` (read them). Implementation
    hiring for ML infrastructure, and who decides on infrastructure spend. It must stop early
    when it has enough.
 5. **Write.** With Haiku (structured output) from the passing findings plus
-   `ABSTRACT_CONTEXT` and `ANGLE_LIBRARY`: `Brief`, `CompanyPicture`, 3 to 4 `Angle`s (each
+   `ABSTRACT_CONTEXT` and `ANGLE_LIBRARY`: `Brief`, `CompanyPicture`, 2 to 4 well-supported
+   `Angle`s, never padded to a fixed count (each
    cites findingIds and has an email and a LinkedIn message under 300 characters) and an
    `Approach`. Drafts: plain, specific, short (under 120 words), no hype, no invented facts,
    the sender's name and Calendly link from settings when set (leave a clear
@@ -254,7 +255,11 @@ The app has no user accounts. When deployed it must not be open to the internet:
 the URL could read leads and spend API credits. Add one shared team password:
 
 - `APP_PASSWORD` and `SESSION_SECRET` env vars (already in `src/lib/env.ts`). When
-  `APP_PASSWORD` is unset (local dev), the gate is off.
+  `APP_PASSWORD` is unset on a local run, the gate is off. On Vercel the app refuses every
+  request with 503 until `APP_PASSWORD` is set, so a deploy can never be open by accident.
+- Cross-site writes to `/api/*` are refused (Sec-Fetch-Site / Origin check), research and
+  steer runs are capped at 20 per hour, and a run stuck in `running` for over 6 minutes is
+  marked failed so it can be retried.
 - `src/lib/auth.ts` (api agent): create and verify a signed session cookie with Web Crypto
   HMAC-SHA256 over an expiry timestamp using `SESSION_SECRET` (works in the proxy runtime);
   constant-time comparison of the password; cookie `le_session`, HttpOnly, Secure in

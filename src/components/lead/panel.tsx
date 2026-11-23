@@ -1,9 +1,26 @@
 "use client";
 
-import type { Finding } from "@/lib/types";
+import type { Finding, Source } from "@/lib/types";
 import { SOURCE_LABELS } from "@/lib/types";
-import { safeUrl } from "../format";
+import { hostOf, safeUrl } from "../format";
 import { cx } from "../ui";
+
+/** Findings read off the open web (search results, pages the agent read). The rest is provider data. */
+const WEB_SOURCES: ReadonlySet<Source> = new Set<Source>(["exa", "agent"]);
+/** Sites that are also a source keep the source's name, so one site never shows two ways. */
+const SITE_NAMES: Array<[string, string]> = [
+  ["linkedin.com", SOURCE_LABELS.linkedin],
+  ["x.com", SOURCE_LABELS.x],
+  ["twitter.com", SOURCE_LABELS.x],
+  ["huggingface.co", SOURCE_LABELS.huggingface],
+];
+
+/** "techcrunch.com" for a web finding; the source's name ("LinkedIn", "Apollo", "Your notes") otherwise. */
+function sourceLabel(f: Finding, url: string | null): string {
+  const host = url && WEB_SOURCES.has(f.source) ? hostOf(url) : "";
+  if (!host) return SOURCE_LABELS[f.source] ?? f.source;
+  return SITE_NAMES.find(([site]) => host === site || host.endsWith(`.${site}`))?.[1] ?? host;
+}
 
 /** A titled card: the building block of the lead page. */
 export function Panel({ title, aside, children, id, className }: { title: string; aside?: React.ReactNode; children: React.ReactNode; id?: string; className?: string }) {
@@ -23,8 +40,9 @@ export function SubHeading({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * Small source links after a claim. Each cited finding id becomes a link to the
- * finding's own URL, or to its row in the Findings section when it has none.
+ * Small source links after a claim, labelled by site or provider, with the finding's
+ * title as the tooltip. Each cited finding id becomes a link to the finding's own URL,
+ * or to its row in the Findings section when it has none.
  * Ids that match no finding are dropped rather than shown as dead links.
  */
 export function Sources({ ids, findings }: { ids: string[] | undefined; findings: Map<string, Finding> }) {
@@ -38,7 +56,7 @@ export function Sources({ ids, findings }: { ids: string[] | undefined; findings
     const href = url ?? `#finding-${f.id}`;
     if (seen.has(href)) continue;
     seen.add(href);
-    items.push({ key: f.id, href, external: Boolean(url), label: SOURCE_LABELS[f.source] ?? f.source, title: f.title || f.text.slice(0, 140) });
+    items.push({ key: f.id, href, external: Boolean(url), label: sourceLabel(f, url), title: f.title || f.text.slice(0, 140) });
   }
   if (items.length === 0) return null;
   return (
@@ -49,7 +67,7 @@ export function Sources({ ids, findings }: { ids: string[] | undefined; findings
           href={s.href}
           title={s.title}
           {...(s.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
-          className="rounded border border-hairline px-1.5 text-[11px] leading-[17px] text-quiet transition-colors hover:border-link hover:text-link"
+          className="max-w-[200px] truncate rounded border border-hairline px-1.5 text-[11px] leading-[17px] text-quiet transition-colors hover:border-link hover:text-link"
         >
           {s.label}
         </a>

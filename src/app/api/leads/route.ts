@@ -4,7 +4,21 @@ import { linkedinSlug, normaliseLinkedinUrl } from "@/lib/http";
 import { addEvent } from "@/lib/repo/events";
 import { claimResearch, createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
 import { runResearch } from "@/lib/research/pipeline";
-import { errorText, fail, json, leadIdBySlug, optionalText, pgCode, readJson, runAfterResponse, serverError } from "../_lib/api";
+import {
+  errorText,
+  fail,
+  failStaleRun,
+  isStaleRun,
+  json,
+  leadIdBySlug,
+  MAX_RUNS_PER_HOUR,
+  optionalText,
+  overRunBudget,
+  pgCode,
+  readJson,
+  runAfterResponse,
+  serverError,
+} from "../_lib/api";
 
 // POST starts a research run after the response; after() lives as long as the function may.
 export const maxDuration = 300;
@@ -26,13 +40,23 @@ const DUPLICATE = "This person is already a lead.";
 export async function GET() {
   await connection(); // reads the database: never prerender this at build time
   try {
-    return json({ leads: await listLeads() });
+    let leads = await listLeads();
+    // A run that outlived its function was lost: fail it so the lists stop polling and it can be retried.
+    const stale = leads.filter((lead) => isStaleRun(lead));
+    if (stale.length) {
+      const reaped = await Promise.all(stale.map((lead) => failStaleRun(lead.id)));
+      if (reaped.some(Boolean)) leads = await listLeads();
+    }
+    return json({ leads });
   } catch (err) {
     return serverError("GET /api/leads", err);
   }
 }
 
-/** POST /api/leads -> 201 { lead } with research already started; 409 { error, existingId } for a duplicate. */
+/**
+ * POST /api/leads -> 201 { lead } with research already started; 409 { error, existingId } for a duplicate.
+ * Over the hourly run cap the lead is still created, without a run, and an event says why.
+ */
 export async function POST(request: NextRequest) {
   const body = await readJson(request, CreateLeadBody);
   if (!body.ok) return body.response;
@@ -58,7 +82,13 @@ export async function POST(request: NextRequest) {
       console.error(`[api] could not log the created event for lead ${lead.id}: ${errorText(err)}`),
     );
 
-    if (await claimResearch(lead.id)) {
+    if (await overRunBudget()) {
+      await addEvent(
+        lead.id,
+        "error",
+        `Research did not start: the limit of ${MAX_RUNS_PER_HOUR} research runs an hour was reached. Run it from this page later.`,
+      ).catch((err) => console.error(`[api] could not log the skipped run for lead ${lead.id}: ${errorText(err)}`));
+    } else if (await claimResearch(lead.id)) {
       const id = lead.id;
       runAfterResponse(id, "Research", () => runResearch(id));
     }

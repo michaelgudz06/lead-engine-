@@ -4,12 +4,16 @@
  *   NODE_USE_ENV_PROXY=1 npx tsx --conditions=react-server --env-file=.env.local scripts/test-api.ts
  *
  * 1. auth     password check; session token valid / tampered / expired / wrong secret; cookie attributes
- * 2. proxy    the matcher as Next compiles it, and every gate decision
+ * 2. proxy    the matcher as Next compiles it, and every gate decision: login ?next= open-redirect
+ *             cases, cross-site write refusal (CSRF), and the Vercel lock without APP_PASSWORD
  * 3. routes   the real handlers against Neon with one temp lead: create, duplicate, get, patch,
  *             sent, events, research and steer claims, settings, status, login/logout, delete.
  *             Handlers run inside a minimal Next request scope whose after() only records the
  *             task: research is claimed but never run, so no provider or Claude credit is spent.
  * 4. hubspot  pushLeadToHubSpot against a mocked HubSpot API (no token, no network)
+ * 5. guards   against Neon with temp leads: the stage rule when a run ends, the stale-run reaper
+ *             (research_started_at backdated) and the hourly run cap (fake run-start events on a
+ *             temp lead, removed with it)
  *
  * Prints statuses and short snippets only: never a key, token, cookie value or header.
  */
@@ -17,6 +21,8 @@
 // request-scope modules below need when they load.
 import "next/dist/server/node-environment-baseline";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { workAsyncStorage } from "next/dist/server/app-render/work-async-storage.external";
@@ -32,7 +38,14 @@ import * as settingsRoute from "../src/app/api/settings/route";
 import * as statusRoute from "../src/app/api/status/route";
 import * as loginRoute from "../src/app/api/login/route";
 import * as logoutRoute from "../src/app/api/logout/route";
-import { serverError } from "../src/app/api/_lib/api";
+import {
+  isStaleRun,
+  MAX_RUNS_PER_HOUR,
+  RUN_LIMIT_MESSAGE,
+  RUN_START_STEPS,
+  serverError,
+  STALE_RUN_MS,
+} from "../src/app/api/_lib/api";
 import { proxy, config as proxyConfig } from "../src/proxy";
 import {
   authConfigError,
@@ -46,9 +59,10 @@ import {
 } from "../src/lib/auth";
 import { normaliseDomain, pushLeadToHubSpot, pushToHubSpot, splitName } from "../src/lib/providers/hubspot";
 import { query } from "../src/lib/db";
-import { deleteLead, finishResearch, getLead } from "../src/lib/repo/leads";
+import { listEvents } from "../src/lib/repo/events";
+import { claimResearch, createLead, deleteLead, finishResearch, getLead, updateLead } from "../src/lib/repo/leads";
 import { getSettings } from "../src/lib/repo/settings";
-import type { Angle, Lead } from "../src/lib/types";
+import type { Angle, Brief, Lead, LeadEvent } from "../src/lib/types";
 
 // ------------------------------------------------------------------ compile-time checks
 // The same shape Next's generated validator (.next/types/validator.ts) requires of route
@@ -82,7 +96,7 @@ function section(title: string): void {
   console.log(`\n== ${title}`);
 }
 
-const GATE_KEYS = ["APP_PASSWORD", "SESSION_SECRET", "HUBSPOT_ACCESS_TOKEN"] as const;
+const GATE_KEYS = ["APP_PASSWORD", "SESSION_SECRET", "HUBSPOT_ACCESS_TOKEN", "VERCEL"] as const;
 const originalEnv = Object.fromEntries(GATE_KEYS.map((k) => [k, process.env[k]]));
 function setEnv(vars: Partial<Record<(typeof GATE_KEYS)[number], string | undefined>>): void {
   for (const [k, v] of Object.entries(vars)) {
@@ -235,12 +249,49 @@ async function testProxy(): Promise<void> {
     const req = new NextRequest(new URL(path, "http://localhost:3000"), cookie ? { headers: { cookie: `${SESSION_COOKIE}=${cookie}` } } : undefined);
     return proxy(req);
   };
+  /** Any method, with browser headers such as Sec-Fetch-Site and Origin. */
+  const send = async (method: string, path: string, headers: Record<string, string> = {}, cookie?: string) =>
+    proxy(new NextRequest(new URL(path, "http://localhost:3000"), { method, headers: { ...headers, ...(cookie ? { cookie: `${SESSION_COOKIE}=${cookie}` } : {}) } }));
   const passes = (res: Response) => res.headers.get("x-middleware-next") === "1";
   const redirectsTo = (res: Response) => (res.status === 307 || res.status === 308 ? res.headers.get("location") : null);
+  const refusedCrossSite = async (res: Response) =>
+    res.status === 403 && res.headers.get("cache-control") === "no-store" && /Cross-site/.test(((await res.json()) as { error?: string }).error ?? "");
+  const CROSS_SITE = { "sec-fetch-site": "cross-site" };
+  const SAME_ORIGIN = { "sec-fetch-site": "same-origin", origin: "http://localhost:3000" };
 
   setEnv({ APP_PASSWORD: undefined, SESSION_SECRET: undefined });
   check("gate off: pages pass", passes(await run("/")));
   check("gate off: API passes", passes(await run("/api/leads")));
+
+  // Cross-site writes (CSRF) are refused before the gate, so a local run with the gate off is covered.
+  check("gate off: cross-site POST /api/leads is 403", await refusedCrossSite(await send("POST", "/api/leads", CROSS_SITE)));
+  for (const method of ["PUT", "PATCH", "DELETE"]) {
+    check(`gate off: cross-site ${method} is 403`, await refusedCrossSite(await send(method, "/api/settings", CROSS_SITE)));
+  }
+  check("gate off: same-site POST (a sibling subdomain) is 403", await refusedCrossSite(await send("POST", "/api/leads", { "sec-fetch-site": "same-site" })));
+  check("gate off: POST with a foreign Origin and no Sec-Fetch-Site is 403", await refusedCrossSite(await send("POST", "/api/leads", { origin: "https://evil.example" })));
+  check("gate off: POST with Origin null (sandboxed frame) is 403", await refusedCrossSite(await send("POST", "/api/leads", { origin: "null" })));
+  check("gate off: POST from another local port is 403", await refusedCrossSite(await send("POST", "/api/leads", { origin: "http://localhost:3001" })));
+  check("gate off: cross-site POST to a page path is 403 too", await refusedCrossSite(await send("POST", "/leads/new", CROSS_SITE)));
+  check("gate off: same-origin POST passes", passes(await send("POST", "/api/leads", SAME_ORIGIN)));
+  check("gate off: our own Origin without Sec-Fetch-Site passes", passes(await send("POST", "/api/leads", { origin: "http://localhost:3000" })));
+  check("gate off: header-less POST (a script) passes", passes(await send("POST", "/api/leads")));
+  check("gate off: Sec-Fetch-Site none (user-initiated) passes", passes(await send("POST", "/api/leads", { "sec-fetch-site": "none" })));
+  check("gate off: cross-site GET (a link from another site) passes", passes(await send("GET", "/api/leads", CROSS_SITE)));
+
+  // On Vercel a missing APP_PASSWORD locks the app instead of leaving it open.
+  setEnv({ VERCEL: "1" });
+  for (const [method, path] of [["GET", "/"], ["GET", "/leads/new"], ["GET", "/login"], ["GET", "/api/leads"], ["POST", "/api/leads"], ["POST", "/api/login"]] as const) {
+    const res = await send(method, path, method === "POST" ? SAME_ORIGIN : {});
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    check(
+      `Vercel without APP_PASSWORD: ${method} ${path} is 503 JSON`,
+      res.status === 503 && /APP_PASSWORD/.test(body?.error ?? "") && res.headers.get("cache-control") === "no-store",
+      { status: res.status },
+    );
+  }
+  setEnv({ VERCEL: undefined });
+  check("off Vercel without APP_PASSWORD: the gate stays off", passes(await run("/api/leads")));
 
   setEnv({ APP_PASSWORD: PASSWORD, SESSION_SECRET: SECRET });
   const token = await createSessionToken();
@@ -260,6 +311,44 @@ async function testProxy(): Promise<void> {
   check("valid session: /api/leads passes", passes(await run("/api/leads", token)));
   check("valid session: /login?next=/pipeline goes to /pipeline", redirectsTo(await run("/login?next=%2Fpipeline", token)) === "http://localhost:3000/pipeline");
   check("valid session: /login?next=//evil.example goes to /", redirectsTo(await run("/login?next=%2F%2Fevil.example", token)) === "http://localhost:3000/");
+
+  // ?next= must never leave the site. URL parsing drops tab/CR/LF, so "/<TAB>/evil.example" was "//evil.example".
+  for (const [label, next] of [
+    ["tab", "/%09/evil.example"],
+    ["line feed", "/%0a/evil.example"],
+    ["carriage return", "/%0d/evil.example"],
+    ["NUL", "/%00/evil.example"],
+    ["two slashes", "//evil.example"],
+    ["backslash", "/%5Cevil.example"],
+    ["slash, backslash", "/%5C/evil.example"],
+    ["encoded slash", "/%2F/evil.example"],
+    ["absolute URL", "https%3A%2F%2Fevil.example%2F"],
+    ["the login page itself", "%2Flogin%3Fnext%3D%2Fpipeline"],
+  ] as const) {
+    const to = redirectsTo(await run(`/login?next=${next}`, token));
+    check(`valid session: ?next=${next} (${label}) goes to /`, to === "http://localhost:3000/", to);
+  }
+  const leadPath = "/leads/3f1c2b9e-8d7a-4c6b-9e5f-1a2b3c4d5e6f";
+  for (const [next, expected] of [
+    [leadPath, leadPath],
+    ["%2Fpipeline%3Fx%3D1", "/pipeline?x=1"],
+    ["%2Fsettings%23criteria", "/settings#criteria"],
+  ] as const) {
+    const to = redirectsTo(await run(`/login?next=${next}`, token));
+    check(`valid session: ?next=${next} is kept`, to === `http://localhost:3000${expected}`, to);
+  }
+
+  // A session cookie does not make a cross-site write acceptable (a sibling subdomain would send it).
+  check("valid session: cross-site POST /api/leads is 403", await refusedCrossSite(await send("POST", "/api/leads", CROSS_SITE, token)));
+  check("valid session: same-origin POST /api/leads passes", passes(await send("POST", "/api/leads", SAME_ORIGIN, token)));
+  check("no session: cross-site POST /api/login is 403 (login CSRF)", await refusedCrossSite(await send("POST", "/api/login", CROSS_SITE)));
+  check("no session: same-origin POST /api/login passes", passes(await send("POST", "/api/login", SAME_ORIGIN)));
+
+  setEnv({ VERCEL: "1" });
+  check("Vercel with APP_PASSWORD: the normal gate (401 without a session)", (await run("/api/leads")).status === 401);
+  check("Vercel with APP_PASSWORD: a session passes", passes(await run("/api/leads", token)));
+  setEnv({ VERCEL: undefined });
+
   setEnv({ SESSION_SECRET: undefined });
   check("misconfigured gate fails closed", (await run("/api/leads", token)).status === 401);
   restoreEnv();
@@ -290,6 +379,21 @@ async function testRoutes(): Promise<void> {
   check("POST /api/leads with a non-LinkedIn URL is 400", notLinkedIn.status === 400 && /LinkedIn/.test(String(notLinkedIn.data?.error)), notLinkedIn.data);
   check("POST /api/leads with broken JSON is 400", (await callRoute(leadsPost, { method: "POST", path: "/api/leads", rawBody: "{nope" })).status === 400);
   check("POST /api/leads with a wrong type is 400", (await callRoute(leadsPost, { method: "POST", path: "/api/leads", body: { linkedinUrl: 42 } })).status === 400);
+  // Bodies a cross-site form or no-cors fetch can send are refused before anything is written.
+  for (const type of ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"]) {
+    const r = await callRoute(leadsPost, {
+      method: "POST",
+      path: "/api/leads",
+      rawBody: JSON.stringify({ linkedinUrl: "linkedin.com/in/le-api-csrf-probe" }),
+      headers: { "content-type": type },
+    });
+    check(`POST /api/leads with a JSON body sent as ${type.split(";")[0]} is 415`, r.status === 415 && /application\/json/.test(String(r.data?.error)), r.data);
+  }
+  // An invalid value (0 days), so a regression would answer 400, never save the owner's settings.
+  const noType = await callRoute(asHandler(settingsRoute.PUT), { method: "PUT", path: "/api/settings", rawBody: '{"followUpDays":0}', headers: { "content-type": "" } });
+  check("PUT /api/settings with an empty content-type is 415", noType.status === 415, noType.data);
+  const charset = await callRoute(leadsPost, { method: "POST", path: "/api/leads", body: {}, headers: { "content-type": "application/json; charset=utf-8" } });
+  check("application/json with a charset is accepted (reaches validation: 400)", charset.status === 400 && /linkedinUrl/.test(String(charset.data?.error)), charset.data);
 
   const slug = `le-api-test-${randomBytes(4).toString("hex")}`;
   let leadId: string | null = null;
@@ -825,6 +929,146 @@ async function testHubSpot(): Promise<void> {
   restoreEnv();
 }
 
+// ------------------------------------------------------------------ 5. run guards against Neon
+
+async function testRunGuards(): Promise<void> {
+  section("5. run guards (Neon)");
+  restoreEnv();
+  setEnv({ APP_PASSWORD: undefined });
+
+  // The cap counts the first step event of each run, so the research code must still log these.
+  const sources = ["pipeline.ts", "steer.ts"].map((f) => readFileSync(join(__dirname, "..", "src", "lib", "research", f), "utf8")).join("\n");
+  for (const message of RUN_START_STEPS) {
+    check(`research code logs the run-start step "${message}"`, new RegExp(`\\bstep\\(\\s*[\\w.]+\\s*,\\s*"${message}"\\s*\\)`).test(sources));
+  }
+
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  check("stale window is 6 minutes", STALE_RUN_MS === 6 * 60_000);
+  check("isStaleRun: running past the window", isStaleRun({ researchStatus: "running", researchStartedAt: ago(STALE_RUN_MS + 5_000) }));
+  check("isStaleRun: running inside the window", !isStaleRun({ researchStatus: "running", researchStartedAt: ago(STALE_RUN_MS - 60_000) }));
+  check("isStaleRun: a finished run is never stale", !isStaleRun({ researchStatus: "error", researchStartedAt: ago(DAY) }));
+  check("isStaleRun: no start time is not stale", !isStaleRun({ researchStatus: "running", researchStartedAt: null }));
+
+  const angle: Angle = { id: "a1", name: "Angle", reasoning: "", findingIds: [], email: { subject: "s", body: "b" }, linkedinMessage: "m" };
+  const brief: Brief = { summary: "Summary.", bullets: [], pains: [], objections: [], questions: [] };
+  const tempIds: string[] = [];
+  const tempLead = async (): Promise<string> => {
+    const lead = await createLead({ linkedinUrl: `https://www.linkedin.com/in/le-api-guard-${randomBytes(4).toString("hex")}` });
+    tempIds.push(lead.id);
+    return lead.id;
+  };
+  const getOne = asHandler(leadRoute.GET);
+  const research = asHandler(researchRoute.POST);
+  const STALE_RE = /stopped before it finished/;
+
+  try {
+    // ---- the stage when a run ends (finishResearch)
+    const id = await tempLead();
+    const stageOf = async () => (await getLead(id))?.stage;
+    const runThenFinish = async (status: "done" | "error") => {
+      const claimed = await claimResearch(id);
+      const during = await stageOf();
+      await finishResearch(id, status, status === "error" ? "test failure" : undefined);
+      return { claimed, during, after: await stageOf() };
+    };
+    let r = await runThenFinish("error");
+    check("stage rule: a failed first run (no brief, no angles) goes back to new", r.claimed && r.during === "researching" && r.after === "new", r);
+    r = await runThenFinish("done");
+    check("stage rule: a done run is researched", r.claimed && r.after === "researched", r);
+    await updateLead(id, { angles: [angle] });
+    r = await runThenFinish("error");
+    check("stage rule: a failed re-run keeps researched when angles exist", r.during === "researching" && r.after === "researched", r);
+    await query("update le_leads set angles = '[]'::jsonb, brief = $2::jsonb where id = $1", [id, JSON.stringify(brief)]);
+    r = await runThenFinish("error");
+    check("stage rule: a failed re-run keeps researched when a brief exists", r.during === "researching" && r.after === "researched", r);
+    await query("update le_leads set brief = 'null'::jsonb, angles = '{}'::jsonb where id = $1", [id]);
+    let threw: unknown = null;
+    r = await runThenFinish("error").catch((err: unknown) => {
+      threw = err;
+      return r;
+    });
+    check("stage rule: a JSON null brief and non-array angles count as nothing (no SQL error)", !threw && r.after === "new", threw ? String(threw) : r);
+    await query("update le_leads set brief = null, angles = '[]'::jsonb where id = $1", [id]);
+    await claimResearch(id);
+    await updateLead(id, { stage: "contacted" });
+    await finishResearch(id, "error", "test failure");
+    check("stage rule: a stage changed during the run is kept", (await stageOf()) === "contacted");
+
+    // ---- the stale-run reaper (a lost run: function killed at maxDuration, or a restart)
+    const rid = await tempLead();
+    const backdate = (minutes: number) => query("update le_leads set research_started_at = now() - make_interval(mins => $2) where id = $1", [rid, minutes]);
+    const staleEvents = (events: unknown) => ((events ?? []) as LeadEvent[]).filter((e) => e.type === "error" && STALE_RE.test(e.message)).length;
+    check("reaper: research claimed", await claimResearch(rid));
+    await backdate(5);
+    let d = await callRoute(getOne, { path: `/api/leads/${rid}`, id: rid });
+    check("reaper: a run 5 minutes old is left running", (d.data?.lead as Lead | undefined)?.researchStatus === "running" && staleEvents(d.data?.events) === 0, d.data?.lead);
+    await backdate(7);
+    d = await callRoute(getOne, { path: `/api/leads/${rid}`, id: rid });
+    const reaped = d.data?.lead as Lead | undefined;
+    check(
+      "reaper: GET /api/leads/[id] marks a run 7 minutes old as failed",
+      d.status === 200 && reaped?.researchStatus === "error" && STALE_RE.test(reaped.researchError ?? "") && reaped.researchStep === null && Boolean(reaped.researchFinishedAt),
+      reaped && { status: reaped.researchStatus, error: reaped.researchError, step: reaped.researchStep },
+    );
+    check("reaper: the stage goes back to new (no brief or angles)", reaped?.stage === "new", reaped?.stage);
+    check("reaper: the same reply carries one error event", staleEvents(d.data?.events) === 1);
+    d = await callRoute(getOne, { path: `/api/leads/${rid}`, id: rid });
+    check("reaper: a second GET logs nothing more", staleEvents(d.data?.events) === 1 && (d.data?.lead as Lead | undefined)?.researchStatus === "error");
+    const tasks = afterTasks.length;
+    const retry = await callRoute(research, { method: "POST", path: `/api/leads/${rid}/research`, id: rid });
+    check("reaper: a retry is accepted at once (202)", retry.status === 202 && afterTasks.length === tasks + 1, retry.data);
+    await updateLead(rid, { angles: [angle] });
+    await backdate(7);
+    const list = await callRoute(asHandler(leadsRoute.GET), { path: "/api/leads" });
+    const listed = ((list.data?.leads ?? []) as Lead[]).find((l) => l.id === rid);
+    check(
+      "reaper: GET /api/leads marks it failed too, and keeps researched (angles exist)",
+      list.status === 200 && listed?.researchStatus === "error" && listed.stage === "researched",
+      listed && { status: listed.researchStatus, stage: listed.stage },
+    );
+    check("reaper: the list logged one more error event", staleEvents(await listEvents(rid)) === 2);
+
+    // ---- the hourly run cap: fill the hour with fake run starts on a temp lead (deleted with it)
+    const bid = await tempLead();
+    await query("insert into le_events (lead_id, type, message) select $1::uuid, 'step', $2::text from generate_series(1, $3::int)", [
+      bid,
+      RUN_START_STEPS[0],
+      MAX_RUNS_PER_HOUR,
+    ]);
+    const before = afterTasks.length;
+    const r1 = await callRoute(research, { method: "POST", path: `/api/leads/${bid}/research`, id: bid });
+    check(`cap: POST /research is 429 after ${MAX_RUNS_PER_HOUR} runs in the hour`, r1.status === 429 && r1.data?.error === RUN_LIMIT_MESSAGE, r1.data);
+    const s1 = await callRoute(asHandler(steerRoute.POST), { method: "POST", path: `/api/leads/${bid}/steer`, id: bid, body: { instruction: "dig into their compute" } });
+    check("cap: POST /steer is 429 too", s1.status === 429 && s1.data?.error === RUN_LIMIT_MESSAGE, s1.data);
+    check("cap: nothing was claimed or handed to after()", afterTasks.length === before && (await getLead(bid))?.researchStatus === "idle");
+    const created = await callRoute(asHandler(leadsRoute.POST), {
+      method: "POST",
+      path: "/api/leads",
+      body: { linkedinUrl: `linkedin.com/in/le-api-cap-${randomBytes(4).toString("hex")}` },
+    });
+    const capLead = created.data?.lead as Lead | undefined;
+    if (capLead?.id) tempIds.push(capLead.id);
+    check(
+      "cap: POST /api/leads still creates the lead (201), without a run",
+      created.status === 201 && capLead?.researchStatus === "idle" && capLead?.stage === "new" && afterTasks.length === before,
+      created.data,
+    );
+    const capEvents = capLead ? await listEvents(capLead.id) : [];
+    check(
+      "cap: an event on the new lead says why research did not start",
+      capEvents.some((e) => e.type === "error" && /did not start/.test(e.message) && e.message.includes(String(MAX_RUNS_PER_HOUR))),
+      capEvents.map((e) => `${e.type}: ${e.message}`),
+    );
+    await query("delete from le_events where lead_id = $1 and type = 'step'", [bid]);
+    const r2 = await callRoute(research, { method: "POST", path: `/api/leads/${bid}/research`, id: bid });
+    check("cap: under the cap again, POST /research is 202", r2.status === 202, r2.data);
+  } finally {
+    for (const tempId of tempIds) await deleteLead(tempId).catch(() => undefined);
+    console.log(`  (cleaned up ${tempIds.length} temp leads and their events)`);
+    restoreEnv();
+  }
+}
+
 async function main(): Promise<void> {
   const started = Date.now();
   try {
@@ -832,6 +1076,7 @@ async function main(): Promise<void> {
     await testProxy();
     await testRoutes();
     await testHubSpot();
+    await testRunGuards();
   } finally {
     restoreEnv();
     globalThis.fetch = realFetch;

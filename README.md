@@ -53,6 +53,24 @@ npm run dev                  # http://localhost:3000
 
 The access gate is off locally unless `APP_PASSWORD` is set.
 
+### Usage panel (owner only)
+
+```bash
+npm run admin                # then open http://127.0.0.1:3001/admin
+```
+
+Shows what every API key has used and spent, per lead and in total, with live balances
+(Hunter credits, OpenRouter limit, Apify monthly usage, Apollo credits, Unipile status).
+It has no password because it only answers on your own machine: on Vercel, on a
+production build or from any other computer, `/admin` is a plain 404.
+
+### Analytics
+
+PostHog tracks page views and named actions (lead created, drafts copied, marked as sent,
+stage changes, steering, settings saved) through the app's own `/ingest` path. Only ids,
+counts and timings are sent; never names, emails, notes or draft text. Session recording
+and autocapture are off. Set `NEXT_PUBLIC_POSTHOG_KEY` to turn it on (it is fixed at build time).
+
 ### Environment variables
 
 See `.env.example` for every variable with a description. Required: `DATABASE_URL`,
@@ -67,7 +85,9 @@ The Settings page shows which integrations are on and why.
 
 1. Push this repo to GitHub and import it in Vercel (framework: Next.js).
 2. Add every variable from `.env.local` in Project Settings → Environment Variables,
-   plus `APP_PASSWORD` and `SESSION_SECRET`. Mark the keys as sensitive.
+   plus `APP_PASSWORD` and `SESSION_SECRET`. Mark the keys as sensitive. Without
+   `APP_PASSWORD` the deployment answers 503 to everything, unless `ALLOW_OPEN_ACCESS=1`
+   is set to run it open on purpose (research runs stay capped at 20 an hour).
 3. Keep Fluid compute on (the default). Routes that start research set
    `maxDuration = 300`, and a run is planned to finish within 280 seconds.
 4. Deploy, open the URL, log in with the team password, and add a lead.

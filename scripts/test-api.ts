@@ -1071,6 +1071,8 @@ async function testRunGuards(): Promise<void> {
 
 async function main(): Promise<void> {
   const started = Date.now();
+  // Every provider call in this harness is mocked: keep those fake calls out of the usage ledger.
+  process.env.USAGE_LEDGER_DISABLED = "1";
   try {
     await testAuth();
     await testProxy();

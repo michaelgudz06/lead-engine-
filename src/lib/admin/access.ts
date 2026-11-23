@@ -19,12 +19,20 @@ import "server-only";
  *     address the server was started on ("localhost" unless -H was given).
  *  4. Forwarding headers, when present, point at this computer as well: X-Forwarded-Host,
  *     every hop of X-Forwarded-For, X-Real-IP and Forwarded. A tunnel or proxy in front of
- *     the dev server puts the visitor's host or address there. In route handlers and pages,
- *     Next fills X-Forwarded-For from the socket when the client sent none, so a request
- *     from another machine (to a dev server listening on every interface) is refused there.
+ *     the dev server puts the visitor's host or address there. Next fills X-Forwarded-For
+ *     from the socket when the client sent none (checked on Next 16.4.6: already in the
+ *     proxy), so another machine that only fakes the Host header is refused.
  *  5. /api/admin/* only: not sent by a browser on behalf of another site (Sec-Fetch-Site
  *     cross-site or same-site), so no web page can make the panel call providers or
  *     download the ledger. Pages can be opened from anywhere on this computer.
+ *
+ * The limit of any header check: Next keeps an X-Forwarded-For the client sent, and nothing
+ * in a request shows the real socket address. So on a server that listens on every
+ * interface (`npm run dev`), another machine on the network that fakes both Host and
+ * X-Forwarded-For could read the panel, as it can already read the rest of the app there
+ * when APP_PASSWORD is unset. `npm run admin` listens on 127.0.0.1 only, so nothing else can
+ * connect at all; that is the way to run the panel. Setting APP_PASSWORD closes it too
+ * (the team gate runs first).
  *
  * Pure: reads env and headers, no I/O. The team gate (APP_PASSWORD) is separate and runs
  * first in the proxy.

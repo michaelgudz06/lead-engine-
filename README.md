@@ -90,6 +90,8 @@ The Settings page shows which integrations are on and why.
    is set to run it open on purpose (research runs stay capped at 20 an hour).
 3. Keep Fluid compute on (the default). Routes that start research set
    `maxDuration = 300`, and a run is planned to finish within 280 seconds.
+   `vercel.json` pins functions to `cle1` (Cleveland), next to the Neon database in
+   `us-east-2`; change it if your database lives elsewhere.
 4. Deploy, open the URL, log in with the team password, and add a lead.
 
 Vercel's Hobby plan is for non-commercial use. It is fine for a prototype; move the

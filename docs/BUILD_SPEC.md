@@ -188,7 +188,8 @@ All JSON. Errors: `{ error: string }` with a 4xx/5xx status. Validate bodies wit
 | POST /api/leads/[id]/events | `{ type: "copied" \| "note", message }` | `{ ok: true }` |
 | POST /api/leads/[id]/hubspot | | `{ ok, contactId?, companyId?, dealId? }`; 400 when not configured |
 | GET /api/settings, PUT /api/settings | `Partial<Settings>` | `{ settings }` |
-| GET /api/status | | `{ providers: ProviderStatus[], model: { name, effort } }` |
+| GET /api/status | | `{ providers: ProviderStatus[], model: { name, effort }, authEnabled: boolean }` |
+| POST /api/login, POST /api/logout | `{ password }` / none | `{ ok: true }` or 401 (see 8b) |
 
 Route handlers that start research must set `export const maxDuration = 300` and use
 `after` from `next/server`.
@@ -248,6 +249,27 @@ friendly empty and error states):
 
 `src/lib/api-client.ts` (ui agent) holds typed fetch helpers for every endpoint in section 7.
 
+## 8b. Access gate (api agent + ui agent)
+
+The app has no user accounts. When deployed it must not be open to the internet: anyone with
+the URL could read leads and spend API credits. Add one shared team password:
+
+- `APP_PASSWORD` and `SESSION_SECRET` env vars (already in `src/lib/env.ts`). When
+  `APP_PASSWORD` is unset (local dev), the gate is off.
+- `src/lib/auth.ts` (api agent): create and verify a signed session cookie with Web Crypto
+  HMAC-SHA256 over an expiry timestamp using `SESSION_SECRET` (works in the proxy runtime);
+  constant-time comparison of the password; cookie `le_session`, HttpOnly, Secure in
+  production, SameSite=Lax, 30-day expiry.
+- `src/proxy.ts` (api agent): Next 16 renamed middleware to proxy; read
+  `node_modules/next/dist/docs/01-app/01-getting-started/16-proxy.md` first. Redirect
+  unauthenticated page requests to `/login?next=...`; answer unauthenticated `/api/*`
+  requests with 401 JSON; always allow `/login`, `/api/login`, `/_next/*`, favicon and
+  public files.
+- `POST /api/login { password }` sets the cookie (small fixed delay on failure);
+  `POST /api/logout` clears it (api agent).
+- `src/app/login/page.tsx` (ui agent): a calm, centred password form in the same style,
+  then redirect to `next`. Add a "Log out" link in the app shell when the gate is on.
+
 ## 9. File ownership
 
 | Owner | Files |
@@ -257,8 +279,8 @@ friendly empty and error states):
 | exa-hub agent | `src/lib/providers/exa.ts`, `src/lib/providers/huggingface.ts`, `src/lib/providers/abstract.ts`, `scripts/test-exa-hub.ts` |
 | x agent | `src/lib/providers/xsearch.ts`, `scripts/test-x.ts` |
 | research agent | `src/lib/claude.ts`, `src/lib/research/**`, `scripts/test-research.ts` |
-| api agent | `src/app/api/**`, `src/lib/providers/hubspot.ts`, `scripts/test-api.ts` |
-| ui agent | `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/globals.css`, `src/app/leads/**`, `src/app/pipeline/**`, `src/app/settings/**`, `src/components/**`, `src/lib/api-client.ts`, `public/**` |
+| api agent | `src/app/api/**`, `src/lib/providers/hubspot.ts`, `src/lib/auth.ts`, `src/proxy.ts`, `scripts/test-api.ts` |
+| ui agent | `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/globals.css`, `src/app/leads/**`, `src/app/pipeline/**`, `src/app/settings/**`, `src/app/login/**`, `src/components/**`, `src/lib/api-client.ts`, `public/**` |
 
 ## 10. Definition of done (every builder)
 

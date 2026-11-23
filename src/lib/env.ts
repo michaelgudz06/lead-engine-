@@ -20,6 +20,8 @@ const KEYS = [
   "OPENROUTER_X_MODEL",
   "ABSTRACT_API_KEY",
   "HUBSPOT_ACCESS_TOKEN",
+  "APP_PASSWORD",
+  "SESSION_SECRET",
 ] as const;
 
 export type EnvKey = (typeof KEYS)[number];

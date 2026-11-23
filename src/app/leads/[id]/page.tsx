@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { daysFromNow, track } from "@/lib/analytics";
 import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, startResearch, steerLead, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
 import { nextAction } from "@/lib/next-action";
 import type { Finding, Lead, LeadDetail } from "@/lib/types";
@@ -86,6 +87,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     setNotice(null);
     try {
       await startResearch(lead.id);
+      track("research_rerun", { leadId: lead.id, hadResearch: hasResearch, afterFailure: failed });
       // Show the running state at once; the next poll brings the real step.
       setLead({ ...lead, researchStatus: "running", researchStep: "Starting research", researchError: null, researchStartedAt: new Date().toISOString() });
     } catch (err) {
@@ -120,9 +122,11 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     try {
       const res = await pushToHubspot(lead.id);
       if (res.ok === false) throw new Error("HubSpot did not accept the lead.");
+      track("hubspot_pushed", { leadId: lead.id, ok: true });
       setNotice("Pushed to HubSpot.");
       void reload();
     } catch (err) {
+      track("hubspot_pushed", { leadId: lead.id, ok: false });
       setActionError(`HubSpot: ${errorMessage(err)}`);
     } finally {
       setPushing(false);
@@ -175,7 +179,12 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
               {lead.location}
             </p>
           )}
-          <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[13.5px] wrap-anywhere">
+          <div
+            className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[13.5px] wrap-anywhere"
+            onClick={(e) => {
+              if (linkedin && e.target instanceof Element && e.target.closest("a")?.getAttribute("href") === linkedin) track("linkedin_profile_opened", { leadId: lead.id, from: "header" });
+            }}
+          >
             {linkedin && <ExternalLink href={linkedin}>LinkedIn ↗</ExternalLink>}
             {lead.email && (
               <span>
@@ -251,16 +260,74 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
               </div>
               <div>
                 <Label htmlFor="stage">Stage</Label>
-                <StageSelect id="stage" value={lead.stage} onChange={(stage) => void patch({ stage })} />
+                <StageSelect
+                  id="stage"
+                  value={lead.stage}
+                  onChange={(stage) => {
+                    const from = lead.stage;
+                    void patch({ stage }).then((ok) => {
+                      if (ok && stage !== from) track("stage_changed", { leadId: lead.id, from, to: stage, surface: "lead" });
+                    });
+                  }}
+                />
               </div>
-              <SavedField id="owner" label="Owner" initial={lead.owner ?? ""} placeholder="Who is on this lead" onSave={(v) => patch({ owner: v.trim() || null })} />
+              <SavedField
+                id="owner"
+                label="Owner"
+                initial={lead.owner ?? ""}
+                placeholder="Who is on this lead"
+                onSave={async (v) => {
+                  const ok = await patch({ owner: v.trim() || null });
+                  if (ok) track("owner_set", { leadId: lead.id, cleared: !v.trim() });
+                  return ok;
+                }}
+              />
               <div>
-                <Label htmlFor="nextStepAt" hint={lead.nextStepAt ? <button type="button" className="underline underline-offset-2 hover:text-ink" onClick={() => void patch({ nextStepAt: null })}>Clear</button> : undefined}>
+                <Label
+                  htmlFor="nextStepAt"
+                  hint={
+                    lead.nextStepAt ? (
+                      <button
+                        type="button"
+                        className="underline underline-offset-2 hover:text-ink"
+                        onClick={() =>
+                          void patch({ nextStepAt: null }).then((ok) => {
+                            if (ok) track("followup_set", { leadId: lead.id, cleared: true });
+                          })
+                        }
+                      >
+                        Clear
+                      </button>
+                    ) : undefined
+                  }
+                >
                   Follow up on
                 </Label>
-                <input id="nextStepAt" type="date" className="field" value={toDateInput(lead.nextStepAt)} onChange={(e) => void patch({ nextStepAt: e.target.value ? fromDateInput(e.target.value) : null })} />
+                <input
+                  id="nextStepAt"
+                  type="date"
+                  className="field"
+                  value={toDateInput(lead.nextStepAt)}
+                  onChange={(e) => {
+                    const nextStepAt = e.target.value ? fromDateInput(e.target.value) : null;
+                    void patch({ nextStepAt }).then((ok) => {
+                      if (ok) track("followup_set", { leadId: lead.id, cleared: !nextStepAt, inDays: daysFromNow(nextStepAt) });
+                    });
+                  }}
+                />
               </div>
-              <SavedField id="notes" label="Your notes" multiline initial={lead.notes ?? ""} placeholder="How you know them, what was said, what you want" onSave={(v) => patch({ notes: v.trim() || null })} />
+              <SavedField
+                id="notes"
+                label="Your notes"
+                multiline
+                initial={lead.notes ?? ""}
+                placeholder="How you know them, what was said, what you want"
+                onSave={async (v) => {
+                  const ok = await patch({ notes: v.trim() || null });
+                  if (ok) track("notes_saved", { leadId: lead.id, cleared: !v.trim(), length: v.trim().length });
+                  return ok;
+                }}
+              />
               <dl className="space-y-1 border-t border-hairline pt-3 text-[13px] text-quiet">
                 <Meta label="Added" value={formatDate(lead.createdAt)} />
                 {lead.lastContactedAt && <Meta label="Last contacted" value={formatDate(lead.lastContactedAt)} />}
@@ -348,6 +415,7 @@ function SteerSection({ leadId, running, onStarted }: { leadId: string; running:
     setError(null);
     try {
       await steerLead(leadId, text);
+      track("steer_sent", { leadId, instructionLength: text.length });
       setInstruction("");
       onStarted();
     } catch (err) {

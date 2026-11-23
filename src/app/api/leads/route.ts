@@ -1,5 +1,6 @@
 import { connection, type NextRequest } from "next/server";
 import { z } from "zod";
+import { trackResearchRun } from "@/lib/analytics-server";
 import { linkedinSlug, normaliseLinkedinUrl } from "@/lib/http";
 import { addEvent } from "@/lib/repo/events";
 import { claimResearch, createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
@@ -90,7 +91,7 @@ export async function POST(request: NextRequest) {
       ).catch((err) => console.error(`[api] could not log the skipped run for lead ${lead.id}: ${errorText(err)}`));
     } else if (await claimResearch(lead.id)) {
       const id = lead.id;
-      runAfterResponse(id, "Research", () => runResearch(id));
+      runAfterResponse(id, "Research", () => trackResearchRun(id, () => runResearch(id)));
     }
     // Re-read so the reply already shows research as running.
     return json({ lead: (await getLead(lead.id)) ?? lead }, 201);

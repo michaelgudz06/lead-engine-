@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { track } from "@/lib/analytics";
 import { ApiError, errorMessage, login } from "@/lib/api-client";
 import { Button, Label, Notice } from "@/components/ui";
 
@@ -38,6 +39,7 @@ export default function LoginPage() {
     setError(null);
     try {
       await login(password);
+      track("login_succeeded", {}, { beforeUnload: true });
       // A full navigation so the proxy sees the new session cookie.
       window.location.assign(safeNext());
     } catch (err) {

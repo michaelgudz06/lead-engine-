@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { angleRef, DraftEditTracker, track } from "@/lib/analytics";
 import { errorMessage, logEvent, markSent, updateLead } from "@/lib/api-client";
 import { gmailComposeUrl } from "@/lib/compose";
 import type { Angle, Finding, Lead } from "@/lib/types";
@@ -163,6 +164,11 @@ export function AnglesSection({
     };
   }, [lead.id]);
 
+  // Analytics: draft_edited once per angle per page view; whatever is still waiting goes on unmount.
+  const [draftEdits] = useState(() => new DraftEditTracker());
+  useEffect(() => () => draftEdits.flush(), [draftEdits]);
+  const refOf = (a: Angle) => angleRef(lead.id, a.id, local.indexOf(a));
+
   function edit(id: string, change: (a: Angle) => Angle) {
     version.current += 1;
     setLocal((prev) => prev.map((a) => (a.id === id ? change(a) : a)));
@@ -198,6 +204,8 @@ export function AnglesSection({
     setActionError(null);
     setCopied(kind);
     setTimeout(() => setCopied((c) => (c === kind ? null : c)), 1800);
+    if (kind === "email") track("email_copied", refOf(active));
+    else track("linkedin_message_copied", { ...refOf(active), length: active.linkedinMessage.length, overLimit: active.linkedinMessage.length > LINKEDIN_LIMIT });
     // The copy itself already worked; logging it is best effort.
     logEvent(lead.id, "copied", `Copied the ${kind === "email" ? "email" : "LinkedIn message"} for "${active.name}"`).then(onActivity, () => {});
   }
@@ -209,6 +217,7 @@ export function AnglesSection({
     try {
       await saveRef.current();
       const updated = await markSent(lead.id, active.id, channel);
+      track("marked_sent", { ...refOf(active), channel });
       onLeadChange(updated);
       onActivity();
       setSendOpen(false);
@@ -267,6 +276,7 @@ export function AnglesSection({
               aria-controls="angle-panel"
               tabIndex={selected ? 0 : -1}
               onClick={() => {
+                if (a.id !== active.id) track("angle_viewed", { ...refOf(a), recommended: a.id === recommendedId });
                 setActiveId(a.id);
                 setSendOpen(false);
                 setActionError(null);
@@ -275,6 +285,7 @@ export function AnglesSection({
                 if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
                 const i = local.findIndex((x) => x.id === a.id);
                 const next = local[(i + (e.key === "ArrowRight" ? 1 : local.length - 1)) % local.length];
+                if (next.id !== active.id) track("angle_viewed", { ...refOf(next), recommended: next.id === recommendedId });
                 setActiveId(next.id);
                 document.getElementById(`angle-tab-${next.id}`)?.focus();
               }}
@@ -311,7 +322,10 @@ export function AnglesSection({
               value={active.email.subject}
               readOnly={locked}
               maxLength={300}
-              onChange={(e) => edit(active.id, (a) => ({ ...a, email: { ...a.email, subject: e.target.value } }))}
+              onChange={(e) => {
+                edit(active.id, (a) => ({ ...a, email: { ...a.email, subject: e.target.value } }));
+                draftEdits.edited(active.id, refOf(active), "subject");
+              }}
               onBlur={() => void save()}
             />
             <div className="mt-3">
@@ -325,13 +339,21 @@ export function AnglesSection({
                 value={active.email.body}
                 readOnly={locked}
                 maxLength={10000}
-                onChange={(e) => edit(active.id, (a) => ({ ...a, email: { ...a.email, body: e.target.value } }))}
+                onChange={(e) => {
+                  edit(active.id, (a) => ({ ...a, email: { ...a.email, body: e.target.value } }));
+                  draftEdits.edited(active.id, refOf(active), "body");
+                }}
                 onBlur={() => void save()}
               />
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button onClick={() => copy("email")}>{copied === "email" ? "Copied" : "Copy email"}</Button>
-              <ButtonLink external href={gmailComposeUrl({ to: lead.email, subject: active.email.subject, body: active.email.body })} title={lead.email ? `To ${lead.email}` : "No email found: add the address in Gmail"}>
+              <ButtonLink
+                external
+                href={gmailComposeUrl({ to: lead.email, subject: active.email.subject, body: active.email.body })}
+                title={lead.email ? `To ${lead.email}` : "No email found: add the address in Gmail"}
+                onClick={() => track("gmail_opened", { ...refOf(active), withRecipient: Boolean(lead.email) })}
+              >
                 Open in Gmail ↗
               </ButtonLink>
             </div>
@@ -352,7 +374,10 @@ export function AnglesSection({
               maxLength={2000}
               aria-invalid={liLength > LINKEDIN_LIMIT || undefined}
               aria-describedby={liLength > LINKEDIN_LIMIT ? "angle-linkedin-help" : undefined}
-              onChange={(e) => edit(active.id, (a) => ({ ...a, linkedinMessage: e.target.value }))}
+              onChange={(e) => {
+                edit(active.id, (a) => ({ ...a, linkedinMessage: e.target.value }));
+                draftEdits.edited(active.id, refOf(active), "linkedin");
+              }}
               onBlur={() => void save()}
             />
             {liLength > LINKEDIN_LIMIT && (
@@ -363,7 +388,7 @@ export function AnglesSection({
             <div className="mt-3 flex flex-wrap gap-2">
               <Button onClick={() => copy("linkedin")}>{copied === "linkedin" ? "Copied" : "Copy LinkedIn message"}</Button>
               {profileUrl && (
-                <ButtonLink external href={profileUrl}>
+                <ButtonLink external href={profileUrl} onClick={() => track("linkedin_profile_opened", { leadId: lead.id, from: "angles" })}>
                   Open LinkedIn profile ↗
                 </ButtonLink>
               )}

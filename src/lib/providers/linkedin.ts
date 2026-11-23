@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError, normaliseLinkedinUrl } from "../http";
+import { metered } from "../usage/ledger";
+import { apifyCostUsd, FREE, type ApifyOperation } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -352,11 +354,13 @@ async function resolveUnipileConnection(settings: { key: string; routes: Unipile
   let lastError: unknown = new LinkedInError("Unipile has no route to try");
   for (const route of settings.routes) {
     try {
-      const list = await fetchJson<unknown>(unipileUrl(route, "/accounts", { limit: 250 }), {
-        headers: { "X-API-KEY": settings.key },
-        timeoutMs: 12_000,
-        retry: false,
-      });
+      const list = await metered({ provider: "unipile", operation: "accounts", onOk: unipileUsed, onFail: unipileUsed }, () =>
+        fetchJson<unknown>(unipileUrl(route, "/accounts", { limit: 250 }), {
+          headers: { "X-API-KEY": settings.key },
+          timeoutMs: 12_000,
+          retry: false,
+        }),
+      );
       return { ...route, accountId: pickLinkedInAccount(list) };
     } catch (err) {
       if (err instanceof HttpError || err instanceof LinkedInError) throw err;
@@ -395,6 +399,20 @@ function pickLinkedInAccount(list: unknown): string {
   return id;
 }
 
+/** Usage ledger: Unipile is a flat subscription, so requests are counted and cost nothing each. */
+function unipileUsed() {
+  return { units: { requests: 1 }, ...FREE };
+}
+
+/** Ledger operation for a Unipile path, without the ids in it. */
+function unipileOperation(path: string): string {
+  if (/^\/users\/[^/]+\/posts$/.test(path)) return "posts";
+  if (path.startsWith("/users/")) return "profile";
+  if (path === "/linkedin/search") return "company-search";
+  if (path.startsWith("/linkedin/company/")) return "company";
+  return "request";
+}
+
 async function unipileRequest<T>(
   method: "GET" | "POST",
   path: string,
@@ -410,14 +428,16 @@ async function unipileRequest<T>(
     throw err;
   }
   try {
-    return await fetchJson<T>(unipileUrl(conn, path, { ...opts.query, account_id: conn.accountId }), {
-      method,
-      headers: { "X-API-KEY": settings.key },
-      body: opts.body,
-      timeoutMs: opts.timeoutMs,
-      // No blind retry: each call is a LinkedIn request on the owner's account, and Apify is the fallback.
-      retry: false,
-    });
+    return await metered({ provider: "unipile", operation: unipileOperation(path), onOk: unipileUsed, onFail: unipileUsed }, () =>
+      fetchJson<T>(unipileUrl(conn, path, { ...opts.query, account_id: conn.accountId }), {
+        method,
+        headers: { "X-API-KEY": settings.key },
+        body: opts.body,
+        timeoutMs: opts.timeoutMs,
+        // No blind retry: each call is a LinkedIn request on the owner's account, and Apify is the fallback.
+        retry: false,
+      }),
+    );
   } catch (err) {
     // The cached route or account may be stale (network change, reconnected account): re-resolve next time.
     if (!(err instanceof HttpError) || err.status === 401 || err.status === 403) resetUnipileConnection();
@@ -549,14 +569,30 @@ async function runApifyActor(actor: ApifyActor, input: Json, opts: { runTimeoutS
     clean: "true",
     format: "json",
   });
-  const data = await fetchJson<unknown>(`${APIFY_API}/acts/${actor.id}/run-sync-get-dataset-items?${qs}`, {
-    method: "POST",
-    // The token goes in a header, not in ?token=: HttpError keeps the URL and could be logged.
-    headers: { authorization: `Bearer ${token}` },
-    body: input,
-    timeoutMs: (opts.runTimeoutSecs + 25) * 1000,
-    retry: false,
-  });
+  // Usage ledger: the actors charge per item returned. The sync endpoint does not report the
+  // charge, so it is estimated from the price table; a failed run's charge is unknown.
+  const operation: ApifyOperation =
+    actor.id === APIFY_ACTORS.profile.id ? "profile" : actor.id === APIFY_ACTORS.posts.id ? "posts" : "company";
+  const data = await metered(
+    {
+      provider: "apify",
+      operation,
+      onOk: (answer) => {
+        const items = Array.isArray(answer) ? answer.length : 0;
+        return { units: { runs: 1, items }, costUsd: apifyCostUsd(operation, items), costBasis: "estimated" };
+      },
+      onFail: () => ({ units: { runs: 1, items: 0 } }),
+    },
+    () =>
+      fetchJson<unknown>(`${APIFY_API}/acts/${actor.id}/run-sync-get-dataset-items?${qs}`, {
+        method: "POST",
+        // The token goes in a header, not in ?token=: HttpError keeps the URL and could be logged.
+        headers: { authorization: `Bearer ${token}` },
+        body: input,
+        timeoutMs: (opts.runTimeoutSecs + 25) * 1000,
+        retry: false,
+      }),
+  );
   if (!Array.isArray(data)) throw new LinkedInError(`${actor.name} returned an unexpected response (not a list)`);
   return data;
 }

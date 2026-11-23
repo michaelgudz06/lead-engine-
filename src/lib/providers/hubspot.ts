@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import type { Angle, Lead, ProviderStatus } from "../types";
+import { metered, withUsageContext } from "../usage/ledger";
+import { FREE } from "../usage/prices";
 
 /**
  * HubSpot (V1). Needs HUBSPOT_ACCESS_TOKEN from a HubSpot private app with
@@ -110,7 +112,12 @@ export function hubspotStatus(): ProviderStatus {
  * with the ids of anything already written, so a retry can pick up where it stopped
  * (every step looks for existing records first).
  */
-export async function pushLeadToHubSpot(input: HubSpotPushInput): Promise<HubSpotPushResult> {
+export function pushLeadToHubSpot(input: HubSpotPushInput): Promise<HubSpotPushResult> {
+  // Usage ledger: the push's requests are tagged to the lead and written before this returns.
+  return withUsageContext(input?.lead?.id ?? null, () => pushLead(input));
+}
+
+async function pushLead(input: HubSpotPushInput): Promise<HubSpotPushResult> {
   const result: HubSpotPushResult = { ok: false, created: [], warnings: [] };
   const token = optionalEnv("HUBSPOT_ACCESS_TOKEN");
   if (!token) return { ...result, error: "HubSpot is not configured: set HUBSPOT_ACCESS_TOKEN." };
@@ -657,6 +664,15 @@ function parseObject(raw: unknown): CrmObject | null {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Ledger operation for a CRM path, e.g. "POST objects/contacts/search": no version, no record ids or emails. */
+function hubspotOperation(method: string, path: string): string {
+  const words = path
+    .split("/")
+    .filter((p) => /^[a-z_]{2,30}$/.test(p) && p !== "crm")
+    .slice(0, 3);
+  return `${method} ${words.join("/") || "request"}`;
+}
+
 class HubSpotClient {
   private readonly deadline = AbortSignal.timeout(PUSH_BUDGET_MS);
 
@@ -674,7 +690,19 @@ class HubSpotClient {
    * always safe) and, for idempotent calls only, on 5xx and network errors: a
    * create is never sent twice, since a lost reply may hide a record that exists.
    */
-  async call(
+  call(
+    method: "GET" | "POST" | "PATCH" | "PUT",
+    path: string,
+    opts: { body?: unknown; query?: Record<string, string>; idempotent: boolean },
+  ): Promise<unknown> {
+    // Usage ledger: the CRM API is free; requests are counted. One row per call, its retry included.
+    const used = () => ({ units: { requests: 1 }, ...FREE });
+    return metered({ provider: "hubspot", operation: hubspotOperation(method, path), onOk: used, onFail: used }, () =>
+      this.callUnmetered(method, path, opts),
+    );
+  }
+
+  private async callUnmetered(
     method: "GET" | "POST" | "PATCH" | "PUT",
     path: string,
     opts: { body?: unknown; query?: Record<string, string>; idempotent: boolean },

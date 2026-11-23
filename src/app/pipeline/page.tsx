@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import { track } from "@/lib/analytics";
 import { errorMessage, listLeads, updateLead } from "@/lib/api-client";
 import { nextAction, sortNeedsYouFirst } from "@/lib/next-action";
 import { STAGES, STAGE_LABELS, type Lead, type Stage } from "@/lib/types";
@@ -23,6 +24,7 @@ export default function PipelinePage() {
     try {
       const saved = await updateLead(lead.id, { stage });
       setData((prev) => prev?.map((l) => (l.id === lead.id ? saved : l)) ?? prev);
+      track("stage_changed", { leadId: lead.id, from: lead.stage, to: stage, surface: "pipeline" });
     } catch (err) {
       setData((prev) => prev?.map((l) => (l.id === lead.id ? { ...l, stage: lead.stage } : l)) ?? prev);
       setMoveError(`Could not move ${leadName(lead)}: ${errorMessage(err)}`);

@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, requireEnv } from "../env";
 import { fetchJson, HttpError } from "../http";
+import { metered } from "../usage/ledger";
+import { exaEstimateUsd, exaReportedCostUsd } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -286,8 +288,34 @@ let pausedUntil = 0;
 let pausedReason = "";
 
 async function call(key: string, path: string, body: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
-  // fetchJson retries once on 429, 5xx and network errors, never on 4xx answers.
-  return fetchJson<unknown>(`${API}${path}`, { method: "POST", headers: { "x-api-key": key }, body, timeoutMs });
+  // Usage ledger: one row per call, with the cost Exa reports (costDollars) when it sends one.
+  const operation = path === "/contents" ? "contents" : "search";
+  return metered(
+    {
+      provider: "exa",
+      operation,
+      onOk: (answer) => {
+        const results = isRecordForUsage(answer) && Array.isArray(answer.results) ? answer.results.length : 0;
+        const units: Record<string, number> = operation === "search" ? { searches: 1, results } : { contents: results };
+        const reported = exaReportedCostUsd(answer);
+        if (reported !== null) return { units, costUsd: reported, costBasis: "reported" };
+        // A search is billed for the results asked for, which can be more than came back.
+        const billed = operation === "search" && typeof body.numResults === "number" ? Math.max(results, body.numResults) : results;
+        return { units, costUsd: exaEstimateUsd(operation, { results: billed }), costBasis: "estimated" };
+      },
+      // Exa does not bill a request it answered with an error; a timeout is unknown.
+      onFail: (err) => {
+        const units: Record<string, number> = operation === "search" ? { searches: 1 } : {};
+        return err instanceof HttpError ? { units, costUsd: 0, costBasis: "free" } : { units };
+      },
+    },
+    // fetchJson retries once on 429, 5xx and network errors, never on 4xx answers.
+    () => fetchJson<unknown>(`${API}${path}`, { method: "POST", headers: { "x-api-key": key }, body, timeoutMs }),
+  );
+}
+
+function isRecordForUsage(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 interface ExaErrorBody {

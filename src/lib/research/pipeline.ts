@@ -3,6 +3,7 @@ import { clearFindings } from "../repo/findings";
 import { finishResearch, getLead } from "../repo/leads";
 import { getSettings } from "../repo/settings";
 import { DEFAULT_SETTINGS, type Settings } from "../types";
+import { withUsageContext } from "../usage/ledger";
 import { runGapFill } from "./agent";
 import { LeadGoneError, note, step } from "./context";
 import { extract } from "./extract";
@@ -59,7 +60,13 @@ async function finish(leadId: string, started: number, failure?: unknown): Promi
 }
 
 /** Full research run for a lead whose research was already claimed with claimResearch(). */
-export async function runResearch(leadId: string): Promise<void> {
+export function runResearch(leadId: string): Promise<void> {
+  // Usage ledger: every outside call in the run is tagged to this lead, and the rows are
+  // flushed before the promise resolves, so a serverless function cannot drop them.
+  return withUsageContext(leadId, () => research(leadId));
+}
+
+async function research(leadId: string): Promise<void> {
   const started = Date.now();
   try {
     const lead = await getLead(leadId);
@@ -112,7 +119,12 @@ export async function runResearch(leadId: string): Promise<void> {
  * more technical" (rewrite drafts) or "dig into their compute setup" (more research,
  * then refresh brief and angles). Research must already be claimed with claimResearch().
  */
-export async function steerLead(leadId: string, instruction: string): Promise<void> {
+export function steerLead(leadId: string, instruction: string): Promise<void> {
+  // Usage ledger: same wrapper as runResearch.
+  return withUsageContext(leadId, () => steerRun(leadId, instruction));
+}
+
+async function steerRun(leadId: string, instruction: string): Promise<void> {
   const started = Date.now();
   try {
     const lead = await getLead(leadId);

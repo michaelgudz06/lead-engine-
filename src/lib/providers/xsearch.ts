@@ -1,6 +1,7 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError } from "../http";
+import { recordUsage } from "../usage/ledger";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -784,6 +785,23 @@ async function callGrok(call: GrokCall): Promise<GrokResult> {
   } finally {
     info.ms = Date.now() - started;
     record(info);
+    // Usage ledger: OpenRouter's own billed cost when it sent one (X search fees included).
+    const u = info.usage;
+    recordUsage({
+      provider: "openrouter",
+      operation: call.kind === "handle" ? "x-handle" : "x-posts",
+      units: {
+        requests: 1,
+        xPosts: u?.xPostsFetched ?? 0,
+        xProfiles: u?.xUsersFetched ?? 0,
+        promptTokens: u?.promptTokens ?? 0,
+        completionTokens: u?.completionTokens ?? 0,
+      },
+      costUsd: u?.costUsd ?? null,
+      costBasis: u?.costUsd != null ? "reported" : "unknown",
+      ok: info.ok,
+      ms: info.ms,
+    });
   }
 }
 

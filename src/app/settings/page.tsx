@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { changedSettingsFields, track } from "@/lib/analytics";
 import { errorMessage, getSettings, getStatus, saveSettings, type StatusResponse } from "@/lib/api-client";
 import type { Settings } from "@/lib/types";
 import { modelLabel } from "@/components/format";
@@ -83,6 +84,8 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
         // Empty rows are just unfinished edits, not rules.
         criteria: form.criteria.map((c) => c.trim()).filter(Boolean),
       });
+      const fields = changedSettingsFields(saved, next);
+      track("settings_saved", { fields, fieldCount: fields.length, criteriaCount: next.criteria.length });
       setForm(next);
       setSaved(next);
       onSaved(next);

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { track } from "@/lib/analytics";
 import { SOURCES, SOURCE_LABELS, type Brief, type CompanyPicture, type Finding, type Lead, type LeadEvent, type Source } from "@/lib/types";
 import { elapsed, formatDate, formatDateTime, hostOf, safeUrl, timeAgo } from "../format";
 import { Button, Chip, ExternalLink, Skeleton, cx } from "../ui";
@@ -217,7 +218,15 @@ export function FindingsSection({ findings }: { findings: Finding[] }) {
           </span>
           {filteredCount > 0 && (
             <label className="flex cursor-pointer items-center gap-1.5 text-ink">
-              <input type="checkbox" className="h-3.5 w-3.5 accent-[#22221f]" checked={showFiltered} onChange={(e) => setShowFiltered(e.target.checked)} />
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 accent-[#22221f]"
+                checked={showFiltered}
+                onChange={(e) => {
+                  setShowFiltered(e.target.checked);
+                  track("findings_filter_toggled", { leadId: findings[0]?.leadId ?? null, showFiltered: e.target.checked, filteredOut: filteredCount });
+                }}
+              />
               Show filtered out ({filteredCount})
             </label>
           )}

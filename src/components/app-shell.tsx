@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { resetAnalytics, track } from "@/lib/analytics";
 import { getStatusCached, logout } from "@/lib/api-client";
 import { cx } from "./ui";
 
@@ -45,6 +46,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     } catch {
       // Even if the call failed, the login page is the right place to land.
     }
+    track("logged_out", {}, { beforeUnload: true });
+    resetAnalytics();
     // A full navigation, so no cached page data survives the session.
     // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.assign("/login");

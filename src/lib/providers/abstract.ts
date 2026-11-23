@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError } from "../http";
+import { metered } from "../usage/ledger";
+import { FREE } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -112,12 +114,16 @@ const EMPTY: InspectResult = {
 };
 
 function post(key: string, checkpointUri: string, pinVersion: boolean): Promise<unknown> {
-  return fetchJson<unknown>(ENDPOINT, {
-    method: "POST",
-    headers: { authorization: `Bearer ${key}`, ...(pinVersion ? { "abstract-version": API_VERSION } : {}) },
-    body: { checkpoint_uri: checkpointUri },
-    timeoutMs: TIMEOUT_MS,
-  });
+  // Usage ledger: inspect calls are free; requests are counted.
+  const used = () => ({ units: { requests: 1 }, ...FREE });
+  return metered({ provider: "abstract", operation: "inspect", onOk: used, onFail: used }, () =>
+    fetchJson<unknown>(ENDPOINT, {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, ...(pinVersion ? { "abstract-version": API_VERSION } : {}) },
+      body: { checkpoint_uri: checkpointUri },
+      timeoutMs: TIMEOUT_MS,
+    }),
+  );
 }
 
 /** Maps a CheckpointInspection. servable is null only together with an error. */

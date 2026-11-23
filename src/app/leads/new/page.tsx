@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { track } from "@/lib/analytics";
 import { ApiError, createLead, errorMessage } from "@/lib/api-client";
 import { normalizeLinkedinUrl } from "@/components/format";
 import { Button, ButtonLink, Label, Notice, PageTitle } from "@/components/ui";
@@ -43,6 +44,7 @@ export default function NewLeadPage() {
         ...(companyName.trim() ? { companyName: companyName.trim() } : {}),
         ...(notes.trim() ? { notes: notes.trim() } : {}),
       });
+      track("lead_created", { leadId: lead.id, withName: Boolean(name.trim()), withCompany: Boolean(companyName.trim()), withNotes: Boolean(notes.trim()) });
       router.push(`/leads/${lead.id}`);
       // Stay "busy" while the next page loads so the form cannot be sent twice.
     } catch (err) {

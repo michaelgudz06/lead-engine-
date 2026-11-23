@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { trackResearchRun } from "@/lib/analytics-server";
 import { claimResearch, getLead } from "@/lib/repo/leads";
 import { runResearch } from "@/lib/research/pipeline";
 import {
@@ -26,7 +27,7 @@ export async function POST(_request: NextRequest, ctx: LeadRouteContext) {
     if (!(await claimResearch(id))) {
       return (await getLead(id)) ? fail(409, "Research is already running for this lead.") : leadNotFound();
     }
-    runAfterResponse(id, "Research", () => runResearch(id));
+    runAfterResponse(id, "Research", () => trackResearchRun(id, () => runResearch(id)));
     return json({ ok: true }, 202);
   } catch (err) {
     return serverError("POST /api/leads/[id]/research", err);

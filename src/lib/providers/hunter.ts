@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError } from "../http";
+import { metered } from "../usage/ledger";
+import { creditCost, HUNTER_CREDITS_PER_FOUND_EMAIL, HUNTER_PLAN } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 import { companyDomain } from "./apollo";
 
@@ -72,11 +74,22 @@ export async function findEmail(input: {
     }
     params.set("max_duration", String(MAX_DURATION_S));
 
-    const body = await fetchJson<unknown>(`${ENDPOINT}?${params.toString()}`, {
-      headers: { "X-API-KEY": key },
-      timeoutMs: TIMEOUT_MS,
-      retry: false,
-    });
+    // Usage ledger: every lookup is counted; a credit is used only when an address came back.
+    const used = (credits: number) => ({ units: { lookups: 1, credits }, ...creditCost(credits, HUNTER_PLAN) });
+    const body = await metered(
+      {
+        provider: "hunter",
+        operation: "email-finder",
+        onOk: (answer) => used(mapResult(answer).email ? HUNTER_CREDITS_PER_FOUND_EMAIL : 0),
+        onFail: () => used(0),
+      },
+      () =>
+        fetchJson<unknown>(`${ENDPOINT}?${params.toString()}`, {
+          headers: { "X-API-KEY": key },
+          timeoutMs: TIMEOUT_MS,
+          retry: false,
+        }),
+    );
     return mapResult(body);
   } catch (err) {
     return describeError(err, none);

@@ -5,6 +5,8 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { z } from "zod";
 import { CLAUDE_EFFORT, CLAUDE_MODEL, requireEnv } from "./env";
 import { addUsage } from "./repo/leads";
+import { currentUsageLeadId, recordUsage as recordLedger, withUsageContext } from "./usage/ledger";
+import { claudeCostUsd, claudeUnits } from "./usage/prices";
 
 /**
  * The single place the app talks to Claude.
@@ -64,9 +66,78 @@ function anthropic(): Anthropic {
     }
     // maxRetries 1: the SDK retries once on 429, 529/5xx and connection errors,
     // honouring retry-after. More retries would blow the run's time budget.
-    client = new Anthropic({ apiKey, maxRetries: 1, timeout: DEFAULT_TIMEOUT_MS });
+    client = new Anthropic({ apiKey, maxRetries: 1, timeout: DEFAULT_TIMEOUT_MS, fetch: meteredFetch });
   }
   return client;
+}
+
+/**
+ * Usage ledger (le_usage): the one place every request to the Claude API passes through,
+ * so every model response is counted with its real token numbers. That includes each
+ * tool-runner iteration, a reply the SDK later rejects as unparseable, and the SDK's own
+ * retry. A request that got no model response (HTTP error, timeout) is one failed row with
+ * no tokens. The response handed back to the SDK is the original, untouched: the numbers
+ * are read from a copy, before returning, so a run that ends right after cannot lose the row.
+ * Each response is priced on its own because the tier depends on that request's prompt size.
+ */
+async function meteredFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const started = Date.now();
+  let operation = "messages";
+  try {
+    // Prompt text is JSON-escaped inside the body, so only the real top-level key can match.
+    if (typeof init?.body === "string") operation = init.body.includes('"tools":[') ? "tool-runner" : "messages.parse";
+  } catch {
+    // Accounting only.
+  }
+  const failed = () =>
+    recordLedger({ provider: "anthropic", operation, units: {}, costUsd: null, costBasis: "unknown", ok: false, ms: Date.now() - started });
+
+  let res: Response;
+  try {
+    res = await fetch(input, init);
+  } catch (err) {
+    failed();
+    throw err;
+  }
+  try {
+    if (!res.ok) {
+      failed();
+      return res;
+    }
+    const body: unknown = JSON.parse(await res.clone().text());
+    const message = (typeof body === "object" && body !== null ? body : {}) as { usage?: UsageLike | null; stop_reason?: unknown };
+    if (!message.usage) {
+      failed();
+      return res;
+    }
+    const tokens = {
+      inputTokens: message.usage.input_tokens ?? 0,
+      outputTokens: message.usage.output_tokens ?? 0,
+      cacheReadTokens: message.usage.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: message.usage.cache_creation_input_tokens ?? 0,
+    };
+    recordLedger({
+      provider: "anthropic",
+      operation,
+      units: claudeUnits(tokens),
+      costUsd: claudeCostUsd(tokens),
+      costBasis: "estimated",
+      ok: message.stop_reason !== "refusal" && message.stop_reason !== "max_tokens",
+      ms: Date.now() - started,
+    });
+  } catch {
+    // The copy could not be read (cut off, not JSON): the SDK will report the same problem.
+    failed();
+  }
+  return res;
+}
+
+/**
+ * Ties ledger rows to opts.leadId for a call made outside a usage context (scripts, one-off
+ * calls). Inside a research run the pipeline's context is already there and is kept.
+ */
+function inLeadContext<T>(leadId: string | null | undefined, fn: () => Promise<T>): Promise<T> {
+  return leadId && !currentUsageLeadId() ? withUsageContext(leadId, fn) : fn();
 }
 
 /** Maps SDK errors to ClaudeError using the typed classes, most specific first. Never includes headers or keys. */
@@ -158,6 +229,10 @@ export interface GenerateObjectOptions<S extends z.ZodType> {
  * because with adaptive thinking the usual cause is thinking eating the budget.
  */
 export async function generateObject<S extends z.ZodType>(opts: GenerateObjectOptions<S>): Promise<z.infer<S>> {
+  return inLeadContext(opts.leadId, () => generateObjectCall(opts));
+}
+
+async function generateObjectCall<S extends z.ZodType>(opts: GenerateObjectOptions<S>): Promise<z.infer<S>> {
   const { leadId, label, system, prompt, schema, timeoutMs = DEFAULT_TIMEOUT_MS, signal } = opts;
   let maxTokens = Math.min(opts.maxTokens ?? DEFAULT_MAX_TOKENS, MAX_TOKENS_CEILING);
   let lastError: ClaudeError | null = null;
@@ -269,6 +344,10 @@ export interface ToolAgentResult {
  * of earlier tool calls (saved findings) are still valid.
  */
 export async function runToolAgent(opts: ToolAgentOptions): Promise<ToolAgentResult> {
+  return inLeadContext(opts.leadId, () => runToolAgentLoop(opts));
+}
+
+async function runToolAgentLoop(opts: ToolAgentOptions): Promise<ToolAgentResult> {
   const { leadId, label, system, prompt, tools, onToolCall } = opts;
   const maxToolCalls = opts.maxToolCalls ?? 8;
   const maxIterations = opts.maxIterations ?? maxToolCalls + 3;

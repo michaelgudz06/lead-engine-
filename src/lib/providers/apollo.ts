@@ -1,6 +1,8 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError, linkedinSlug, normaliseLinkedinUrl } from "../http";
+import { metered } from "../usage/ledger";
+import { APOLLO_CREDITS_PER_CALL, APOLLO_PLAN, creditCost } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -347,11 +349,18 @@ async function apolloRequest(method: "GET" | "POST", path: string, params: Param
     if (v !== null && v !== undefined && v !== "") qs.set(k, String(v));
   }
   const query = qs.toString();
-  return fetchJson<unknown>(`${BASE}${path}${query ? `?${query}` : ""}`, {
-    method,
-    headers: { "x-api-key": key, "cache-control": "no-cache" },
-    timeoutMs: TIMEOUT_MS,
-  });
+  // Usage ledger: credits are the unit. An answered call uses one; a failed or plan-blocked one uses none.
+  const operation = path.endsWith("/job_postings") ? "job-postings" : path === "/people/match" ? "people-match" : "org-enrich";
+  const used = (credits: number) => ({ units: { credits }, ...creditCost(credits, APOLLO_PLAN) });
+  return metered(
+    { provider: "apollo", operation, onOk: () => used(APOLLO_CREDITS_PER_CALL), onFail: () => used(0) },
+    () =>
+      fetchJson<unknown>(`${BASE}${path}${query ? `?${query}` : ""}`, {
+        method,
+        headers: { "x-api-key": key, "cache-control": "no-cache" },
+        timeoutMs: TIMEOUT_MS,
+      }),
+  );
 }
 
 function mapOrg(o: Rec, requestedDomain: string | null): ApolloOrg {

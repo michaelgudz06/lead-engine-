@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { z } from "zod";
+import { trackSteerRun } from "@/lib/analytics-server";
 import { claimResearch, getLead } from "@/lib/repo/leads";
 import { steerLead } from "@/lib/research/pipeline";
 import {
@@ -40,7 +41,7 @@ export async function POST(request: NextRequest, ctx: LeadRouteContext) {
       return (await getLead(id)) ? fail(409, "The agent is already working on this lead. Try again when it finishes.") : leadNotFound();
     }
     // steerLead logs the instruction itself (a "steer" event), so nothing is logged here.
-    runAfterResponse(id, "Steering", () => steerLead(id, instruction));
+    runAfterResponse(id, "Steering", () => trackSteerRun(id, () => steerLead(id, instruction)));
     return json({ ok: true }, 202);
   } catch (err) {
     return serverError("POST /api/leads/[id]/steer", err);

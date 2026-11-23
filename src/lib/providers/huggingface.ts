@@ -1,6 +1,8 @@
 import "server-only";
 import { optionalEnv, type EnvKey } from "../env";
 import { HttpError } from "../http";
+import { metered } from "../usage/ledger";
+import { FREE } from "../usage/prices";
 import type { ProviderStatus } from "../types";
 
 /**
@@ -331,7 +333,15 @@ function pauseReason(): string {
     : `Hugging Face is rate-limiting this server's IP (anonymous API, 500 requests per 5 minutes; HF_TOKEN raises it). Back in ${wait}.`;
 }
 
-async function hubGet(path: string, params: URLSearchParams): Promise<unknown> {
+/** Usage ledger: the Hub API is free; requests are counted. One row per call, retries included in it. */
+function hubGet(path: string, params: URLSearchParams): Promise<unknown> {
+  const used = () => ({ units: { requests: 1 }, ...FREE });
+  // "/api/models/org/name" -> "models": the operation never carries an id.
+  const operation = path.split("/").filter((p) => p && p !== "api")[0] ?? "request";
+  return metered({ provider: "huggingface", operation, onOk: used, onFail: used }, () => hubGetUnmetered(path, params));
+}
+
+async function hubGetUnmetered(path: string, params: URLSearchParams): Promise<unknown> {
   const url = `${HUB}${path}?${params.toString()}`;
   if (Date.now() < pausedUntil) throw new HttpError(429, pauseReason(), url);
   let last: unknown = null;

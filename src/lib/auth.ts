@@ -5,7 +5,8 @@ import { optionalEnv } from "./env";
  * The access gate: one shared team password, no user accounts (BUILD_SPEC 8b).
  *
  * - The gate is on exactly when APP_PASSWORD is set. Local dev leaves it unset; on
- *   Vercel (VERCEL=1) the proxy then refuses every request with 503 instead.
+ *   Vercel (VERCEL=1) the proxy then refuses every request with 503 instead, unless the
+ *   owner chose an open deploy with ALLOW_OPEN_ACCESS=1 (see src/proxy.ts).
  * - A login sets `le_session`, a token signed with HMAC-SHA256 under SESSION_SECRET.
  * - Only Web Crypto and other Web APIs are used, so this module runs unchanged in
  *   the proxy (src/proxy.ts), in route handlers and in plain Node scripts.

@@ -39,6 +39,27 @@ const nextConfig: NextConfig = {
   // it lazily imports optional extras (email rendering, OpenTelemetry) that are not installed.
   serverExternalPackages: ["posthog-node"],
 
+  // No "X-Powered-By: Next.js" on replies.
+  poweredByHeader: false,
+
+  // Browser hardening for a public URL: no other site may frame these pages (clickjacking),
+  // no MIME sniffing, no full URLs (with lead ids) in the Referer sent to other sites, and no
+  // camera, microphone or location access for any page.
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Content-Security-Policy", value: "frame-ancestors 'none'" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+        ],
+      },
+    ];
+  },
+
   // Product analytics (src/lib/analytics.ts) reaches PostHog through /ingest on this site, a
   // same-origin reverse proxy, so the browser never calls posthog.com itself. PostHog's API
   // paths end with a slash (/e/, /flags/), which Next.js would otherwise answer with a 308.

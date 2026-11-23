@@ -258,7 +258,9 @@ the URL could read leads and spend API credits. Add one shared team password:
   `APP_PASSWORD` is unset on a local run, the gate is off. On Vercel the app refuses every
   request with 503 until `APP_PASSWORD` is set, so a deploy can never be open by accident.
 - Cross-site writes to `/api/*` are refused (Sec-Fetch-Site / Origin check), research and
-  steer runs are capped at 20 per hour, and a run stuck in `running` for over 6 minutes is
+  steer runs are capped at 20 per hour and 25 per day (`RUN_LIMIT_PER_HOUR`,
+  `RUN_LIMIT_PER_DAY`; each slot reserved atomically in `le_run_starts`, migration 003), and
+  a run stuck in `running` for over 6 minutes is
   marked failed so it can be retried.
 - `src/lib/auth.ts` (api agent): create and verify a signed session cookie with Web Crypto
   HMAC-SHA256 over an expiry timestamp using `SESSION_SECRET` (works in the proxy runtime);

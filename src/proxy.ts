@@ -56,13 +56,15 @@ function openAccessAllowed(): boolean {
  * Where to send someone after login: a path on this site, never another site. The value is
  * resolved against our own origin the way a browser would resolve it (URL parsing drops tab,
  * CR and LF, so "/\t/evil.example" becomes "//evil.example"), and anything that does not stay
- * on this origin falls back to "/". Same rules as the login page.
+ * on this origin falls back to "/". The returned path is resolved again by the redirect, so
+ * it must not start with "//" either: dot segments ("/.//evil.example") resolve to exactly
+ * that. Same rules as the login page.
  */
 function safeNext(next: string | null, origin: string): string {
   if (!next || !next.startsWith("/") || /[\u0000-\u001f\u007f\\]/.test(next)) return "/";
   try {
     const url = new URL(next, origin);
-    if (url.origin !== origin || url.pathname.startsWith("/login")) return "/";
+    if (url.origin !== origin || url.pathname.startsWith("//") || url.pathname.startsWith("/login")) return "/";
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return "/";

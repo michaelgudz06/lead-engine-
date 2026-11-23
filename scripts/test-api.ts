@@ -12,8 +12,8 @@
  *             task: research is claimed but never run, so no provider or Claude credit is spent.
  * 4. hubspot  pushLeadToHubSpot against a mocked HubSpot API (no token, no network)
  * 5. guards   against Neon with temp leads: the stage rule when a run ends, the stale-run reaper
- *             (research_started_at backdated) and the hourly run cap (fake run-start events on a
- *             temp lead, removed with it)
+ *             (research_started_at backdated) and the hourly and daily run caps (le_run_starts
+ *             rows on temp leads, including a concurrent burst; all removed at the end)
  *
  * Prints statuses and short snippets only: never a key, token, cookie value or header.
  */
@@ -21,8 +21,6 @@
 // request-scope modules below need when they load.
 import "next/dist/server/node-environment-baseline";
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { workAsyncStorage } from "next/dist/server/app-render/work-async-storage.external";
@@ -39,10 +37,12 @@ import * as statusRoute from "../src/app/api/status/route";
 import * as loginRoute from "../src/app/api/login/route";
 import * as logoutRoute from "../src/app/api/logout/route";
 import {
+  DEFAULT_RUNS_PER_DAY,
+  DEFAULT_RUNS_PER_HOUR,
   isStaleRun,
-  MAX_RUNS_PER_HOUR,
-  RUN_LIMIT_MESSAGE,
-  RUN_START_STEPS,
+  runLimitEvent,
+  runLimitMessage,
+  runLimits,
   serverError,
   STALE_RUN_MS,
 } from "../src/app/api/_lib/api";
@@ -96,7 +96,7 @@ function section(title: string): void {
   console.log(`\n== ${title}`);
 }
 
-const GATE_KEYS = ["APP_PASSWORD", "SESSION_SECRET", "HUBSPOT_ACCESS_TOKEN", "VERCEL"] as const;
+const GATE_KEYS = ["APP_PASSWORD", "SESSION_SECRET", "HUBSPOT_ACCESS_TOKEN", "VERCEL", "RUN_LIMIT_PER_HOUR", "RUN_LIMIT_PER_DAY"] as const;
 const originalEnv = Object.fromEntries(GATE_KEYS.map((k) => [k, process.env[k]]));
 function setEnv(vars: Partial<Record<(typeof GATE_KEYS)[number], string | undefined>>): void {
   for (const [k, v] of Object.entries(vars)) {
@@ -111,6 +111,13 @@ function restoreEnv(): void {
 const PASSWORD = "correct horse battery staple";
 const SECRET = randomBytes(32).toString("hex"); // generated here, never printed
 const DAY = 86_400_000;
+
+/**
+ * Leads whose run slots (le_run_starts rows) the tests may have taken. Those rows have no
+ * foreign key, so they outlive the temp leads; main() deletes them at the end so the tests
+ * never use up the real hourly and daily caps.
+ */
+const runLeadIds = new Set<string>();
 
 /** Tasks handed to next/server after() during route calls. Recorded only, never run. */
 const afterTasks: unknown[] = [];
@@ -323,6 +330,12 @@ async function testProxy(): Promise<void> {
     ["slash, backslash", "/%5C/evil.example"],
     ["encoded slash", "/%2F/evil.example"],
     ["absolute URL", "https%3A%2F%2Fevil.example%2F"],
+    // Dot segments resolve to a path that starts with "//", which the redirect would read as another host.
+    ["dot segment", "/.//evil.example"],
+    ["dot-dot segment", "/..//evil.example"],
+    ["encoded dot segment", "/%2e//evil.example"],
+    ["dot, encoded slash", "/./%2Fevil.example"],
+    ["path, then dot-dot", "/pipeline/..//evil.example/x"],
     ["the login page itself", "%2Flogin%3Fnext%3D%2Fpipeline"],
   ] as const) {
     const to = redirectsTo(await run(`/login?next=${next}`, token));
@@ -405,6 +418,7 @@ async function testRoutes(): Promise<void> {
     });
     const lead = created.data?.lead as Lead | undefined;
     leadId = lead?.id ?? null;
+    if (leadId) runLeadIds.add(leadId);
     check("POST /api/leads is 201 with the lead", created.status === 201 && Boolean(leadId), created.data);
     check("create: URL normalised", lead?.linkedinUrl === `https://www.linkedin.com/in/${slug}`, lead?.linkedinUrl);
     check("create: fields trimmed, empty company is null", lead?.name === "API Test" && lead?.companyName === null);
@@ -936,11 +950,23 @@ async function testRunGuards(): Promise<void> {
   restoreEnv();
   setEnv({ APP_PASSWORD: undefined });
 
-  // The cap counts the first step event of each run, so the research code must still log these.
-  const sources = ["pipeline.ts", "steer.ts"].map((f) => readFileSync(join(__dirname, "..", "src", "lib", "research", f), "utf8")).join("\n");
-  for (const message of RUN_START_STEPS) {
-    check(`research code logs the run-start step "${message}"`, new RegExp(`\\bstep\\(\\s*[\\w.]+\\s*,\\s*"${message}"\\s*\\)`).test(sources));
+  // Run limits: defaults, env overrides, and bad values ignored.
+  setEnv({ RUN_LIMIT_PER_HOUR: undefined, RUN_LIMIT_PER_DAY: undefined });
+  const defaults = runLimits();
+  check(
+    "run limits default to 20 an hour and 25 a day",
+    DEFAULT_RUNS_PER_HOUR === 20 && DEFAULT_RUNS_PER_DAY === 25 && defaults.perHour === 20 && defaults.perDay === 25,
+    defaults,
+  );
+  setEnv({ RUN_LIMIT_PER_HOUR: "5", RUN_LIMIT_PER_DAY: "40" });
+  check("run limits read RUN_LIMIT_PER_HOUR and RUN_LIMIT_PER_DAY", runLimits().perHour === 5 && runLimits().perDay === 40, runLimits());
+  for (const bad of ["0", "-3", "1.5", "abc", "1e3", "  "]) {
+    setEnv({ RUN_LIMIT_PER_HOUR: bad, RUN_LIMIT_PER_DAY: bad });
+    const l = runLimits();
+    check(`run limit "${bad}" falls back to the defaults`, l.perHour === DEFAULT_RUNS_PER_HOUR && l.perDay === DEFAULT_RUNS_PER_DAY, l);
   }
+  setEnv({ RUN_LIMIT_PER_HOUR: undefined, RUN_LIMIT_PER_DAY: undefined });
+  check("429 messages name the window and the limit", /last hour \(the limit is 20\)/.test(runLimitMessage("hour", defaults)) && /last 24 hours \(the limit is 25\)/.test(runLimitMessage("day", defaults)));
 
   const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
   check("stale window is 6 minutes", STALE_RUN_MS === 6 * 60_000);
@@ -955,6 +981,7 @@ async function testRunGuards(): Promise<void> {
   const tempLead = async (): Promise<string> => {
     const lead = await createLead({ linkedinUrl: `https://www.linkedin.com/in/le-api-guard-${randomBytes(4).toString("hex")}` });
     tempIds.push(lead.id);
+    runLeadIds.add(lead.id);
     return lead.id;
   };
   const getOne = asHandler(leadRoute.GET);
@@ -1028,40 +1055,97 @@ async function testRunGuards(): Promise<void> {
     );
     check("reaper: the list logged one more error event", staleEvents(await listEvents(rid)) === 2);
 
-    // ---- the hourly run cap: fill the hour with fake run starts on a temp lead (deleted with it)
+    // ---- the run caps: le_run_starts rows, counted and inserted under one advisory lock.
+    // Each check sets the limits just above what the table already holds, so the result does
+    // not depend on how many real runs happened in the last day.
+    const counts = async () =>
+      (
+        await query<{ hour: number; day: number }>(
+          `select count(*) filter (where created_at > now() - interval '1 hour')::int as hour, count(*)::int as day
+             from le_run_starts where created_at > now() - interval '24 hours'`,
+        )
+      )[0] ?? { hour: 0, day: 0 };
+    const startsFor = async (leadId: string) =>
+      (await query<{ n: number }>("select count(*)::int as n from le_run_starts where lead_id = $1", [leadId]))[0]?.n ?? 0;
+    const steerPost = asHandler(steerRoute.POST);
+    const leadsPost = asHandler(leadsRoute.POST);
+    const createWithoutRun = async () => {
+      const res = await callRoute(leadsPost, { method: "POST", path: "/api/leads", body: { linkedinUrl: `linkedin.com/in/le-api-cap-${randomBytes(4).toString("hex")}` } });
+      const lead = res.data?.lead as Lead | undefined;
+      if (lead?.id) {
+        tempIds.push(lead.id);
+        runLeadIds.add(lead.id);
+      }
+      return { res, lead, events: lead ? await listEvents(lead.id) : [] };
+    };
+
+    // Hourly cap: room for 2 more, then 2 fake run starts fill it.
+    let c = await counts();
+    setEnv({ RUN_LIMIT_PER_HOUR: String(c.hour + 2), RUN_LIMIT_PER_DAY: "100000" });
+    let limits = runLimits();
     const bid = await tempLead();
-    await query("insert into le_events (lead_id, type, message) select $1::uuid, 'step', $2::text from generate_series(1, $3::int)", [
-      bid,
-      RUN_START_STEPS[0],
-      MAX_RUNS_PER_HOUR,
-    ]);
+    await query("insert into le_run_starts (lead_id, kind) select $1::uuid, 'research' from generate_series(1, 2)", [bid]);
     const before = afterTasks.length;
     const r1 = await callRoute(research, { method: "POST", path: `/api/leads/${bid}/research`, id: bid });
-    check(`cap: POST /research is 429 after ${MAX_RUNS_PER_HOUR} runs in the hour`, r1.status === 429 && r1.data?.error === RUN_LIMIT_MESSAGE, r1.data);
-    const s1 = await callRoute(asHandler(steerRoute.POST), { method: "POST", path: `/api/leads/${bid}/steer`, id: bid, body: { instruction: "dig into their compute" } });
-    check("cap: POST /steer is 429 too", s1.status === 429 && s1.data?.error === RUN_LIMIT_MESSAGE, s1.data);
+    check("cap: POST /research is 429 when the hour is full", r1.status === 429 && r1.data?.error === runLimitMessage("hour", limits), r1.data);
+    const s1 = await callRoute(steerPost, { method: "POST", path: `/api/leads/${bid}/steer`, id: bid, body: { instruction: "dig into their compute" } });
+    check("cap: POST /steer is 429 too", s1.status === 429 && s1.data?.error === runLimitMessage("hour", limits), s1.data);
     check("cap: nothing was claimed or handed to after()", afterTasks.length === before && (await getLead(bid))?.researchStatus === "idle");
-    const created = await callRoute(asHandler(leadsRoute.POST), {
-      method: "POST",
-      path: "/api/leads",
-      body: { linkedinUrl: `linkedin.com/in/le-api-cap-${randomBytes(4).toString("hex")}` },
-    });
-    const capLead = created.data?.lead as Lead | undefined;
-    if (capLead?.id) tempIds.push(capLead.id);
+    check("cap: a refused request takes no slot", (await startsFor(bid)) === 2);
+    const hourly = await createWithoutRun();
     check(
       "cap: POST /api/leads still creates the lead (201), without a run",
-      created.status === 201 && capLead?.researchStatus === "idle" && capLead?.stage === "new" && afterTasks.length === before,
-      created.data,
+      hourly.res.status === 201 && hourly.lead?.researchStatus === "idle" && hourly.lead?.stage === "new" && afterTasks.length === before,
+      hourly.res.data,
     );
-    const capEvents = capLead ? await listEvents(capLead.id) : [];
     check(
       "cap: an event on the new lead says why research did not start",
-      capEvents.some((e) => e.type === "error" && /did not start/.test(e.message) && e.message.includes(String(MAX_RUNS_PER_HOUR))),
-      capEvents.map((e) => `${e.type}: ${e.message}`),
+      hourly.events.some((e) => e.type === "error" && e.message === runLimitEvent("hour", limits)),
+      hourly.events.map((e) => `${e.type}: ${e.message}`),
     );
-    await query("delete from le_events where lead_id = $1 and type = 'step'", [bid]);
+    await query("delete from le_run_starts where lead_id = $1", [bid]);
     const r2 = await callRoute(research, { method: "POST", path: `/api/leads/${bid}/research`, id: bid });
-    check("cap: under the cap again, POST /research is 202", r2.status === 202, r2.data);
+    check("cap: under the cap again, POST /research is 202 and takes one slot", r2.status === 202 && (await startsFor(bid)) === 1, r2.data);
+
+    // Daily cap: the last 24 hours already hold the limit.
+    c = await counts();
+    setEnv({ RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: String(Math.max(1, c.day)) });
+    limits = runLimits();
+    if (c.day === 0) await query("insert into le_run_starts (lead_id, kind) values ($1::uuid, 'research')", [bid]);
+    const did = await tempLead();
+    const r3 = await callRoute(research, { method: "POST", path: `/api/leads/${did}/research`, id: did });
+    check("cap: POST /research is 429 when the 24 hours are full", r3.status === 429 && r3.data?.error === runLimitMessage("day", limits), r3.data);
+    const daily = await createWithoutRun();
+    check(
+      "cap: the new lead's event names the daily limit",
+      daily.res.status === 201 && daily.events.some((e) => e.type === "error" && e.message === runLimitEvent("day", limits)),
+      daily.events.map((e) => `${e.type}: ${e.message}`),
+    );
+
+    // A burst: 8 requests at once with room for 3 start exactly 3 runs.
+    c = await counts();
+    setEnv({ RUN_LIMIT_PER_HOUR: String(c.hour + 3), RUN_LIMIT_PER_DAY: "100000" });
+    const burstIds = await Promise.all(Array.from({ length: 8 }, () => tempLead()));
+    const burstBefore = afterTasks.length;
+    const burst = await Promise.all(burstIds.map((lid) => callRoute(research, { method: "POST", path: `/api/leads/${lid}/research`, id: lid })));
+    check(
+      "cap: a burst of 8 with room for 3 starts exactly 3 runs",
+      burst.filter((r) => r.status === 202).length === 3 && burst.filter((r) => r.status === 429).length === 5 && afterTasks.length === burstBefore + 3,
+      burst.map((r) => r.status),
+    );
+
+    // A claim that fails gives its slot back; deleting the lead does not.
+    setEnv({ RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "100000" });
+    const kid = await tempLead();
+    const k1 = await callRoute(research, { method: "POST", path: `/api/leads/${kid}/research`, id: kid });
+    const k2 = await callRoute(research, { method: "POST", path: `/api/leads/${kid}/research`, id: kid });
+    check("cap: a 409 (already running) gives its slot back", k1.status === 202 && k2.status === 409 && (await startsFor(kid)) === 1, [k1.status, k2.status]);
+    const ghostLead = "00000000-0000-4000-8000-00000000c0de";
+    runLeadIds.add(ghostLead);
+    const g = await callRoute(research, { method: "POST", path: `/api/leads/${ghostLead}/research`, id: ghostLead });
+    check("cap: a 404 (unknown lead) gives its slot back", g.status === 404 && (await startsFor(ghostLead)) === 0, g.status);
+    await deleteLead(kid);
+    check("cap: run starts outlive their lead (deleting leads does not free slots)", (await startsFor(kid)) === 1);
   } finally {
     for (const tempId of tempIds) await deleteLead(tempId).catch(() => undefined);
     console.log(`  (cleaned up ${tempIds.length} temp leads and their events)`);
@@ -1082,6 +1166,11 @@ async function main(): Promise<void> {
   } finally {
     restoreEnv();
     globalThis.fetch = realFetch;
+    // The tests' run slots: without this they would count against the real caps for a day.
+    if (runLeadIds.size) {
+      const removed = await query("delete from le_run_starts where lead_id = any($1::uuid[]) returning id", [[...runLeadIds]]).catch(() => []);
+      console.log(`  (removed ${removed.length} run slots taken by the tests)`);
+    }
   }
   console.log(`\n${passed} passed, ${failed} failed in ${((Date.now() - started) / 1000).toFixed(1)} s (after() tasks recorded, never run: ${afterTasks.length})`);
   if (failed) process.exit(1);

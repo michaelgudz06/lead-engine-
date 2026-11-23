@@ -87,12 +87,24 @@ The Settings page shows which integrations are on and why.
 2. Add every variable from `.env.local` in Project Settings → Environment Variables,
    plus `APP_PASSWORD` and `SESSION_SECRET`. Mark the keys as sensitive. Without
    `APP_PASSWORD` the deployment answers 503 to everything, unless `ALLOW_OPEN_ACCESS=1`
-   is set to run it open on purpose (research runs stay capped at 20 an hour).
+   is set to run it open on purpose (runs stay capped; see Run limits below).
+   With Vercel's standard deployment protection the production domains are public, and
+   per-deployment URLs and previews need a Vercel login.
+   Apply new migrations (`npm run migrate`) before deploying the code that needs them.
 3. Keep Fluid compute on (the default). Routes that start research set
    `maxDuration = 300`, and a run is planned to finish within 280 seconds.
    `vercel.json` pins functions to `cle1` (Cleveland), next to the Neon database in
    `us-east-2`; change it if your database lives elsewhere.
 4. Deploy, open the URL, log in with the team password, and add a lead.
+
+### Run limits
+
+Research and steer runs (the paid part) are capped across all leads: 20 in any rolling
+hour and 25 in any rolling 24 hours by default (`RUN_LIMIT_PER_HOUR`, `RUN_LIMIT_PER_DAY`).
+A research run costs about $0.15 and reads LinkedIn 4 times, so the daily default keeps
+LinkedIn near 100 reads a day and spend near $4. Each slot is taken in one transaction
+(`le_run_starts`), so a burst of requests cannot get past the caps, and deleting leads
+does not give runs back. Over a cap, the API answers 429 and a new lead is saved without a run.
 
 Vercel's Hobby plan is for non-commercial use. It is fine for a prototype; move the
 project to a team on a paid plan for real company use.
@@ -116,4 +128,6 @@ runs a complete research pass for one lead and keeps it.
 - HubSpot push is built against HubSpot's API docs but untested until a token is added.
 - Apollo's person match needs a paid plan; person data comes from LinkedIn and Hunter.
 - Abstract's checkpoint inspect is off until `ABSTRACT_API_KEY` is set.
+- Fill in Settings > Sender (name, email, booking link, signature). Until then drafts end
+  with `[your booking link]` and `[your name]` placeholders.
 - `docs/BUILD_SPEC.md` is the build contract the modules were written against.

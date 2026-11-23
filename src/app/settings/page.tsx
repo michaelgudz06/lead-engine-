@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { changedSettingsFields, track } from "@/lib/analytics";
 import { errorMessage, getSettings, getStatus, saveSettings, type StatusResponse } from "@/lib/api-client";
 import type { Settings } from "@/lib/types";
+import { AutoTextarea } from "@/components/auto-textarea";
 import { modelLabel } from "@/components/format";
 import { Button, Chip, ErrorState, Label, Notice, PageTitle, Skeleton } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
@@ -148,7 +149,7 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
         <ul className="space-y-2">
           {form.criteria.map((rule, i) => (
             <li key={i} className="flex items-start gap-2">
-              <textarea
+              <AutoTextarea
                 rows={2}
                 className="field"
                 aria-label={`Rule ${i + 1}`}

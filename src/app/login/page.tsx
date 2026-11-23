@@ -8,7 +8,9 @@ import { Button, Label, Notice } from "@/components/ui";
 /**
  * Only paths on this site are accepted, so `?next=` cannot send anyone to another site.
  * The browser drops tabs and newlines when it resolves a URL ("/\t/evil.example" becomes
- * "//evil.example"), so the value is resolved the same way and its origin compared.
+ * "//evil.example"), so the value is resolved the same way and its origin compared. The
+ * path that comes back is resolved once more by location.assign(), so it must not start
+ * with "//" either: dot segments ("/.//evil.example") resolve to exactly that.
  */
 function safeNext(): string {
   const next = new URLSearchParams(window.location.search).get("next");
@@ -16,7 +18,7 @@ function safeNext(): string {
   try {
     const origin = window.location.origin;
     const url = new URL(next, origin);
-    if (url.origin !== origin || url.pathname.startsWith("/login")) return "/";
+    if (url.origin !== origin || url.pathname.startsWith("//") || url.pathname.startsWith("/login")) return "/";
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return "/";

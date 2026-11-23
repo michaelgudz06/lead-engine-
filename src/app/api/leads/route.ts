@@ -3,7 +3,7 @@ import { z } from "zod";
 import { trackResearchRun } from "@/lib/analytics-server";
 import { linkedinSlug, normaliseLinkedinUrl } from "@/lib/http";
 import { addEvent } from "@/lib/repo/events";
-import { claimResearch, createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
+import { createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
 import { runResearch } from "@/lib/research/pipeline";
 import {
   errorText,
@@ -12,13 +12,13 @@ import {
   isStaleRun,
   json,
   leadIdBySlug,
-  MAX_RUNS_PER_HOUR,
   optionalText,
-  overRunBudget,
   pgCode,
   readJson,
   runAfterResponse,
+  runLimitEvent,
   serverError,
+  startRun,
 } from "../_lib/api";
 
 // POST starts a research run after the response; after() lives as long as the function may.
@@ -56,7 +56,7 @@ export async function GET() {
 
 /**
  * POST /api/leads -> 201 { lead } with research already started; 409 { error, existingId } for a duplicate.
- * Over the hourly run cap the lead is still created, without a run, and an event says why.
+ * Over the hourly or daily run cap the lead is still created, without a run, and an event says why.
  */
 export async function POST(request: NextRequest) {
   const body = await readJson(request, CreateLeadBody);
@@ -83,15 +83,14 @@ export async function POST(request: NextRequest) {
       console.error(`[api] could not log the created event for lead ${lead.id}: ${errorText(err)}`),
     );
 
-    if (await overRunBudget()) {
-      await addEvent(
-        lead.id,
-        "error",
-        `Research did not start: the limit of ${MAX_RUNS_PER_HOUR} research runs an hour was reached. Run it from this page later.`,
-      ).catch((err) => console.error(`[api] could not log the skipped run for lead ${lead.id}: ${errorText(err)}`));
-    } else if (await claimResearch(lead.id)) {
+    const start = await startRun(lead.id, "research");
+    if (start.ok) {
       const id = lead.id;
       runAfterResponse(id, "Research", () => trackResearchRun(id, () => runResearch(id)));
+    } else if (start.reason === "limit") {
+      await addEvent(lead.id, "error", runLimitEvent(start.window, start.limits)).catch((err) =>
+        console.error(`[api] could not log the skipped run for lead ${lead.id}: ${errorText(err)}`),
+      );
     }
     // Re-read so the reply already shows research as running.
     return json({ lead: (await getLead(lead.id)) ?? lead }, 201);

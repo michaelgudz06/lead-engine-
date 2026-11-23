@@ -1,9 +1,10 @@
 import "server-only";
 import { after, NextResponse } from "next/server";
 import { z } from "zod";
-import { query } from "@/lib/db";
+import { db, query } from "@/lib/db";
+import { optionalEnv } from "@/lib/env";
 import { addEvent } from "@/lib/repo/events";
-import { failStaleResearch, finishResearch } from "@/lib/repo/leads";
+import { claimResearch, failStaleResearch, finishResearch } from "@/lib/repo/leads";
 import type { Lead } from "@/lib/types";
 
 /**
@@ -178,29 +179,116 @@ export async function leadIdBySlug(slug: string | null): Promise<string | null> 
 
 // ------------------------------------------------------------------ research run limits
 
-/** Research and steer runs (paid Claude and provider calls) allowed per hour, across all leads. */
-export const MAX_RUNS_PER_HOUR = 20;
+/** Research and steer runs (paid Claude and provider calls) allowed per rolling hour, across all leads. */
+export const DEFAULT_RUNS_PER_HOUR = 20;
+/**
+ * Runs allowed per rolling 24 hours. A research run reads LinkedIn 4 times (account check,
+ * profile, posts, company), so 25 runs stay near 100 LinkedIn reads a day
+ * (LINKEDIN_DAILY_GUIDANCE), and cost about $4 at roughly $0.15 a run.
+ */
+export const DEFAULT_RUNS_PER_DAY = 25;
+
+export interface RunLimits {
+  perHour: number;
+  perDay: number;
+}
+
+export type RunWindow = "hour" | "day";
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  if (!value || !/^\d+$/.test(value)) return fallback;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+/** The caps in force: RUN_LIMIT_PER_HOUR and RUN_LIMIT_PER_DAY when set to a whole number above 0, else the defaults. */
+export function runLimits(): RunLimits {
+  return {
+    perHour: positiveInt(optionalEnv("RUN_LIMIT_PER_HOUR"), DEFAULT_RUNS_PER_HOUR),
+    perDay: positiveInt(optionalEnv("RUN_LIMIT_PER_DAY"), DEFAULT_RUNS_PER_DAY),
+  };
+}
+
+/** The 429 message for a full window. */
+export function runLimitMessage(window: RunWindow, limits: RunLimits): string {
+  return window === "hour"
+    ? `Too many research runs in the last hour (the limit is ${limits.perHour}). Try again later.`
+    : `Too many research runs in the last 24 hours (the limit is ${limits.perDay}). Try again later.`;
+}
+
+/** Why a new lead was saved without a run, for its activity log. */
+export function runLimitEvent(window: RunWindow, limits: RunLimits): string {
+  const limit = window === "hour" ? `${limits.perHour} research runs an hour` : `${limits.perDay} research runs a day`;
+  return `Research did not start: the limit of ${limit} was reached. Run it from this page later.`;
+}
+
+/** Any fixed number, the same everywhere: the advisory lock that puts reservations in a queue. */
+const RUN_LOCK_KEY = 74_221_001;
+
+export type RunReservation = { ok: true; id: string } | { ok: false; window: RunWindow; limits: RunLimits };
 
 /**
- * The first step event of every run: runResearch logs "Starting research" and steerLead
- * "Reading your instruction" (src/lib/research/pipeline.ts and steer.ts). scripts/test-api.ts
- * checks that the research code still logs them.
+ * Takes one run slot when both the last hour and the last 24 hours are under their caps.
+ * The count and the insert run in one transaction behind an advisory lock, so any number
+ * of simultaneous requests, on any number of instances, cannot start more runs than the
+ * caps allow. The rows have no foreign key: deleting leads does not give runs back.
+ * Routes call startRun(), which pairs this with the lead's claim.
  */
-export const RUN_START_STEPS = ["Starting research", "Reading your instruction"] as const;
+export async function reserveRun(leadId: string, kind: "research" | "steer"): Promise<RunReservation> {
+  const limits = runLimits();
+  const sql = db();
+  const [, rows] = await sql.transaction([
+    sql.query(`select pg_advisory_xact_lock(${RUN_LOCK_KEY})`),
+    sql.query(
+      `with counts as (
+         select count(*) filter (where created_at > now() - interval '1 hour')::int as hour,
+                count(*)::int as day
+           from le_run_starts
+          where created_at > now() - interval '24 hours'
+       ), taken as (
+         insert into le_run_starts (lead_id, kind)
+         select $1::uuid, $2::text from counts where hour < $3 and day < $4
+         returning id
+       )
+       select (select id::text from taken) as id, hour, day from counts`,
+      [leadId, kind, limits.perHour, limits.perDay],
+    ),
+  ]);
+  const row = (rows as Array<{ id: string | null; hour: number; day: number }>)[0];
+  if (row?.id) return { ok: true, id: row.id };
+  return { ok: false, window: (row?.hour ?? 0) >= limits.perHour ? "hour" : "day", limits };
+}
 
-export const RUN_LIMIT_MESSAGE = `Too many research runs in the last hour (the limit is ${MAX_RUNS_PER_HOUR}). Try again later.`;
+/** Gives a slot back when its run did not start after all (the lead was busy or gone). Never throws. */
+export async function releaseRun(id: string): Promise<void> {
+  try {
+    await query("delete from le_run_starts where id = $1", [id]);
+  } catch (err) {
+    console.error(`[api] could not release run slot ${id}: ${errorText(err)}`);
+  }
+}
+
+export type RunStart =
+  | { ok: true }
+  | { ok: false; reason: "limit"; window: RunWindow; limits: RunLimits }
+  | { ok: false; reason: "busy" };
 
 /**
- * True when the last hour already saw MAX_RUNS_PER_HOUR runs. Counted in the database,
- * so the cap holds across server instances. Check it before claimResearch.
+ * Everything a route does before it hands a run to after(): take a slot under the caps,
+ * then claim the lead (claimResearch, one atomic UPDATE). When the claim fails or throws,
+ * the slot goes back, so only runs that really start count toward the caps.
+ * "busy" means a run is already going on the lead, or the lead does not exist.
  */
-export async function overRunBudget(): Promise<boolean> {
-  const rows = await query<{ n: number }>(
-    `select count(*)::int as n from le_events
-      where type = 'step' and message = any($1::text[]) and created_at > now() - interval '1 hour'`,
-    [RUN_START_STEPS],
-  );
-  return (rows[0]?.n ?? 0) >= MAX_RUNS_PER_HOUR;
+export async function startRun(leadId: string, kind: "research" | "steer"): Promise<RunStart> {
+  const slot = await reserveRun(leadId, kind);
+  if (!slot.ok) return { ok: false, reason: "limit", window: slot.window, limits: slot.limits };
+  let claimed = false;
+  try {
+    claimed = await claimResearch(leadId);
+  } finally {
+    if (!claimed) await releaseRun(slot.id);
+  }
+  return claimed ? { ok: true } : { ok: false, reason: "busy" };
 }
 
 /**

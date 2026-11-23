@@ -23,6 +23,9 @@ export const KEYS = [
   "APP_PASSWORD",
   "SESSION_SECRET",
   "HF_TOKEN",
+  "ADMIN_PASSWORD",
+  "NEXT_PUBLIC_POSTHOG_KEY",
+  "NEXT_PUBLIC_POSTHOG_HOST",
 ] as const;
 
 export type EnvKey = (typeof KEYS)[number];
@@ -31,7 +34,7 @@ export type EnvKey = (typeof KEYS)[number];
  * Secrets that guard access. Any non-empty value counts as set, so a placeholder left
  * in place keeps the gate closed instead of silently turning it off.
  */
-const FAIL_CLOSED: ReadonlySet<EnvKey> = new Set<EnvKey>(["APP_PASSWORD", "SESSION_SECRET"]);
+const FAIL_CLOSED: ReadonlySet<EnvKey> = new Set<EnvKey>(["APP_PASSWORD", "SESSION_SECRET", "ADMIN_PASSWORD"]);
 
 /** The value, or undefined when unset or left as a placeholder. */
 export function optionalEnv(key: EnvKey): string | undefined {

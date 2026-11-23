@@ -22,14 +22,22 @@ const KEYS = [
   "HUBSPOT_ACCESS_TOKEN",
   "APP_PASSWORD",
   "SESSION_SECRET",
+  "HF_TOKEN",
 ] as const;
 
 export type EnvKey = (typeof KEYS)[number];
 
+/**
+ * Secrets that guard access. Any non-empty value counts as set, so a placeholder left
+ * in place keeps the gate closed instead of silently turning it off.
+ */
+const FAIL_CLOSED: ReadonlySet<EnvKey> = new Set<EnvKey>(["APP_PASSWORD", "SESSION_SECRET"]);
+
 /** The value, or undefined when unset or left as a placeholder. */
 export function optionalEnv(key: EnvKey): string | undefined {
   const v = process.env[key]?.trim();
-  if (!v || v.startsWith("REPLACE") || v.includes("XXXX")) return undefined;
+  if (!v) return undefined;
+  if (!FAIL_CLOSED.has(key) && (v.startsWith("REPLACE") || v.includes("XXXX"))) return undefined;
   return v;
 }
 

@@ -68,10 +68,22 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, i:
   return out;
 }
 
-/** Normalises a LinkedIn profile URL and returns its public slug, or null. */
+/**
+ * Normalises a LinkedIn profile URL and returns its public slug, or null.
+ * Vanity slugs are case-insensitive and lowercased; member-id slugs (ACoAA..., ADoAA...)
+ * are case-sensitive and kept as they are. A malformed %-escape returns null, not a throw.
+ */
 export function linkedinSlug(url: string): string | null {
-  const m = url.trim().match(/linkedin\.com\/in\/([^/?#]+)/i);
-  return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  const m = String(url ?? "").trim().match(/linkedin\.com\/in\/([^/?#]+)/i);
+  if (!m) return null;
+  let slug: string;
+  try {
+    slug = decodeURIComponent(m[1]).trim();
+  } catch {
+    return null;
+  }
+  if (!slug) return null;
+  return /^A[CD]o[A-Za-z0-9_-]{8,}$/.test(slug) ? slug : slug.toLowerCase();
 }
 
 export function normaliseLinkedinUrl(url: string): string | null {

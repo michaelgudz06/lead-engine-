@@ -1,0 +1,247 @@
+import "server-only";
+import { apolloStatus, matchPerson, type ApolloPerson } from "../providers/apollo";
+import { exaSearch, exaStatus, type ExaResult } from "../providers/exa";
+import {
+  getLinkedInCompany,
+  getLinkedInProfile,
+  linkedinStatus,
+  type LinkedInCompany,
+  type LinkedInProfile,
+} from "../providers/linkedin";
+import { addUsage, updateLead, type LeadPatch } from "../repo/leads";
+import type { Lead, Settings } from "../types";
+import { attempt, isConfigured, note, raw, step, type Person, type RunContext } from "./context";
+import {
+  cleanXHandle,
+  Deadline,
+  domainFromUrl,
+  domainMatchesCompany,
+  nameFromSlug,
+  parseLinkedInTitle,
+  splitName,
+  urlKey,
+} from "./util";
+
+/**
+ * Step 1: who is this? Reads the LinkedIn profile, fills the lead's name, title,
+ * company and location, and finds the company's domain. Never throws: when the
+ * profile cannot be read the run continues from the URL slug, the user's notes
+ * and web search.
+ */
+
+/** Apify runs for a profile can take one to two minutes; leave the rest of the 300 s for everything else. */
+const PROFILE_TIMEOUT_MS = 110_000;
+const SECONDARY_TIMEOUT_MS = 40_000;
+/** Time kept back for gather, extract, the agent, writing and verifying. */
+const RESERVE_AFTER_IDENTIFY_MS = 150_000;
+
+export async function identify(leadId: string, lead: Lead, settings: Settings, deadline: Deadline): Promise<RunContext> {
+  await step(leadId, "Reading LinkedIn profile");
+
+  let profile: LinkedInProfile | null = null;
+  if (isConfigured(linkedinStatus)) {
+    const res = await attempt("LinkedIn profile", deadline.budget(PROFILE_TIMEOUT_MS, RESERVE_AFTER_IDENTIFY_MS), () =>
+      getLinkedInProfile(lead.linkedinUrl),
+    );
+    if (res.ok && res.value.profile) {
+      profile = res.value.profile;
+      await raw(leadId, "linkedin.profile", { url: lead.linkedinUrl }, profile);
+      await note(leadId, "tool", `Read the LinkedIn profile${profile.fullName ? ` of ${profile.fullName}` : ""} (via ${profile.via})`);
+    } else {
+      const why = res.ok ? (res.value.error ?? "no profile returned") : res.error;
+      await note(leadId, "tool", `Could not read the LinkedIn profile (${why}). Continuing from the URL, your notes and web search.`);
+    }
+  } else {
+    await note(leadId, "tool", "LinkedIn is not connected. Continuing from the URL, your notes and web search.");
+  }
+
+  const person = personFrom(lead, profile);
+
+  // Without a profile, a people search for the profile URL usually returns the
+  // person's name and headline, which is enough to anchor every later search.
+  let searchHit: ExaResult | null = null;
+  if (!profile && (!person.name || person.nameIsGuess || !person.company) && isConfigured(exaStatus)) {
+    searchHit = await findProfileBySearch(leadId, lead, person, deadline);
+    if (searchHit) {
+      const parsed = parseLinkedInTitle(searchHit.title);
+      if (parsed.name && (!person.name || person.nameIsGuess)) {
+        person.name = parsed.name;
+        person.nameIsGuess = false;
+        Object.assign(person, namesOf(parsed.name));
+      }
+      person.title ??= parsed.title;
+      person.company ??= parsed.company;
+    }
+  }
+
+  await step(leadId, person.company ? `Looking up ${person.company}` : "Looking up the company");
+
+  // The company page and the Apollo match do not depend on each other.
+  const companyKey = person.companyLinkedinUrl ?? person.company;
+  const [companyRes, apolloRes] = await Promise.all([
+    companyKey && isConfigured(linkedinStatus)
+      ? attempt("LinkedIn company page", deadline.budget(SECONDARY_TIMEOUT_MS, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
+          getLinkedInCompany(companyKey),
+        )
+      : null,
+    isConfigured(apolloStatus)
+      ? attempt("Apollo person match", deadline.budget(25_000, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
+          matchPerson({
+            linkedinUrl: lead.linkedinUrl,
+            name: person.nameIsGuess ? null : person.name,
+            domain: profile?.currentCompanyDomain ?? lead.companyDomain,
+            organizationName: person.company,
+          }),
+        )
+      : null,
+  ]);
+
+  let company: LinkedInCompany | null = null;
+  if (companyRes) {
+    if (companyRes.ok && companyRes.value.company) {
+      company = companyRes.value.company;
+      await raw(leadId, "linkedin.company", { key: companyKey }, company);
+    } else {
+      await note(leadId, "tool", `LinkedIn company page not available (${companyRes.ok ? (companyRes.value.error ?? "not found") : companyRes.error})`);
+    }
+  }
+
+  let apolloPerson: ApolloPerson | null = null;
+  if (apolloRes) {
+    if (apolloRes.ok) {
+      await raw(leadId, "apollo.person", { linkedinUrl: lead.linkedinUrl }, apolloRes.value);
+      apolloPerson = apolloRes.value.person;
+      // A plan block is expected on the free plan and is not worth an event; a real error is.
+      if (!apolloPerson && apolloRes.value.error && !apolloRes.value.planBlocked) {
+        await note(leadId, "tool", `Apollo person match failed (${apolloRes.value.error})`);
+      }
+    } else {
+      await note(leadId, "tool", `Apollo person match failed (${apolloRes.error})`);
+    }
+  }
+
+  if (apolloPerson) {
+    if (!person.name || person.nameIsGuess) {
+      if (apolloPerson.name) {
+        person.name = apolloPerson.name;
+        person.nameIsGuess = false;
+        Object.assign(person, namesOf(apolloPerson.name));
+      }
+    }
+    person.title ??= apolloPerson.title ?? apolloPerson.headline;
+    person.company ??= apolloPerson.organizationName;
+    person.location ??= [apolloPerson.city, apolloPerson.country].filter(Boolean).join(", ") || null;
+  }
+  person.company ??= company?.name ?? null;
+  person.companyLinkedinUrl ??= company?.linkedinUrl ?? null;
+
+  // Company domain, most trusted source first.
+  person.domain =
+    domainFromUrl(profile?.currentCompanyDomain) ??
+    domainFromUrl(company?.domain) ??
+    domainFromUrl(company?.website) ??
+    domainFromUrl(apolloPerson?.organizationDomain) ??
+    domainFromUrl(lead.companyDomain) ??
+    null;
+  if (!person.domain && person.company && isConfigured(exaStatus)) {
+    person.domain = await findDomainBySearch(leadId, person.company, deadline);
+  }
+
+  const patch: LeadPatch = {};
+  // The user's own entries are kept when research found nothing better; a guessed name is never saved over a real one.
+  if (person.name && (!person.nameIsGuess || !lead.name)) patch.name = person.name;
+  if (person.title) patch.title = person.title;
+  if (person.company) patch.companyName = person.company;
+  if (person.location) patch.location = person.location;
+  if (person.companyLinkedinUrl) patch.companyLinkedinUrl = person.companyLinkedinUrl;
+  if (person.domain) patch.companyDomain = person.domain;
+  if (apolloPerson?.email && !lead.email) {
+    patch.email = apolloPerson.email;
+    patch.emailConfidence = apolloPerson.emailStatus === "verified" ? 95 : 70;
+  }
+  const apolloHandle = cleanXHandle(apolloPerson?.twitterUrl);
+  if (apolloHandle && !lead.xHandle) patch.xHandle = apolloHandle;
+
+  let current = lead;
+  try {
+    current = (await updateLead(leadId, patch)) ?? lead;
+  } catch (err) {
+    await note(leadId, "tool", `Could not save the profile details (${err instanceof Error ? err.message : "database error"})`);
+  }
+
+  const who = [person.name, person.title, person.company].filter(Boolean).join(", ");
+  await note(
+    leadId,
+    "step",
+    who
+      ? `Identified: ${who}${person.domain ? ` (${person.domain})` : ""}${person.nameIsGuess ? ". The name is a guess from the URL." : ""}`
+      : "Could not identify the person yet. Research continues from the URL and your notes.",
+  );
+
+  return { leadId, lead: current, settings, deadline, person, profile, company, apolloPerson };
+}
+
+function namesOf(full: string): { firstName: string | null; lastName: string | null } {
+  const { first, last } = splitName(full);
+  return { firstName: first, lastName: last };
+}
+
+/** The best picture of the person from the lead row and the profile, before any search. Pure. */
+export function personFrom(lead: Lead, profile: LinkedInProfile | null): Person {
+  const slugName = nameFromSlug(lead.linkedinSlug);
+  const name = profile?.fullName?.trim() || lead.name?.trim() || slugName;
+  const nameIsGuess = !profile?.fullName?.trim() && !lead.name?.trim() && Boolean(slugName);
+  const split = splitName(name);
+  return {
+    name: name ?? null,
+    nameIsGuess,
+    firstName: profile?.firstName?.trim() || split.first,
+    lastName: profile?.lastName?.trim() || split.last,
+    title: profile?.currentTitle?.trim() || profile?.headline?.trim() || lead.title,
+    company: profile?.currentCompany?.trim() || lead.companyName,
+    domain: domainFromUrl(profile?.currentCompanyDomain) ?? lead.companyDomain,
+    location: profile?.location?.trim() || lead.location,
+    linkedinUrl: lead.linkedinUrl,
+    companyLinkedinUrl: profile?.currentCompanyLinkedinUrl ?? lead.companyLinkedinUrl,
+  };
+}
+
+async function findProfileBySearch(leadId: string, lead: Lead, person: Person, deadline: Deadline): Promise<ExaResult | null> {
+  const query = [person.name, person.company, "LinkedIn", lead.linkedinSlug].filter(Boolean).join(" ");
+  const res = await attempt("People search", deadline.budget(25_000, RESERVE_AFTER_IDENTIFY_MS), () =>
+    exaSearch(query, { category: "people", numResults: 5, textChars: 1500 }),
+  );
+  await addUsage(leadId, { exaSearches: 1 }).catch(() => undefined);
+  if (!res.ok) {
+    await note(leadId, "tool", `People search failed (${res.error})`);
+    return null;
+  }
+  await raw(leadId, "exa.identify", { query }, res.value);
+  const wanted = urlKey(lead.linkedinUrl);
+  // Only an exact profile-URL match is trusted here: a namesake would poison every later step.
+  const hit = res.value.find((r) => urlKey(r.url) === wanted || (lead.linkedinSlug && urlKey(r.url).endsWith(`/in/${lead.linkedinSlug}`)));
+  if (hit) await note(leadId, "tool", "Found the profile through web search");
+  return hit ?? null;
+}
+
+async function findDomainBySearch(leadId: string, company: string, deadline: Deadline): Promise<string | null> {
+  const res = await attempt("Company website search", deadline.budget(20_000, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
+    exaSearch(`${company} official website`, { category: "company", numResults: 5, textChars: 300 }),
+  );
+  await addUsage(leadId, { exaSearches: 1 }).catch(() => undefined);
+  if (!res.ok) return null;
+  await raw(leadId, "exa.domain", { company }, res.value.map((r) => ({ url: r.url, title: r.title })));
+  return pickCompanyDomain(
+    company,
+    res.value.map((r) => r.url),
+  );
+}
+
+/** First result whose host plausibly is the company's own site. Pure. */
+export function pickCompanyDomain(company: string, urls: string[]): string | null {
+  for (const url of urls) {
+    const domain = domainFromUrl(url);
+    if (domain && domainMatchesCompany(domain, company)) return domain;
+  }
+  return null;
+}

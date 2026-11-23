@@ -1,26 +1,284 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* Design tokens: the abstract.inc look. White and black, hairlines, no shadows. */
+@theme {
+  --color-ink: #22221f;
+  --color-paper: #ffffff;
+  --color-quiet: #767670;
+  --color-hairline: #e4e4df;
+  --color-wash: #f6f6f3;
+  --color-link: #234cd0;
+  --color-danger: #b42318;
+  --color-success: #1f7a3f;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: var(--font-newsreader), ui-serif, Georgia, "Times New Roman", serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  html {
+    color-scheme: light;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14.5px;
+    line-height: 1.55;
+  }
+  ::selection {
+    background: #e3e3dc;
+  }
+  /* One focus style everywhere, visible only for keyboard use. */
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+  button,
+  select,
+  summary,
+  [role="tab"] {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 14px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+    user-select: none;
+  }
+  .btn-sm {
+    height: 30px;
+    padding: 0 10px;
+    font-size: 13px;
+  }
+  .btn-primary {
+    background: var(--color-ink);
+    color: #fff;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: #000;
+  }
+  .btn-secondary {
+    background: #fff;
+    color: var(--color-ink);
+    border-color: var(--color-hairline);
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--color-wash);
+    border-color: #d3d3cc;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--color-ink);
+    padding: 0 8px;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-wash);
+  }
+  .btn-danger {
+    background: #fff;
+    color: var(--color-danger);
+    border-color: var(--color-hairline);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: #fdf3f2;
+    border-color: #ecc8c4;
+  }
+  .btn-danger-solid {
+    background: var(--color-danger);
+    color: #fff;
+  }
+  .btn-danger-solid:hover:not(:disabled) {
+    background: #96190f;
+  }
+  .btn:disabled {
+    opacity: 0.45;
+  }
+
+  .field {
+    display: block;
+    width: 100%;
+    min-height: 36px;
+    padding: 7px 11px;
+    border: 1px solid var(--color-hairline);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--color-ink);
+    font-size: 14px;
+    line-height: 1.45;
+    transition: border-color 120ms ease;
+  }
+  .field::placeholder {
+    color: #a3a39c;
+  }
+  .field:hover {
+    border-color: #d3d3cc;
+  }
+  .field:focus {
+    outline: none;
+    border-color: var(--color-ink);
+  }
+  .field:disabled {
+    background: var(--color-wash);
+    color: var(--color-quiet);
+  }
+  .field[aria-invalid="true"] {
+    border-color: var(--color-danger);
+  }
+  textarea.field {
+    resize: vertical;
+    line-height: 1.55;
+  }
+  select.field {
+    appearance: none;
+    padding-right: 30px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23767670' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 11px center;
+  }
+  select.field-sm {
+    min-height: 28px;
+    padding: 2px 26px 2px 10px;
+    font-size: 12.5px;
+    border-radius: 999px;
+    background-position: right 9px center;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 9px;
+    border: 1px solid var(--color-hairline);
+    border-radius: 999px;
+    background: #fff;
+    color: var(--color-ink);
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .card {
+    border: 1px solid var(--color-hairline);
+    border-radius: 10px;
+    background: #fff;
+  }
+
+  .skeleton {
+    border-radius: 6px;
+    background: var(--color-wash);
+    animation: pulse-quiet 1.4s ease-in-out infinite;
+  }
+
+  /* Small label above groups of content: quiet, uppercase, tracked. */
+  .eyebrow {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--color-quiet);
+  }
+
+  /* Tooltip that explains why a control is disabled. The wrapper takes focus
+     because a disabled button cannot, so keyboard users can read the reason. */
+  .tip {
+    position: relative;
+    display: inline-flex;
+  }
+  .tip::after {
+    content: attr(data-tip);
+    position: absolute;
+    z-index: 30;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: 240px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    background: var(--color-ink);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.35;
+    white-space: normal;
+    text-align: left;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 100ms ease;
+  }
+  .tip:hover::after,
+  .tip:focus-visible::after {
+    opacity: 1;
+  }
+  .tip-end::after {
+    left: auto;
+    right: 0;
+    transform: none;
+  }
+
+  .spinner {
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    border: 1.5px solid var(--color-hairline);
+    border-top-color: var(--color-ink);
+    animation: spin 0.8s linear infinite;
+    flex: none;
+  }
+
+  dialog.modal {
+    margin: auto;
+    width: min(420px, calc(100vw - 32px));
+    padding: 0;
+    border: 1px solid var(--color-hairline);
+    border-radius: 12px;
+    background: #fff;
+    color: var(--color-ink);
+  }
+  dialog.modal::backdrop {
+    background: rgb(34 34 31 / 0.28);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pulse-quiet {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton,
+  .spinner {
+    animation-duration: 3s;
+  }
 }

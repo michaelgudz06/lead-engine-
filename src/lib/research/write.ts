@@ -27,17 +27,21 @@ import { compact, domainFromUrl, fitToLimit, truncate, uniqueBy } from "./util";
 export interface AliasMap {
   aliasOf: Map<string, string>;
   idOf: Map<string, string>;
+  /** Alias -> the finding's title, for the rare label that ends up inside a sentence. */
+  titleOf?: Map<string, string>;
 }
 
 export function aliasFindings(findings: Finding[]): AliasMap {
   const aliasOf = new Map<string, string>();
   const idOf = new Map<string, string>();
+  const titleOf = new Map<string, string>();
   findings.forEach((f, i) => {
     const alias = `F${i + 1}`;
     aliasOf.set(f.id, alias);
     idOf.set(alias, f.id);
+    if (f.title?.trim()) titleOf.set(alias, f.title.trim());
   });
-  return { aliasOf, idOf };
+  return { aliasOf, idOf, titleOf };
 }
 
 /** "F3", "[f3]", "F3." or a real finding id -> real ids, in order, without duplicates. Unknown labels vanish. */
@@ -61,16 +65,22 @@ export function resolveIds(labels: unknown, map: AliasMap): string[] {
  * Removes finding labels the model left inside prose ("... on the cart (F2).").
  * Labels belong in findingIds only; in text they would mean nothing to the reader.
  */
-export function stripAliases(text: string | null | undefined): string {
+export function stripAliases(text: string | null | undefined, map?: AliasMap): string {
   return (text ?? "")
     .replace(/\s*[\[(]\s*F\d{1,3}(?:\s*(?:,|and|&)\s*F\d{1,3})*\s*[\])]/g, "")
+    // A bare label used as a noun ("F2 is an Amazon article"): name the finding instead, so the sentence still reads.
+    .replace(/\bF(\d{1,3})\b(?![-.]\d)/g, (label) => {
+      if (!map?.idOf.has(label)) return label;
+      const title = map.titleOf?.get(label);
+      return title ? `"${title}"` : "one of the findings";
+    })
     .replace(/[ \t]+([.,;:!?])/g, "$1")
     .trim();
 }
 
 function citedList(items: Array<{ text: string; findingIds: string[] }> | undefined, map: AliasMap, max: number): Cited[] {
   return (items ?? [])
-    .map((item) => ({ text: stripAliases(item.text), findingIds: resolveIds(item.findingIds, map) }))
+    .map((item) => ({ text: stripAliases(item.text, map), findingIds: resolveIds(item.findingIds, map) }))
     // A claim whose citations all turned out to be invalid is unsupported: leave it out.
     .filter((item) => item.text && item.findingIds.length > 0)
     .slice(0, max);
@@ -116,7 +126,7 @@ export function shapeBrief(rawOut: z.infer<typeof BriefSchema>, map: AliasMap, p
   const c = rawOut.companyPicture;
   return {
     brief: {
-      summary: stripAliases(b.summary),
+      summary: stripAliases(b.summary, map),
       bullets: citedList(b.bullets, map, 8),
       pains: citedList(b.pains, map, 4),
       objections: cleanList(b.objections, 4),
@@ -197,7 +207,7 @@ export function shapeAngles(rawOut: z.infer<typeof AnglesSchema>, map: AliasMap)
   const renamed = new Map<string, string>();
   const angles: Angle[] = [];
   for (const a of rawOut.angles ?? []) {
-    const body = stripAliases(a.emailBody);
+    const body = stripAliases(a.emailBody, map);
     if (!body) continue;
     const library = ANGLE_LIBRARY.find((l) => l.id === slug(a.id ?? ""));
     let id = library?.id ?? (slug(a.id ?? "") || slug(a.name ?? "") || "angle");
@@ -208,10 +218,10 @@ export function shapeAngles(rawOut: z.infer<typeof AnglesSchema>, map: AliasMap)
     angles.push({
       id,
       name: a.name?.trim() || library?.name || "Angle",
-      reasoning: stripAliases(a.reasoning),
+      reasoning: stripAliases(a.reasoning, map),
       findingIds: resolveIds(a.findingIds, map),
       email: { subject: truncate(stripAliases(a.emailSubject).replace(/\s+/g, " "), 140), body },
-      linkedinMessage: stripAliases(a.linkedinMessage),
+      linkedinMessage: stripAliases(a.linkedinMessage, map),
     });
     if (angles.length === 4) break;
   }
@@ -222,7 +232,7 @@ export function shapeAngles(rawOut: z.infer<typeof AnglesSchema>, map: AliasMap)
     approach: {
       leadAngleId: lead && angles.some((a) => a.id === lead) ? lead : (angles[0]?.id ?? null),
       channel: ap?.channel ?? "either",
-      why: stripAliases(ap?.why),
+      why: stripAliases(ap?.why, map),
       firstCallQuestions: cleanList(ap?.firstCallQuestions, 5),
       dealBreakers: cleanList(ap?.dealBreakers, 4),
     },
@@ -288,16 +298,70 @@ export function signOff(settings: Pick<Settings, "senderName" | "signature">): s
   return `Best,\n${name || "[your name]"}`;
 }
 
+const GREETING = /^\s*((?:hi|hello|hey|dear)(?:[ \t]+[\p{L}.'’\-\[\]]+){0,4}?)(?:[,:!][ \t]*|[ \t]*(?=\n))/iu;
+/** Sentence starts: a capital, a bracket or the booking token after closing punctuation. */
+const SENTENCE_BREAK = /(?<=[.?!]["')\]]?)\s+(?=[A-Z\[{])/;
+
 /**
- * Turns verified drafts into what the teammate sees: the booking link (or a
- * visible placeholder) in place of the token, the sign-off, and a LinkedIn
- * message that fits a connection note.
+ * Lays an email body out the way a person would type it:
+ *
+ *   Hi <Name>,
+ *   <blank line>
+ *   <short paragraphs separated by blank lines>
+ *
+ * The model (and the checker that may rewrite after it) sometimes returns the
+ * greeting and the whole message as one line. The greeting always gets its own
+ * line; a body that came back as a single block of three or more sentences is
+ * split before the part about Abstract and before the ask. No words change. Pure.
  */
-export function finalizeAngles(angles: Angle[], settings: Pick<Settings, "senderName" | "signature" | "calendlyUrl">): Angle[] {
+export function formatEmailBody(body: string, firstName?: string | null): string {
+  let text = (body ?? "").replace(/\r\n?/g, "\n").trim();
+  let greeting = firstName?.trim() ? `Hi ${firstName.trim()},` : "Hi,";
+  const m = text.match(GREETING);
+  if (m) {
+    greeting = `${m[1].trim().replace(/^./, (c) => c.toUpperCase())},`;
+    text = text.slice(m[0].length).trim();
+  }
+  // The sentence that followed "Hi Name," on the same line starts a paragraph now.
+  text = text.replace(/^[a-z]/, (c) => c.toUpperCase());
+
+  let paragraphs = text
+    .split(/\n\s*\n+/)
+    .map((p) => p.replace(/[ \t]*\n[ \t]*/g, "\n").replace(/[ \t]{2,}/g, " ").trim())
+    .filter(Boolean);
+
+  if (paragraphs.length === 1 && !paragraphs[0].includes("\n")) {
+    const sentences = paragraphs[0].split(SENTENCE_BREAK).filter(Boolean);
+    if (sentences.length >= 3) {
+      const isAsk = (s: string) => /\{\{\s*BOOKING_LINK\s*\}\}|\[your booking link\]|https?:\/\/\S+/i.test(s) || (/\?\s*$/.test(s) && /\b(call|chat|talk|meet|minutes|open to|worth)\b/i.test(s));
+      // The ask is the closing question plus the link that follows it.
+      let askAt = sentences.length;
+      while (askAt > 1 && isAsk(sentences[askAt - 1])) askAt--;
+      if (askAt === sentences.length) askAt = sentences.length - 1;
+      // The pitch starts at the first sentence about Abstract, when that is not the opening line.
+      const pitchAt = sentences.findIndex((s, i) => i > 0 && i < askAt && /\bAbstract\b/.test(s));
+      const cuts = [...new Set([0, pitchAt > 0 ? pitchAt : 0, askAt])].sort((x, y) => x - y);
+      paragraphs = cuts.map((from, i) => sentences.slice(from, cuts[i + 1] ?? sentences.length).join(" ")).filter(Boolean);
+    }
+  }
+  return [greeting, ...paragraphs].join("\n\n");
+}
+
+/**
+ * Turns verified drafts into what the teammate sees: the greeting on its own
+ * line, paragraphs, the booking link (or a visible placeholder) in place of the
+ * token, the sign-off, and a LinkedIn message that fits a connection note.
+ */
+export function finalizeAngles(
+  angles: Angle[],
+  settings: Pick<Settings, "senderName" | "signature" | "calendlyUrl">,
+  firstName?: string | null,
+): Angle[] {
   const link = settings.calendlyUrl?.trim() || BOOKING_PLACEHOLDER;
   const fill = (text: string) => text.split(BOOKING_TOKEN).join(link).replace(/\{\{\s*BOOKING_LINK\s*\}\}/gi, link);
   return angles.map((a) => {
-    const body = `${fill(stripSignOff(a.email.body)).replace(/\n{3,}/g, "\n\n").trim()}\n\n${signOff(settings)}`;
+    // "Hi <Name>," / blank line / paragraphs / blank line / "Best," / the sender.
+    const body = `${formatEmailBody(fill(stripSignOff(a.email.body)), firstName)}\n\n${signOff(settings)}`;
     // A link does not belong in a connection note: drop the token and tidy what is left.
     const linkedin = a.linkedinMessage
       .replace(/\{\{\s*BOOKING_LINK\s*\}\}/gi, "")

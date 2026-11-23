@@ -93,16 +93,19 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     }
   }
 
-  async function patch(change: LeadPatch) {
+  /** Saves a change. Resolves to false (after putting the old value back) when it fails. */
+  async function patch(change: LeadPatch): Promise<boolean> {
     setActionError(null);
     const before = lead;
     setLead({ ...lead, ...change } as Lead);
     try {
       setLead(await updateLead(lead.id, change));
       if (change.stage) void reload(); // brings in the new "stage" event
+      return true;
     } catch (err) {
       setLead(before);
       setActionError(`That change was not saved: ${errorMessage(err)}`);
+      return false;
     }
   }
 
@@ -162,13 +165,13 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         <div className="min-w-0">
           <h1 className="break-words font-serif text-[32px] leading-[1.15] tracking-[-0.01em]">{leadName(lead)}</h1>
           {(sub || lead.location) && (
-            <p className="mt-1 text-[15px] text-quiet">
+            <p className="mt-1 text-[15px] text-quiet wrap-anywhere">
               {sub}
               {sub && lead.location && " · "}
               {lead.location}
             </p>
           )}
-          <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[13.5px]">
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[13.5px] wrap-anywhere">
             {linkedin && <ExternalLink href={linkedin}>LinkedIn ↗</ExternalLink>}
             {lead.email && (
               <span>
@@ -245,14 +248,14 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
                 <Label htmlFor="stage">Stage</Label>
                 <StageSelect id="stage" value={lead.stage} onChange={(stage) => void patch({ stage })} />
               </div>
-              <SavedField key={`owner-${lead.owner ?? ""}`} id="owner" label="Owner" initial={lead.owner ?? ""} placeholder="Who is on this lead" onSave={(v) => patch({ owner: v.trim() || null })} />
+              <SavedField id="owner" label="Owner" initial={lead.owner ?? ""} placeholder="Who is on this lead" onSave={(v) => patch({ owner: v.trim() || null })} />
               <div>
                 <Label htmlFor="nextStepAt" hint={lead.nextStepAt ? <button type="button" className="underline underline-offset-2 hover:text-ink" onClick={() => void patch({ nextStepAt: null })}>Clear</button> : undefined}>
                   Follow up on
                 </Label>
                 <input id="nextStepAt" type="date" className="field" value={toDateInput(lead.nextStepAt)} onChange={(e) => void patch({ nextStepAt: e.target.value ? fromDateInput(e.target.value) : null })} />
               </div>
-              <SavedField key={`notes-${lead.notes ?? ""}`} id="notes" label="Your notes" multiline initial={lead.notes ?? ""} placeholder="How you know them, what was said, what you want" onSave={(v) => patch({ notes: v.trim() || null })} />
+              <SavedField id="notes" label="Your notes" multiline initial={lead.notes ?? ""} placeholder="How you know them, what was said, what you want" onSave={(v) => patch({ notes: v.trim() || null })} />
               <dl className="space-y-1 border-t border-hairline pt-3 text-[13px] text-quiet">
                 <Meta label="Added" value={formatDate(lead.createdAt)} />
                 {lead.lastContactedAt && <Meta label="Last contacted" value={formatDate(lead.lastContactedAt)} />}
@@ -282,15 +285,25 @@ function Meta({ label, value }: { label: string; value: string }) {
 }
 
 /** A text field that saves when focus leaves it, and says so. */
-function SavedField({ id, label, initial, placeholder, multiline, onSave }: { id: string; label: string; initial: string; placeholder?: string; multiline?: boolean; onSave: (value: string) => Promise<void> }) {
+function SavedField({ id, label, initial, placeholder, multiline, onSave }: { id: string; label: string; initial: string; placeholder?: string; multiline?: boolean; onSave: (value: string) => Promise<boolean> }) {
   const [value, setValue] = useState(initial);
+  const [seen, setSeen] = useState(initial);
   const [state, setState] = useState<"idle" | "saving" | "saved">("idle");
 
+  // The saved value changed underneath (a save came back, or a refresh brought
+  // someone else's edit): follow it unless the person is part-way through typing.
+  if (initial !== seen) {
+    setSeen(initial);
+    if (value === seen) setValue(initial);
+  }
+
   async function commit() {
-    if (value === initial || state === "saving") return;
+    const next = value.trim();
+    if (next !== value) setValue(next);
+    if (next === initial || state === "saving") return;
     setState("saving");
-    await onSave(value);
-    setState("saved");
+    const ok = await onSave(next);
+    setState(ok ? "saved" : "idle");
   }
 
   const hint = state === "saving" ? "Saving…" : state === "saved" ? "Saved" : value !== initial ? "Unsaved" : undefined;

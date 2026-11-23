@@ -313,3 +313,33 @@ export function uniqueBy<T>(items: T[], key: (item: T) => string): T[] {
 export function compact<T>(items: Array<T | null | undefined | false | "">): T[] {
   return items.filter(Boolean) as T[];
 }
+
+const STOPWORDS = new Set(
+  "a an and are as at be been by for from has have he her his in is it its of on or she that the their they this to was were which who with also about into than then per via according says said".split(" "),
+);
+
+/** Content words of a sentence, lowercased, for comparing two facts. */
+export function contentTokens(text: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  for (const raw of (text ?? "").toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9.]+/)) {
+    const t = raw.replace(/^\.+|\.+$/g, "");
+    if (t.length < 2 || STOPWORDS.has(t)) continue;
+    out.add(t);
+  }
+  return out;
+}
+
+/**
+ * True when two facts say the same thing in different words: most of the shorter
+ * one's content words appear in the longer one (80% by default). Short facts are never
+ * matched this way (too few words to tell).
+ */
+export function sameFact(a: string | null | undefined, b: string | null | undefined, threshold = 0.8): boolean {
+  const x = contentTokens(a);
+  const y = contentTokens(b);
+  const [small, large] = x.size <= y.size ? [x, y] : [y, x];
+  if (small.size < 5) return false;
+  let shared = 0;
+  for (const t of small) if (large.has(t)) shared++;
+  return shared / small.size >= threshold;
+}

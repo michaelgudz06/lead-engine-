@@ -11,6 +11,8 @@ import { clamp01 } from "./util";
 export const MIN_CONFIDENCE = 0.5;
 /** The writer sees at most this many findings, best first, to keep prompts small. */
 export const MAX_FINDINGS_FOR_WRITING = 60;
+/** Below this relevance a finding stays in the list for the reader but is not handed to the writer (education, old jobs). */
+export const MIN_RELEVANCE_FOR_WRITING = 0.25;
 
 export function criteriaBlock(criteria: string[]): string {
   const rules = (criteria ?? []).map((c) => c.trim()).filter(Boolean);
@@ -35,7 +37,9 @@ export function normaliseVerdict<T extends Pick<NewFinding, "passesCriteria" | "
 /** Findings the writer may use: passed the criteria, confident enough, most relevant first. */
 export function selectForWriting(findings: Finding[], max = MAX_FINDINGS_FOR_WRITING): Finding[] {
   return findings
-    .filter((f) => f.passesCriteria && f.confidence >= MIN_CONFIDENCE)
+    // The email address is contact data on the lead, not something to write about.
+    .filter((f) => f.passesCriteria && f.confidence >= MIN_CONFIDENCE && f.kind !== "email")
+    .filter((f) => f.source === "notes" || f.relevance >= MIN_RELEVANCE_FOR_WRITING)
     .sort((a, b) => {
       // The user's own notes always come first: they are the most trusted context.
       const notes = Number(b.source === "notes") - Number(a.source === "notes");

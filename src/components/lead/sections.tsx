@@ -47,7 +47,7 @@ export function ResearchProgress({ lead, events }: { lead: Lead; events: LeadEve
           {recent.map((e, i) => (
             <li key={e.id} className={cx("flex items-baseline gap-3 py-[3px] text-[13.5px]", i === 0 ? "text-ink" : "text-quiet")}>
               <span aria-hidden className={cx("mt-[7px] h-1 w-1 shrink-0 self-start rounded-full", i === 0 ? "bg-ink" : "bg-hairline")} />
-              <span className="min-w-0 flex-1 break-words">{e.message}</span>
+              <span className="min-w-0 flex-1 wrap-anywhere">{e.message}</span>
               <span className="shrink-0 text-[12px] tabular-nums text-quiet">{new Date(e.createdAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" })}</span>
             </li>
           ))}
@@ -256,7 +256,7 @@ function FindingRow({ finding: f }: { finding: Finding }) {
   const url = safeUrl(f.url);
   const date = formatDate(f.publishedAt);
   return (
-    <li id={`finding-${f.id}`} className={cx("scroll-mt-24 py-2.5 target:bg-wash", !f.passesCriteria && "opacity-70")}>
+    <li id={`finding-${f.id}`} className={cx("scroll-mt-24 py-2.5 wrap-anywhere target:bg-wash", !f.passesCriteria && "opacity-70")}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
         {f.title && <span className="font-medium">{f.title}</span>}
         <span className="text-[12px] text-quiet">
@@ -314,7 +314,7 @@ export function ActivitySection({ events }: { events: LeadEvent[] }) {
                     {timeAgo(e.createdAt)}
                   </time>
                 </div>
-                <p className={cx("mt-0.5 break-words", e.type === "error" && "text-danger")}>{e.message}</p>
+                <p className={cx("mt-0.5 wrap-anywhere", e.type === "error" && "text-danger")}>{e.message}</p>
               </li>
             ))}
           </ol>

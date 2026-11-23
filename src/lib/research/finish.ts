@@ -108,7 +108,7 @@ export async function writeVerifySave(ctx: RunContext, opts: WriteOptions): Prom
     await note(leadId, "tool", "Skipped the draft check to finish in time. Read the claims carefully before sending.");
   }
 
-  const clean = sanitizeCitations({ angles: finalizeAngles(angles, settings), approach }, validIds);
+  const clean = sanitizeCitations({ angles: finalizeAngles(angles, settings, person.firstName), approach }, validIds);
   const patch: LeadPatch = { angles: clean.angles, approach: clean.approach };
   await updateLead(leadId, patch);
 

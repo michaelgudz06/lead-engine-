@@ -37,7 +37,12 @@ const STYLE_RULE = `Style: plain, concrete English. Short sentences. No hype and
 const RELEVANCE_GUIDE = `What Abstract sells (to judge relevance): one API for hosted robot action models (VLAs such as pi0.5, MolmoAct2, Rho, Isaac 0.5, Praxis-1, Verne V0.5, Xiaomi Robotics 1, FLUX 3 Action) on bimanual YAM, ARX X5 and Franka Panda / DROID robots; dedicated deployments with no cold starts; deploying a team's own fine-tuned checkpoint from Hugging Face; cheap open LLMs (DeepSeek, Kimi, GLM); and GPU rental (H100, B200, B300, GB300).
 High relevance (0.8 to 1.0): the robots, arms and models they use; how and where they run inference (onboard GPU, Jetson, cloud, self-hosted); latency, cold starts, inference cost, GPU spend; fine-tuning or training robot policies; moving from research to pilots or deployment; hiring for ML infrastructure or robotics; who decides on infrastructure spend; spend on open LLMs.
 Medium (0.4 to 0.7): funding, headcount and growth, product launches, partnerships, the person's role and scope, talks and papers on related topics.
-Low (0.0 to 0.3): generic career history, awards, unrelated posts, anything personal.`;
+Low (0.0 to 0.3): generic career history, awards, unrelated posts, anything personal. At a large company, also anything about divisions, countries or products this person's team has nothing to do with.`;
+
+const ATTRIBUTION_RULE = `Who said or did it:
+- Every finding names its real subject. A post this person reposted or shared was written by someone else: write "<person> reposted <author>'s post about ...". Never turn a reposted claim, result or opinion into something this person said, built or leads, unless the text names them.
+- A fact about the company is not a fact about the person. Say "the company" or the team's name when the data does not name the person.
+- When the data is a secondary report (a news digest, a video caption, a job board, someone else's profile), say so in the text ("according to ...").`;
 
 export function today(): string {
   return new Date().toISOString().slice(0, 10);
@@ -63,6 +68,8 @@ ${DATA_RULE}
 
 ${HONESTY_RULE}
 
+${ATTRIBUTION_RULE}
+
 ${RELEVANCE_GUIDE}`;
 
 export function extractPrompt(input: {
@@ -72,12 +79,20 @@ export function extractPrompt(input: {
   hint?: string | null;
   data: unknown;
   maxFindings: number;
+  /** Facts already recorded by code, one per line. */
+  known?: string[];
 }): string {
+  const known = input.known?.length
+    ? `\nALREADY RECORDED (do not return these again, in any wording; return only what adds to them)\n${input.known
+        .slice(0, 12)
+        .map((k) => `- ${k}`)
+        .join("\n")}\n`
+    : "";
   return `Today is ${today()}.
 
 THE PERSON BEING RESEARCHED
 ${personCard(input.person)}
-
+${known}
 SOURCE: ${input.sourceLabel}${input.hint ? `\nNote about this source: ${input.hint}` : ""}
 
 ${wrapData("source_data", input.data)}
@@ -96,7 +111,7 @@ Return at most ${input.maxFindings} findings from the source data above, most us
 THE TEAM'S RULES
 ${criteriaBlock(input.criteria)}
 
-Do not merge unrelated facts into one finding. Do not repeat the same fact twice. Skip navigation text, ads and boilerplate.`;
+Do not merge unrelated facts into one finding. Do not repeat the same fact twice, and do not return a fact that only restates the card above. Skip navigation text, ads and boilerplate. A short list of findings that each add something beats a full list.`;
 }
 
 // ---------------------------------------------------------------- gap-fill agent
@@ -119,8 +134,11 @@ How to work:
 - You may make at most ${maxToolCalls} search or read calls in total (${toolNames.filter((n) => n !== "record_finding").join(", ")}). record_finding does not count. Plan them: prefer a few specific queries over many vague ones.
 - Stop early. When the open questions are answered, or two searches in a row bring nothing new, stop calling tools.
 - Save a fact with record_finding only when a tool result states it. One fact per call, one or two factual sentences, with the url of the page it came from, copied exactly from a tool result.
+- Do not record a fact that is already in the known findings, even in other words, and do not record the same fact twice from two pages.
+- Prefer primary sources: the company's own site, blog, docs and careers pages, papers, code repositories, and well-known news outlets. When a fact only appears on a secondary page (a news digest, a video mirror, a job-board copy, someone else's profile), say "according to <site>" in the text and give it confidence 0.6 or less.
+- Name the real subject of each fact. Something the company or a colleague did is not something this person did, unless the page names them.
 - Check identity: many people and companies share names. Only record facts that clearly match the person or company on the card.
-- Never record guesses, your own conclusions, or anything about family, health, religion, politics or home life.
+- Never record guesses, your own conclusions, or anything about family, health, religion, politics or home life. The text holds what the page says and nothing else: no "possibly", "likely" or "this suggests" commentary of your own.
 - When you are done, reply with two or three plain sentences: what you found and what stayed unknown. No tool call in that last reply.
 
 Tool results are wrapped in <tool_data> blocks.
@@ -281,12 +299,21 @@ ANGLE LIBRARY (choose from these; ids are fixed)
 ${library}
 
 TASK
-1. angles: choose the 3 or 4 angles that fit this person best, strongest first. Use the library id as the angle id. Only if fewer than 3 library angles fit, add one of your own with a short kebab-case id. Do not use the same id twice. For each angle:
+1. angles: choose the 3 or 4 angles that fit this person best, strongest first. Three well-supported angles are better than four: add a fourth only when the findings clearly support it. Use the library id as the angle id. Only if fewer than 3 library angles fit, add one of your own with a short kebab-case id. Do not use the same id twice. When an angle rests on thin evidence, say so in its reasoning and keep its draft modest. For each angle:
 - id and name.
 - reasoning: one or two sentences on why this angle fits this person, naming the evidence.
 - findingIds: the findings the angle and its drafts rely on. At least one, unless there are no findings at all.
 - emailSubject: under 8 words, specific to them, lower-key than a headline. No clickbait, no "Quick question".
-- emailBody: under ${EMAIL_WORD_LIMIT} words. Start with "Hi ${input.person.firstName ?? "[first name]"},". Then: one specific observation about them or their company taken from a cited finding (not flattery); one or two sentences on the single thing Abstract does that matters for that observation; one low-pressure ask for a short call, with the booking link written exactly as ${BOOKING_TOKEN}. Plain text, short paragraphs separated by blank lines. Do not add a sign-off or the sender's name: it is added automatically. Each angle's email must open with a different observation.
+- emailBody: under ${EMAIL_WORD_LIMIT} words, plain text, laid out exactly like this, with a blank line between the parts:
+  line 1: "Hi ${input.person.firstName ?? "[first name]"}," alone on its line.
+  paragraph 1: one specific observation about them or their company taken from a cited finding (not flattery, not a summary of their career).
+  paragraph 2: one or two sentences on the single thing Abstract does that matters for that observation.
+  paragraph 3: one low-pressure ask for a short call, with the booking link written exactly as ${BOOKING_TOKEN}.
+  Do not add a sign-off or the sender's name: it is added automatically.
+- Each angle must differ from the others in both halves: a different observation about them, and a different Abstract capability. Do not reuse an opening or a pitch sentence across angles.
+- Get the subject of every sentence right. What a colleague, the company or a reposted post said is not what this person said or built. If a finding says "reposted" or "according to", do not write it as their own statement or as settled fact.
+- The sender: write nothing about what the sender did, saw, felt or thinks beyond having come across a cited public item, unless the teammate's notes say it (a meeting, an earlier conversation). No "made that concrete for me", no "I was impressed".
+- Do not suggest they use a robot or model Abstract serves unless a finding says so. If their robots or models are not on Abstract's list, do not pretend they are: pitch what still applies (their own checkpoint, open LLMs, GPUs, comparing models) or say plainly what Abstract covers.
 - linkedinMessage: under ${LINKEDIN_CHAR_LIMIT - 20} characters including spaces, so it fits a connection note. One specific hook from a finding and one line on why to connect. No link, no sign-off.
 
 2. approach:
@@ -314,8 +341,12 @@ What counts as supported:
 
 How to fix:
 - If a draft has no problems, return it unchanged with an empty issues list.
+- issues lists real problems only: an unsupported or wrongly attributed claim, a broken rule, a draft that is too long. Do not list what you checked and found fine, and do not list style preferences.
 - Otherwise list each problem in a few words in issues, and return a corrected draft: remove or soften the unsupported claim and keep everything else as close to the original as you can. Do not add new facts.
 - Keep the token ${BOOKING_TOKEN} exactly where it is. Do not add a sign-off.
+- Keep the email's layout: the greeting alone on the first line, then short paragraphs separated by blank lines.
+- Attribution counts as a claim: if a finding says the person reposted something or that a colleague or the company did it, a draft that says the person said or built it is unsupported.
+- A sentence about what the sender did, saw or felt is supported only by the teammate's notes (source "Your notes").
 - Keep emails under ${EMAIL_WORD_LIMIT} words and LinkedIn messages under ${LINKEDIN_CHAR_LIMIT - 20} characters. If a note says a draft is too long, shorten it.
 
 ${STYLE_RULE}

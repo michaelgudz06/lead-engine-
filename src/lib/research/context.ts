@@ -1,10 +1,11 @@
 import "server-only";
-import type { ApolloPerson } from "../providers/apollo";
+import type { ApolloOrg, ApolloPerson } from "../providers/apollo";
 import type { LinkedInCompany, LinkedInProfile } from "../providers/linkedin";
 import { addEvent } from "../repo/events";
 import { saveRaw } from "../repo/findings";
 import { setResearchStep } from "../repo/leads";
 import type { EventType, Lead, ProviderStatus, Settings } from "../types";
+import type { DomainSource } from "./domain";
 import { Deadline, errorMessage, withTimeout } from "./util";
 
 /** What the pipeline knows about who it is researching. Built by identify, read by every later step. */
@@ -17,6 +18,8 @@ export interface Person {
   title: string | null;
   company: string | null;
   domain: string | null;
+  /** Where the domain came from (see domain.ts). Absent on a rebuilt context. */
+  domainSource?: DomainSource | null;
   location: string | null;
   linkedinUrl: string;
   companyLinkedinUrl: string | null;
@@ -31,6 +34,8 @@ export interface RunContext {
   profile: LinkedInProfile | null;
   company: LinkedInCompany | null;
   apolloPerson: ApolloPerson | null;
+  /** Apollo's company record matched by the company's LinkedIn URL during identify, when there is one. */
+  apolloOrg?: ApolloOrg | null;
 }
 
 /**

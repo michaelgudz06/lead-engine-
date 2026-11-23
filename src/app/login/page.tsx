@@ -40,7 +40,7 @@ export default function LoginPage() {
       <div className="w-full max-w-[340px]">
         <h1 className="text-center font-serif text-[32px] leading-tight tracking-[-0.01em]">Lead Engine</h1>
         <p className="mt-1.5 text-center text-quiet">Enter the team password to continue.</p>
-        <form onSubmit={onSubmit} className="card mt-7 space-y-4 p-5">
+        <form onSubmit={onSubmit} noValidate className="card mt-7 space-y-4 p-5">
           <div>
             <Label htmlFor="password">Password</Label>
             <input

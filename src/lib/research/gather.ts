@@ -16,6 +16,7 @@ import { getLinkedInPosts, linkedinStatus, type LinkedInPost } from "../provider
 import { findXHandle, getXPosts, xStatus, type XPost } from "../providers/xsearch";
 import { addUsage, updateLead } from "../repo/leads";
 import { attempt, isConfigured, note, raw, step, type RunContext } from "./context";
+import { sameCompanyName } from "./domain";
 import { cleanXHandle, compact, isoDateMonthsAgo, normaliseName, uniqueBy, urlKey } from "./util";
 
 /**
@@ -92,12 +93,24 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
     (async (): Promise<Outcome> => {
       const label = "Apollo company data";
       if (!isConfigured(apolloStatus)) return { label, status: "skipped", detail: "Apollo not connected" };
-      if (!person.domain) return { label, status: "skipped", detail: "company website unknown" };
-      const org = await attempt(label, within(30_000), () => enrichOrganization(person.domain!));
-      if (!org.ok) return { label, status: "failed", detail: org.error };
-      await raw(leadId, "apollo.org", { domain: person.domain }, org.value);
-      out.apolloOrg = org.value.org;
-      if (!out.apolloOrg) return { label, status: org.value.error ? "failed" : "empty", detail: org.value.error ?? "no match" };
+      // identify may already hold Apollo's record, matched by the company's LinkedIn URL.
+      out.apolloOrg = ctx.apolloOrg ?? null;
+      if (!out.apolloOrg) {
+        if (!person.domain) return { label, status: "skipped", detail: "company website unknown" };
+        const org = await attempt(label, within(30_000), () => enrichOrganization(person.domain!));
+        if (!org.ok) return { label, status: "failed", detail: org.error };
+        await raw(leadId, "apollo.org", { domain: person.domain }, org.value);
+        out.apolloOrg = org.value.org;
+        if (!out.apolloOrg) return { label, status: org.value.error ? "failed" : "empty", detail: org.value.error ?? "no match" };
+        // A domain that was only guessed can belong to another company (a country site, a
+        // namesake). Company facts about the wrong company are worse than none.
+        const guessed = person.domainSource === "search" || person.domainSource === "previous";
+        if (guessed && out.apolloOrg.name && person.company && !sameCompanyName(out.apolloOrg.name, person.company)) {
+          const other = out.apolloOrg.name;
+          out.apolloOrg = null;
+          return { label, status: "empty", detail: `Apollo has ${person.domain} as "${other}", not ${person.company}; left out` };
+        }
+      }
       if (out.apolloOrg.id) {
         const jobs = await attempt("Apollo job postings", within(30_000), () => getJobPostings(out.apolloOrg!.id!, 40));
         if (jobs.ok) {
@@ -125,7 +138,7 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
     // Web: company news, last 12 months
     exaTask("Web search for company news", "exa.news", () => {
       if (!person.company) return null;
-      const query = `${person.company}${person.domain ? ` (${person.domain})` : ""} announcement funding launch robots news`;
+      const query = `${person.company}${person.domain ? ` (${person.domain})` : ""} robotics AI announcement: funding, launch, robots, models, pilots`;
       return { query, opts: { category: "news" as const, numResults: 6, textChars: 2000, startPublishedDate: isoDateMonthsAgo(12) } };
     }, (r) => (out.exaNews = r)),
 
@@ -246,18 +259,23 @@ export function matchHubAccounts(
 ): Array<HubAccount & { matched: "company" | "person" }> {
   const want = normaliseName(target);
   if (want.length < 3) return [];
-  return accounts
-    .filter((a) => {
-      const id = normaliseName(a.id);
-      const full = normaliseName(a.fullName);
-      if (kind === "person") {
-        // A personal account must carry the person's full name: handles alone collide too easily.
-        return a.type === "user" && full === want;
-      }
-      return id === want || full === want || (want.length >= 5 && (id.startsWith(want) || full.startsWith(want)));
-    })
-    .slice(0, kind === "company" ? 2 : 1)
-    .map((a) => ({ ...a, matched: kind }));
+  const idOf = (a: HubAccount) => normaliseName(a.id);
+  const fullOf = (a: HubAccount) => normaliseName(a.fullName);
+  if (kind === "person") {
+    // A personal account must carry the person's full name: handles alone collide too easily.
+    return accounts
+      .filter((a) => a.type === "user" && fullOf(a) === want)
+      .slice(0, 1)
+      .map((a) => ({ ...a, matched: kind }));
+  }
+  // The company's own account: the id is its name, or an organisation carries its name. A user
+  // who merely calls themselves "Amazon" only counts when there is nothing better.
+  const own = accounts.filter((a) => idOf(a) === want || (a.type === "org" && fullOf(a) === want));
+  const exact = own.length ? own : accounts.filter((a) => fullOf(a) === want);
+  // Prefix matches ("amazon-sagemaker-community" for "Amazon") are other teams or communities
+  // more often than the company: use them only when no account carries the exact name.
+  const loose = exact.length ? [] : accounts.filter((a) => want.length >= 5 && (idOf(a).startsWith(want) || fullOf(a).startsWith(want)));
+  return [...exact, ...loose].slice(0, 2).map((a) => ({ ...a, matched: kind }));
 }
 
 async function gatherHub(ctx: RunContext, out: Gathered): Promise<void> {

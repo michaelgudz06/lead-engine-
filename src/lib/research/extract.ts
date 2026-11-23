@@ -10,7 +10,7 @@ import { note, step, type Person, type RunContext } from "./context";
 import { dropLowConfidence, normaliseVerdict } from "./criteria";
 import type { Gathered } from "./gather";
 import { EXTRACT_SYSTEM, extractPrompt } from "./prompts";
-import { clamp01, cleanDate, cleanUrl, collectUrls, compact, errorMessage, truncate, uniqueBy, urlKey } from "./util";
+import { clamp01, cleanDate, cleanUrl, collectUrls, compact, errorMessage, sameFact, truncate, uniqueBy, urlKey } from "./util";
 
 /**
  * Step 3: turn raw source data into atomic findings.
@@ -50,6 +50,8 @@ export interface SourceBundle {
 
 const EXTRACT_CONCURRENCY = 4;
 const EXTRACT_TIMEOUT_MS = 45_000;
+/** Job postings shown to the model; gather asks Apollo for the same number. */
+const JOBS_SHOWN = 40;
 
 // ---------------------------------------------------------------- deterministic findings (pure)
 
@@ -63,6 +65,7 @@ function money(amount: number): string {
 function pct(fraction: number): string {
   // Apollo reports growth as a fraction (0.25); tolerate percentages too.
   const value = Math.abs(fraction) <= 5 ? fraction * 100 : fraction;
+  if (Math.round(value) === 0) return "flat";
   return `${value >= 0 ? "up" : "down"} ${Math.abs(Math.round(value))}%`;
 }
 
@@ -146,7 +149,7 @@ export function companyFindings(company: LinkedInCompany | null): NewFinding[] {
   if (!company || !company.name) return [];
   const out: NewFinding[] = [];
   const url = company.linkedinUrl ?? company.website ?? null;
-  const size = company.employeeCount ? `${company.employeeCount} employees on LinkedIn` : company.employeeRange ? `${company.employeeRange} employees` : null;
+  const size = company.employeeCount ? `${company.employeeCount.toLocaleString("en-US")} employees on LinkedIn` : company.employeeRange ? `${company.employeeRange} employees` : null;
   const facts = compact([
     company.industry ? `industry: ${company.industry}` : null,
     size,
@@ -201,7 +204,7 @@ export function apolloOrgFindings(org: ApolloOrg | null): NewFinding[] {
       source: "apollo",
       kind: "company",
       title: "Headcount",
-      text: `${name} has about ${org.employees} employees (Apollo)${growth.length ? `, headcount ${growth.join(" and ")}` : ""}.${
+      text: `${name} has about ${org.employees.toLocaleString("en-US")} employees (Apollo)${growth.length ? `, headcount ${growth.join(" and ")}` : ""}.${
         eng.length ? ` Largest teams: ${eng.join(", ")}.` : ""
       }`,
       url,
@@ -397,7 +400,7 @@ export function buildBundles(ctx: Pick<RunContext, "person" | "profile">, gather
       key: "linkedin.posts",
       source: "linkedin",
       label: "Their recent LinkedIn posts, newest first",
-      hint: "A repost (isRepost true) shows interest, not authorship: say 'reposted'. One finding per post worth knowing; skip congratulations, birthdays and generic reshares.",
+      hint: "isRepost true, or text starting with '[Reposted from <name>]', means someone else wrote the post and this person only reshared it. '[Shared post by <name>]' marks the part of a post that quotes someone else. Write such a finding as '<this person> reposted <author>'s post about ...' and name the author. Never present a reposted claim, result, launch or opinion as this person's own words or work, unless the post names them as taking part. A repost about their own team's work is still worth a finding; give it confidence 0.6 at most unless the post names them. One finding per post worth knowing; skip congratulations, birthdays, job-change wishes and generic reshares.",
       data: gathered.posts.slice(0, 15).map((p) => ({
         url: p.url,
         postedAt: p.postedAt,
@@ -411,12 +414,21 @@ export function buildBundles(ctx: Pick<RunContext, "person" | "profile">, gather
   }
 
   if (gathered.jobs.length) {
+    // The list is capped (gather asks Apollo for 40): a full list is a sample, not the company's total.
+    const capped = gathered.jobs.length >= JOBS_SHOWN;
     bundles.push({
       key: "apollo.jobs",
       source: "apollo",
       label: `Open job postings at ${person.company ?? "the company"} (Apollo)`,
-      hint: "Return hiring findings only for roles that matter to Abstract: ML, robot learning, ML infrastructure, platform, MLOps, GPU or inference, robotics software, deployment. Group similar roles into one finding and name the titles. Add one finding with the total number of open roles. Ignore sales, HR, finance and similar roles apart from that count.",
-      data: { totalOpenRoles: gathered.jobs.length, jobs: gathered.jobs.slice(0, 40).map((j) => ({ title: j.title, url: j.url, location: j.location, postedAt: j.postedAt })) },
+      hint: `Return hiring findings only for roles that matter to Abstract: ML, robot learning, ML infrastructure, platform, MLOps, GPU or inference, robotics software, deployment. Group similar roles into one finding and name the titles. ${
+        capped
+          ? "This is only a sample of the company's postings: do not state a total number of open roles, and return nothing when no role in the sample matters to Abstract."
+          : "Add one finding with the total number of open roles."
+      } Ignore sales, HR, finance, operations and similar roles${capped ? "" : " apart from that count"}.`,
+      data: {
+        ...(capped ? { note: `sample of ${JOBS_SHOWN} postings; the company has more` } : { totalOpenRoles: gathered.jobs.length }),
+        jobs: gathered.jobs.slice(0, JOBS_SHOWN).map((j) => ({ title: j.title, url: j.url, location: j.location, postedAt: j.postedAt })),
+      },
       maxFindings: 5,
     });
   }
@@ -426,7 +438,7 @@ export function buildBundles(ctx: Pick<RunContext, "person" | "profile">, gather
       key: "exa.people",
       source: "exa",
       label: "Web search results for the person (people search)",
-      hint: "Search results often include other people with the same or a similar name. Use the company, title and location on the card to decide, and score confidence low when a result does not clearly match. Do not repeat the current job title alone.",
+      hint: "Search results often include other people with the same or a similar name. Use the company, title and location on the card to decide, and score confidence low when a result does not clearly match. Their own LinkedIn profile is usually among the results: skip what it repeats (title, employer, past jobs, education) and keep only what is new.",
       data: gathered.exaPeople.map((r) => slimResult(r, 1500)),
       maxFindings: 6,
     });
@@ -448,7 +460,7 @@ export function buildBundles(ctx: Pick<RunContext, "person" | "profile">, gather
       key: "exa.news",
       source: "exa",
       label: `News search results about ${person.company ?? "the company"} from the last 12 months`,
-      hint: "Confidence here means: is this about the right company (check the website and what the company does)? Prefer funding, launches, pilots, customers, partnerships, robots and models used.",
+      hint: "Confidence here means: is this about the right company (check the website and what the company does)? Prefer funding, launches, pilots, customers, partnerships, robots and models used. For a large company, keep only news about the part this person works in (robotics, AI, ML infrastructure): news about other divisions, regional investments, retail or consumer products gets relevance 0.2 or less, and is better left out.",
       data: gathered.exaNews.map((r) => slimResult(r, 2000)),
       maxFindings: 8,
     });
@@ -505,8 +517,37 @@ export function cleanExtracted(items: ExtractedFinding[], bundle: Pick<SourceBun
   return out;
 }
 
+/**
+ * Removes repeats. Exact repeats within a source go first; then a finding that says
+ * the same thing as an earlier one in different words, whatever its source (the
+ * current role, for example, comes back from LinkedIn, the people search and the
+ * talks search). Earlier items win, so put the most trusted findings first.
+ */
 export function dedupeFindings(items: NewFinding[]): NewFinding[] {
-  return uniqueBy(items, (f) => `${f.source}|${f.text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 160)}`);
+  const exact = uniqueBy(items, (f) => `${f.source}|${f.text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 160)}`);
+  const kept: NewFinding[] = [];
+  for (const f of exact) {
+    // The teammate's notes are never a duplicate of anything, and nothing is dropped in their favour.
+    if (f.source !== "notes" && kept.some((k) => k.source !== "notes" && sameFact(k.text, f.text, repeatThreshold(k, f)))) continue;
+    kept.push(f);
+  }
+  return kept;
+}
+
+/**
+ * How much two findings must overlap to count as one. Who the person is and where they
+ * worked comes back from every source in slightly different words, so role, career and profile
+ * facts are merged more readily; everything else needs a near-complete overlap (two
+ * job postings or two papers share most of their words and are still different facts).
+ */
+function repeatThreshold(a: NewFinding, b: NewFinding): number {
+  const about = (f: NewFinding) => f.kind === "role" || f.kind === "career" || f.kind === "other";
+  return about(a) && about(b) ? 0.6 : 0.8;
+}
+
+/** Short lines telling the model what code has already recorded, so it does not extract it again. */
+export function alreadyRecorded(facts: NewFinding[]): string[] {
+  return facts.filter((f) => f.source !== "notes" && f.source !== "hunter").map((f) => `${f.title ? `${f.title}: ` : ""}${truncate(f.text, 260)}`);
 }
 
 // ---------------------------------------------------------------- the step
@@ -517,6 +558,8 @@ export async function extractBundle(input: {
   person: Person;
   criteria: string[];
   bundle: SourceBundle;
+  /** Facts already recorded in code (role, career, company basics), so the model skips them. */
+  known?: string[];
   timeoutMs?: number;
 }): Promise<NewFinding[]> {
   const { bundle } = input;
@@ -531,6 +574,7 @@ export async function extractBundle(input: {
       hint: bundle.hint,
       data: bundle.data,
       maxFindings: bundle.maxFindings,
+      known: input.known,
     }),
     schema: ExtractSchema,
     maxTokens: 6_000,
@@ -544,6 +588,7 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
   const { leadId, person, settings, deadline } = ctx;
   const facts = deterministicFindings(ctx, gathered);
   const bundles = buildBundles(ctx, gathered);
+  const known = alreadyRecorded(facts);
 
   await step(leadId, bundles.length ? `Reading ${bundles.length} ${bundles.length === 1 ? "source" : "sources"} for facts` : "Recording the facts found");
 
@@ -554,7 +599,7 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
     // A rejected key or missing config fails every call the same way: stop spending time on the rest.
     if (fatal || timeoutMs < 5_000) return [] as NewFinding[];
     try {
-      return await extractBundle({ leadId, person, criteria: settings.criteria, bundle, timeoutMs });
+      return await extractBundle({ leadId, person, criteria: settings.criteria, bundle, known, timeoutMs });
     } catch (err) {
       if (err instanceof ClaudeError && err.kind === "config") fatal = err;
       await note(leadId, "tool", `Could not read ${bundle.label} (${errorMessage(err)}). Skipped.`);
@@ -563,7 +608,10 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
   });
 
   const { kept, dropped } = dropLowConfidence(extracted.flat());
-  const all = dedupeFindings([...facts.map((f) => normaliseVerdict(f)), ...kept]);
+  // Code-made facts first, then the model's findings best first, so a repeat loses to the better version.
+  const ranked = [...kept].sort((a, b) => (b.confidence ?? 0) + (b.relevance ?? 0) - ((a.confidence ?? 0) + (a.relevance ?? 0)));
+  const all = dedupeFindings([...facts.map((f) => normaliseVerdict(f)), ...ranked]);
+  const repeats = facts.length + kept.length - all.length;
 
   let saved: Finding[] = [];
   try {
@@ -581,9 +629,9 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
     saved.length
       ? `${saved.length} ${saved.length === 1 ? "finding" : "findings"} recorded (${[...bySource].map(([s, n]) => `${s} ${n}`).join(", ")})${hidden ? `; ${hidden} filtered out by your criteria` : ""}${
           dropped ? `; ${dropped} dropped as probably about someone else` : ""
-        }`
+        }${repeats > 0 ? `; ${repeats} repeats left out` : ""}`
       : "No findings could be recorded from the sources",
-    { total: saved.length, filteredOut: hidden, droppedLowConfidence: dropped },
+    { total: saved.length, filteredOut: hidden, droppedLowConfidence: dropped, repeats },
   );
   return saved;
 }

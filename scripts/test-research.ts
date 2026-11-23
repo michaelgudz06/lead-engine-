@@ -43,12 +43,22 @@ import {
   type SourceBundle,
 } from "../src/lib/research/extract";
 import { emptyGathered, matchHubAccounts } from "../src/lib/research/gather";
+import {
+  brandLabel,
+  chooseCompanyDomain,
+  companySiteDomain,
+  emailOnStaleDomain,
+  isCountryDomain,
+  looksLikePersonalSite,
+  registrableDomain,
+  sameCompanyName,
+} from "../src/lib/research/domain";
 import { personFrom, pickCompanyDomain } from "../src/lib/research/identify";
 import { runResearch, steerLead } from "../src/lib/research/pipeline";
 import { BOOKING_PLACEHOLDER, BOOKING_TOKEN, extractPrompt } from "../src/lib/research/prompts";
 import { classifySteer, fallbackSteerMode } from "../src/lib/research/steer";
 import { applyVerification, lengthIssues, sanitizeCitations, verifyAngles } from "../src/lib/research/verify";
-import { aliasFindings, finalizeAngles, resolveIds, shapeAngles, signOff, stripAliases, stripSignOff, writeAngles, writeBrief } from "../src/lib/research/write";
+import { aliasFindings, finalizeAngles, formatEmailBody, resolveIds, shapeAngles, signOff, stripAliases, stripSignOff, writeAngles, writeBrief } from "../src/lib/research/write";
 import {
   cleanDate,
   cleanUrl,
@@ -61,6 +71,7 @@ import {
   isoDateMonthsAgo,
   nameFromSlug,
   parseLinkedInTitle,
+  sameFact,
   splitName,
   truncate,
   urlKey,
@@ -251,6 +262,76 @@ async function unitTests(): Promise<void> {
   check("domainMatchesCompany rejects unrelated", !domainMatchesCompany("techcrunch.news", "Figure AI"));
   eq("pickCompanyDomain", pickCompanyDomain("Tallow Robotics", ["https://www.crunchbase.com/organization/tallow", "https://tallowrobotics.com/careers"]), "tallowrobotics.com");
   eq("pickCompanyDomain none", pickCompanyDomain("Tallow Robotics", ["https://example.org/a"]), null);
+  // company domain (the Amazon case: the LinkedIn page had no website and a web search put amazon.de first)
+  const amazonSearch = ["https://www.amazon.de/", "https://business.amazon.com/", "https://music.amazon.com/", "https://studios.amazon.com/", "https://sell.amazon.com/"];
+  eq("pickCompanyDomain prefers the global site over a country site", pickCompanyDomain("Amazon", amazonSearch), "amazon.com");
+  eq("pickCompanyDomain keeps a country site when it is all there is", pickCompanyDomain("Amazon", ["https://www.amazon.de/"]), "amazon.de");
+  eq("pickCompanyDomain: exact brand beats a loose match", pickCompanyDomain("Figure", ["https://figureskating.example/", "https://www.figure.ai/"]), "figure.ai");
+  eq("pickCompanyDomain skips news and personal hosts", pickCompanyDomain("Tallow Robotics", ["https://tallowrobotics.github.io/", "https://www.reuters.com/tallow-robotics", "https://tallowrobotics.com/"]), "tallowrobotics.com");
+  eq("registrableDomain", [registrableDomain("business.amazon.com"), registrableDomain("shop.acme.co.uk"), registrableDomain("acme.ai")], ["amazon.com", "acme.co.uk", "acme.ai"]);
+  eq("brandLabel", [brandLabel("amazon.de"), brandLabel("www.amazon.co.uk")], ["amazon", "amazon"]);
+  check("isCountryDomain", isCountryDomain("amazon.de") && isCountryDomain("amazon.co.uk") && !isCountryDomain("figure.ai") && !isCountryDomain("acme.io") && !isCountryDomain("amazon.com"));
+  eq("companySiteDomain folds a careers subdomain", companySiteDomain("https://careers.acme.com/jobs"), "acme.com");
+  eq("companySiteDomain rejects a news site", companySiteDomain("https://www.forbes.com/sites/x"), null);
+  check("looksLikePersonalSite", looksLikePersonalSite("pieterabbeel.com", "Pieter Abbeel") && looksLikePersonalSite("pabbeel.io", "Pieter Abbeel") && !looksLikePersonalSite("amazon.com", "Pieter Abbeel"));
+  const pick = (company: string, candidates: Parameters<typeof chooseCompanyDomain>[0]["candidates"], personName = "Pieter Abbeel") =>
+    chooseCompanyDomain({ company, personName, candidates })?.domain ?? null;
+  eq("chooseCompanyDomain: LinkedIn website first", pick("Physical Intelligence", [{ value: "https://pi.website", source: "linkedin_company" }, { value: "physicalintelligence.company", source: "apollo_org" }]), "pi.website");
+  eq("chooseCompanyDomain: Apollo by LinkedIn URL beats search and an earlier run", pick("Amazon", [{ value: null, source: "linkedin_company" }, { value: "amazon.com", source: "apollo_org" }, { value: "https://www.amazon.de/", source: "search" }, { value: "amazon.de", source: "previous" }]), "amazon.com");
+  eq("chooseCompanyDomain: search beats a stale country site from an earlier run", pick("Amazon", [...amazonSearch.map((value) => ({ value, source: "search" as const })), { value: "amazon.de", source: "previous" as const }]), "amazon.com");
+  eq("chooseCompanyDomain: exact sources agree on the global site", pick("Amazon", [{ value: "https://www.amazon.de", source: "linkedin_company" }, { value: "amazon.com", source: "apollo_org" }]), "amazon.com");
+  eq("chooseCompanyDomain: a company's own country domain stays", pick("Franka Robotics", [{ value: "https://franka.de", source: "linkedin_company" }, { value: "https://www.franka.com/", source: "search" }]), "franka.de");
+  eq("chooseCompanyDomain: personal site is not the company", pick("Amazon", [{ value: "https://pieterabbeel.com", source: "linkedin_company" }, { value: "amazon.com", source: "apollo_org" }]), "amazon.com");
+  eq("chooseCompanyDomain: a guess must look like the company", pick("Amazon", [{ value: "covariant.ai", source: "apollo_person" }, { value: "https://techcrunch.com/x", source: "search" }]), null);
+  eq("chooseCompanyDomain: nothing usable", pick("Amazon", [{ value: "https://www.linkedin.com/company/amazon", source: "linkedin_company" }]), null);
+  check("emailOnStaleDomain", emailOnStaleDomain("pabbeel@amazon.de", "amazon.de", "amazon.com") && !emailOnStaleDomain("pabbeel@amazon.com", "amazon.com", "amazon.com") && !emailOnStaleDomain("p@berkeley.edu", "amazon.de", "amazon.com") && !emailOnStaleDomain("jane@old.co", "old.co", "new.com"));
+  check("sameCompanyName", sameCompanyName("Figure", "Figure AI, Inc.") && sameCompanyName("Amazon", "Amazon.com") && !sameCompanyName("Amazon", "Zalando SE"));
+  check("sameFact: same role in other words", sameFact("Pieter Abbeel is Distinguished Scientist, VP, Scholar at Amazon since 2024-08, based in Berkeley, California.", "Pieter Abbeel is a Distinguished Scientist at Amazon."));
+  check("sameFact: different facts", !sameFact("Tallow Robotics raised a $40M Series A led by Northzone in March 2026.", "Tallow Robotics runs pi0.5 fine-tunes on two bimanual YAM stations."));
+  check("sameFact: too short to tell", !sameFact("Amazon robotics", "Amazon robotics team hiring"));
+  eq(
+    "dedupeFindings drops a repeat from another source, keeps notes",
+    dedupeFindings([
+      { source: "notes", kind: "other", text: "Mara Lindqvist is Head of Robot Learning at Tallow Robotics, met at CoRL." },
+      { source: "linkedin", kind: "role", text: "Mara Lindqvist is Head of Robot Learning at Tallow Robotics since 2024-02, based in Stockholm." },
+      { source: "exa", kind: "role", text: "Mara Lindqvist is the Head of Robot Learning at Tallow Robotics." },
+      { source: "exa", kind: "news", text: "Tallow Robotics raised a $40M Series A in March 2026." },
+    ]).map((f) => `${f.source}:${f.kind}`),
+    ["notes:other", "linkedin:role", "exa:news"],
+  );
+  eq("matchHubAccounts: exact account beats prefix matches", matchHubAccounts([{ id: "amazon", type: "org", url: "u", fullName: "Amazon" }, { id: "amazon-sagemaker-community", type: "org", url: "u", fullName: "Amazon SageMaker Community" }], "Amazon", "company").map((a) => a.id), ["amazon"]);
+  eq("matchHubAccounts: a user who calls themselves the company loses to the org", matchHubAccounts([{ id: "amazon", type: "org", url: "u", fullName: "Amazon" }, { id: "Amazon0071", type: "user", url: "u", fullName: "Amazon" }], "Amazon", "company").map((a) => a.id), ["amazon"]);
+
+  eq(
+    "dedupeFindings merges the same role told twice, keeps two different job postings",
+    dedupeFindings([
+      { source: "linkedin", kind: "role", text: "According to his LinkedIn about section, Pieter Abbeel is Professor and Director of the Robot Learning Lab at UC Berkeley and Co-Director of the Berkeley AI Research (BAIR) Lab. The section gives no dates for these posts." },
+      { source: "exa", kind: "role", text: "According to Pieter Abbeel's LinkedIn About section, he is Director of the Berkeley Robot Learning Lab and co-director of the Berkeley AI Research (BAIR) Lab at UC Berkeley. The section does not give a start date." },
+      { source: "apollo", kind: "hiring", text: 'According to a job posting listed on Apollo, Walden Robotics is hiring a "Senior Engineer - Data & Training Infrastructure" in Cambridge, MA and San Francisco, CA, posted 2026-07-17.' },
+      { source: "apollo", kind: "hiring", text: 'According to a job posting listed on Apollo, Walden Robotics has an open "Deployment Engineer" role in San Francisco, CA, posted 2026-10-16.' },
+    ]).map((f) => `${f.source}:${f.kind}`),
+    ["linkedin:role", "apollo:hiring", "apollo:hiring"],
+  );
+  const aliasMap = aliasFindings(fakeFindings([{ source: "exa", kind: "news", title: "Series A", text: "a" }, { source: "exa", kind: "news", title: "Trainium article", text: "b" }]));
+  eq("stripAliases names a bare label used as a noun", stripAliases("F2 is an Amazon article, not his statement (F1).", aliasMap), '"Trainium article" is an Amazon article, not his statement.');
+  eq("stripAliases leaves unknown labels and model names alone", stripAliases("The F9 rocket and pi0.5 run at 30 Hz.", aliasMap), "The F9 rocket and pi0.5 run at 30 Hz.");
+  const manyJobs = buildBundles({ person: PERSON, profile: null }, { ...emptyGathered(), jobs: Array.from({ length: 40 }, (_, i) => ({ title: `Role ${i}`, url: null, location: null, postedAt: null })) }).find((b) => b.key === "apollo.jobs");
+  check("jobs bundle: a capped list is a sample, no total", Boolean(manyJobs) && /do not state a total/.test(manyJobs!.hint ?? "") && !("totalOpenRoles" in (manyJobs!.data as object)), manyJobs?.hint);
+
+  // email layout (the "Hi Pieter, When we met..." case)
+  const oneLine = `Hi Pieter, When we met at CoRL you asked about cloud latency. Amazon FAR released an inference stack. Abstract serves pi0.5 and Verne V0.5 from its own GPUs. Would you be open to a 30-minute call? ${BOOKING_TOKEN}`;
+  eq(
+    "formatEmailBody: greeting on its own line, paragraphs",
+    formatEmailBody(oneLine, "Pieter"),
+    `Hi Pieter,\n\nWhen we met at CoRL you asked about cloud latency. Amazon FAR released an inference stack.\n\nAbstract serves pi0.5 and Verne V0.5 from its own GPUs.\n\nWould you be open to a 30-minute call? ${BOOKING_TOKEN}`,
+  );
+  eq("formatEmailBody keeps a well-formed body", formatEmailBody("Hi Mara,\n\nOne thing.\n\nAnother thing.", "Mara"), "Hi Mara,\n\nOne thing.\n\nAnother thing.");
+  eq("formatEmailBody adds a missing greeting", formatEmailBody("Your team runs two YAM stations.", "Mara"), "Hi Mara,\n\nYour team runs two YAM stations.");
+  eq("formatEmailBody lower-case start after the greeting", formatEmailBody("Hi Mara, your Jetson note stuck with me.", "Mara"), "Hi Mara,\n\nYour Jetson note stuck with me.");
+  const laidOut = finalizeAngles([{ id: "a", name: "A", reasoning: "", findingIds: [], email: { subject: "s", body: oneLine }, linkedinMessage: "x".repeat(400) }], { senderName: "Sam", signature: "", calendlyUrl: "" }, "Pieter")[0];
+  check("finalizeAngles: Hi <Name>, blank line, paragraphs, blank line, Best, name", /^Hi Pieter,\n\n\S[\s\S]*\n\nBest,\nSam$/.test(laidOut.email.body) && !/^Hi Pieter, \S/.test(laidOut.email.body) && !/\n{3,}/.test(laidOut.email.body), laidOut.email.body);
+  check("finalizeAngles: LinkedIn message under 300 characters", laidOut.linkedinMessage.length < 300, laidOut.linkedinMessage.length);
+
   eq("parseLinkedInTitle full", parseLinkedInTitle("Jane Doe - CTO at Acme Robotics | LinkedIn"), { name: "Jane Doe", title: "CTO", company: "Acme Robotics" });
   eq("parseLinkedInTitle short", parseLinkedInTitle("Jane Doe - Acme Robotics | LinkedIn"), { name: "Jane Doe", title: null, company: "Acme Robotics" });
   eq("parseLinkedInTitle empty", parseLinkedInTitle(null), { name: null, title: null, company: null });

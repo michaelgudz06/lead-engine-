@@ -11,7 +11,7 @@ import { FINDING_KINDS, type Finding } from "../types";
 import { isConfigured, note, raw, step, type RunContext } from "./context";
 import { MIN_CONFIDENCE, normaliseVerdict } from "./criteria";
 import { agentPrompt, agentSystem } from "./prompts";
-import { clamp01, cleanDate, cleanUrl, cleanXHandle, collectUrls, domainFromUrl, isoDateMonthsAgo, truncate, urlKey, withTimeout, wrapData } from "./util";
+import { clamp01, cleanDate, cleanUrl, cleanXHandle, collectUrls, domainFromUrl, isoDateMonthsAgo, sameFact, truncate, urlKey, withTimeout, wrapData } from "./util";
 
 /**
  * Step 4: one Haiku tool loop that looks for what the fixed searches missed and
@@ -216,6 +216,10 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
         if (!text || text.length < 15) return "Not saved: the text is too short to stand alone.";
         const confidence = clamp01(input.confidence, 0.6);
         if (confidence < MIN_CONFIDENCE) return "Not saved: confidence that this is the right person or company is too low.";
+        // The same fact in other words, from the earlier steps or from this run, is not a new finding.
+        if ([...known, ...recorded].some((k) => k.source !== "notes" && sameFact(k.text, text))) {
+          return "Not saved: this fact is already known. Record only facts that add something new.";
+        }
         const saved = await insertFindings(leadId, [
           normaliseVerdict({
             source: "agent" as const,

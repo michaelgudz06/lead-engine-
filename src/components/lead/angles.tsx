@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { errorMessage, logEvent, markSent, updateLead } from "@/lib/api-client";
 import { gmailComposeUrl } from "@/lib/compose";
 import type { Angle, Finding, Lead } from "@/lib/types";
@@ -23,6 +23,35 @@ function cleanAngles(angles: Angle[]): Angle[] {
       email: { subject: a.email?.subject ?? "", body: a.email?.body ?? "" },
       linkedinMessage: typeof a.linkedinMessage === "string" ? a.linkedinMessage : "",
     }));
+}
+
+/**
+ * A textarea that grows to show the whole draft, so the sign-off is never hidden
+ * below the fold of a fixed-height box. `rows` is the minimum height.
+ */
+function AutoTextarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const fit = () => {
+      el.style.height = "auto";
+      // +2 for the top and bottom border, which scrollHeight leaves out.
+      el.style.height = `${el.scrollHeight + 2}px`;
+    };
+    fit();
+    // The text re-wraps when the column changes width (phone rotation, window resize).
+    let width = el.offsetWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.offsetWidth !== width) {
+        width = el.offsetWidth;
+        fit();
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [props.value]);
+  return <textarea ref={ref} {...props} style={{ ...props.style, resize: "none", overflow: "hidden" }} />;
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -289,10 +318,10 @@ export function AnglesSection({
               <Label htmlFor="angle-body" hint={`${countWords(active.email.body)} words`}>
                 Body
               </Label>
-              <textarea
+              <AutoTextarea
                 id="angle-body"
                 className="field"
-                rows={12}
+                rows={8}
                 value={active.email.body}
                 readOnly={locked}
                 maxLength={10000}
@@ -314,10 +343,10 @@ export function AnglesSection({
             <Label htmlFor="angle-linkedin" hint={<span className={cx("tabular-nums", liLength > LINKEDIN_LIMIT && "font-medium text-danger")}>{liLength} / {LINKEDIN_LIMIT}</span>}>
               Message
             </Label>
-            <textarea
+            <AutoTextarea
               id="angle-linkedin"
               className="field"
-              rows={7}
+              rows={5}
               value={active.linkedinMessage}
               readOnly={locked}
               maxLength={2000}

@@ -1,5 +1,5 @@
 import "server-only";
-import { apolloStatus, matchPerson, type ApolloPerson } from "../providers/apollo";
+import { apolloStatus, enrichOrganization, matchPerson, type ApolloOrg, type ApolloPerson } from "../providers/apollo";
 import { exaSearch, exaStatus, type ExaResult } from "../providers/exa";
 import {
   getLinkedInCompany,
@@ -11,11 +11,11 @@ import {
 import { addUsage, updateLead, type LeadPatch } from "../repo/leads";
 import type { Lead, Settings } from "../types";
 import { attempt, isConfigured, note, raw, step, type Person, type RunContext } from "./context";
+import { chooseCompanyDomain, emailOnStaleDomain, pickCompanyDomain, type DomainCandidate } from "./domain";
 import {
   cleanXHandle,
   Deadline,
   domainFromUrl,
-  domainMatchesCompany,
   nameFromSlug,
   parseLinkedInTitle,
   splitName,
@@ -76,9 +76,12 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
 
   await step(leadId, person.company ? `Looking up ${person.company}` : "Looking up the company");
 
-  // The company page and the Apollo match do not depend on each other.
+  // The company page, the Apollo person match and the Apollo company lookup do not depend on each other.
   const companyKey = person.companyLinkedinUrl ?? person.company;
-  const [companyRes, apolloRes] = await Promise.all([
+  // Apollo matches a company by its LinkedIn URL, which is an exact identifier: its primary
+  // domain is the fallback when the LinkedIn page lists no website. Gather reuses the result.
+  const companyLinkedinUrl = person.companyLinkedinUrl;
+  const [companyRes, apolloRes, apolloOrgRes] = await Promise.all([
     companyKey && isConfigured(linkedinStatus)
       ? attempt("LinkedIn company page", deadline.budget(SECONDARY_TIMEOUT_MS, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
           getLinkedInCompany(companyKey),
@@ -89,10 +92,14 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
           matchPerson({
             linkedinUrl: lead.linkedinUrl,
             name: person.nameIsGuess ? null : person.name,
-            domain: profile?.currentCompanyDomain ?? lead.companyDomain,
+            // The saved domain is not passed on: it may be the mistake this run corrects.
+            domain: profile?.currentCompanyDomain ?? null,
             organizationName: person.company,
           }),
         )
+      : null,
+    companyLinkedinUrl && isConfigured(apolloStatus)
+      ? attempt("Apollo company lookup", deadline.budget(25_000, RESERVE_AFTER_IDENTIFY_MS - 20_000), () => enrichOrganization(companyLinkedinUrl))
       : null,
   ]);
 
@@ -135,16 +142,38 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
   person.company ??= company?.name ?? null;
   person.companyLinkedinUrl ??= company?.linkedinUrl ?? null;
 
-  // Company domain, most trusted source first.
-  person.domain =
-    domainFromUrl(profile?.currentCompanyDomain) ??
-    domainFromUrl(company?.domain) ??
-    domainFromUrl(company?.website) ??
-    domainFromUrl(apolloPerson?.organizationDomain) ??
-    domainFromUrl(lead.companyDomain) ??
-    null;
-  if (!person.domain && person.company && isConfigured(exaStatus)) {
-    person.domain = await findDomainBySearch(leadId, person.company, deadline);
+  let apolloOrg: ApolloOrg | null = apolloOrgRes?.ok ? apolloOrgRes.value.org : null;
+  // The profile gave a numeric company URL that Apollo did not know: try the page's own URL once.
+  if (!apolloOrg && !company?.domain && company?.linkedinUrl && urlKey(company.linkedinUrl) !== urlKey(companyLinkedinUrl ?? "") && isConfigured(apolloStatus)) {
+    const again = await attempt("Apollo company lookup", deadline.budget(20_000, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
+      enrichOrganization(company!.linkedinUrl!),
+    );
+    apolloOrg = again.ok ? again.value.org : null;
+  }
+  if (apolloOrg) await raw(leadId, "apollo.org", { linkedinUrl: company?.linkedinUrl ?? companyLinkedinUrl }, apolloOrg);
+
+  // Company domain: every candidate, ranked by how directly its source identifies the company (see domain.ts).
+  const candidates: DomainCandidate[] = [
+    { value: company?.website, source: "linkedin_company" },
+    { value: company?.domain, source: "linkedin_company" },
+    { value: apolloOrg?.domain, source: "apollo_org" },
+    { value: apolloOrg?.website, source: "apollo_org" },
+    { value: profile?.currentCompanyDomain, source: "linkedin_profile" },
+    { value: apolloPerson?.organizationDomain, source: "apollo_person" },
+  ];
+  let choice = chooseCompanyDomain({ company: person.company, personName: person.name, candidates });
+  if (!choice && person.company && isConfigured(exaStatus)) {
+    const urls = await findDomainBySearch(leadId, person.company, deadline);
+    candidates.push(...urls.map((value) => ({ value, source: "search" as const })));
+    choice = chooseCompanyDomain({ company: person.company, personName: person.name, candidates });
+  }
+  // What an earlier run saved is the last resort: it may be the very mistake this run corrects.
+  choice ??= chooseCompanyDomain({ company: person.company, personName: person.name, candidates: [{ value: lead.companyDomain, source: "previous" }] });
+  person.domain = choice?.domain ?? null;
+  person.domainSource = choice?.source ?? null;
+  if (choice?.note) await note(leadId, "tool", `Company website: ${choice.note}`);
+  if (lead.companyDomain && person.domain && lead.companyDomain !== person.domain) {
+    await note(leadId, "tool", `Company website corrected from ${lead.companyDomain} to ${person.domain}`);
   }
 
   const patch: LeadPatch = {};
@@ -155,7 +184,14 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
   if (person.location) patch.location = person.location;
   if (person.companyLinkedinUrl) patch.companyLinkedinUrl = person.companyLinkedinUrl;
   if (person.domain) patch.companyDomain = person.domain;
-  if (apolloPerson?.email && !lead.email) {
+  // An address found on a rejected variant of the domain (jane@amazon.de for amazon.com) was
+  // derived from the wrong site: clear it so the email lookup runs again with the right one.
+  const staleEmail = emailOnStaleDomain(lead.email, lead.companyDomain, person.domain);
+  if (staleEmail) {
+    patch.email = null;
+    patch.emailConfidence = null;
+  }
+  if (apolloPerson?.email && (!lead.email || staleEmail)) {
     patch.email = apolloPerson.email;
     patch.emailConfidence = apolloPerson.emailStatus === "verified" ? 95 : 70;
   }
@@ -178,7 +214,7 @@ export async function identify(leadId: string, lead: Lead, settings: Settings, d
       : "Could not identify the person yet. Research continues from the URL and your notes.",
   );
 
-  return { leadId, lead: current, settings, deadline, person, profile, company, apolloPerson };
+  return { leadId, lead: current, settings, deadline, person, profile, company, apolloPerson, apolloOrg };
 }
 
 function namesOf(full: string): { firstName: string | null; lastName: string | null } {
@@ -199,6 +235,7 @@ export function personFrom(lead: Lead, profile: LinkedInProfile | null): Person 
     lastName: profile?.lastName?.trim() || split.last,
     title: profile?.currentTitle?.trim() || profile?.headline?.trim() || lead.title,
     company: profile?.currentCompany?.trim() || lead.companyName,
+    // identify() replaces this once every source has been asked; steering reuses the saved value.
     domain: domainFromUrl(profile?.currentCompanyDomain) ?? lead.companyDomain,
     location: profile?.location?.trim() || lead.location,
     linkedinUrl: lead.linkedinUrl,
@@ -224,24 +261,16 @@ async function findProfileBySearch(leadId: string, lead: Lead, person: Person, d
   return hit ?? null;
 }
 
-async function findDomainBySearch(leadId: string, company: string, deadline: Deadline): Promise<string | null> {
+/** Result URLs of a web search for the company's own site, best first. Empty when the search fails. */
+async function findDomainBySearch(leadId: string, company: string, deadline: Deadline): Promise<string[]> {
   const res = await attempt("Company website search", deadline.budget(20_000, RESERVE_AFTER_IDENTIFY_MS - 20_000), () =>
     exaSearch(`${company} official website`, { category: "company", numResults: 5, textChars: 300 }),
   );
   await addUsage(leadId, { exaSearches: 1 }).catch(() => undefined);
-  if (!res.ok) return null;
+  if (!res.ok) return [];
   await raw(leadId, "exa.domain", { company }, res.value.map((r) => ({ url: r.url, title: r.title })));
-  return pickCompanyDomain(
-    company,
-    res.value.map((r) => r.url),
-  );
+  return res.value.map((r) => r.url);
 }
 
-/** First result whose host plausibly is the company's own site. Pure. */
-export function pickCompanyDomain(company: string, urls: string[]): string | null {
-  for (const url of urls) {
-    const domain = domainFromUrl(url);
-    if (domain && domainMatchesCompany(domain, company)) return domain;
-  }
-  return null;
-}
+// Kept as an export of this module for callers and tests that import it from here.
+export { pickCompanyDomain };

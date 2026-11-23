@@ -52,10 +52,9 @@ write code.
 
 - Database: Neon Postgres, reached over HTTPS with `@neondatabase/serverless` (`src/lib/db.ts`).
   Schema in `db/migrations/001_init.sql` is already applied. Tables are prefixed `le_`.
-- **Unipile cannot be reached from this sandbox** (its API is on port 14914). Write the
-  Unipile code against its docs (`https://developer.unipile.com/llms.txt` and the pages it
-  links, fetchable over 443); it will run on the owner's machine and on Vercel. Test
-  LinkedIn here through the Apify fallback.
+- **Unipile's DSN port (14914) is blocked in this sandbox**, but Unipile documents a
+  `https://host/api/v1/...?port=PORT` route on 443, and `linkedin.ts` switches to it
+  automatically, so Unipile works here too. Apify is the fallback.
 - Next.js 16.4 has breaking changes from older versions. Before writing routes, pages or
   layouts, read the relevant guides in `node_modules/next/dist/docs/01-app/` (route
   handlers, `after`, layouts and pages, fonts, css). In Next 16 route `params` is a

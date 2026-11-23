@@ -140,7 +140,7 @@ export function Notice({ tone = "error", children, action }: { tone?: "error" | 
   const color = tone === "error" ? "border-[#ecc8c4] bg-[#fdf6f5] text-danger" : tone === "success" ? "border-[#c5e0cf] bg-[#f4faf6] text-success" : "border-hairline bg-wash text-ink";
   return (
     <div role={tone === "error" ? "alert" : "status"} className={cx("flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border px-3.5 py-2.5 text-[13.5px]", color)}>
-      <div className="min-w-0">{children}</div>
+      <div className="min-w-0 wrap-anywhere">{children}</div>
       {action}
     </div>
   );

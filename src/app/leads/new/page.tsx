@@ -17,6 +17,7 @@ export default function NewLeadPage() {
   const [urlError, setUrlError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [existingId, setExistingId] = useState<string | null>(null);
+  const [existingUnqualified, setExistingUnqualified] = useState(false);
   const [busy, setBusy] = useState(false);
 
   function validateUrl(value: string): string | null {
@@ -48,8 +49,12 @@ export default function NewLeadPage() {
       router.push(`/leads/${lead.id}`);
       // Stay "busy" while the next page loads so the form cannot be sent twice.
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409 && err.existingId) setExistingId(err.existingId);
-      else setError(errorMessage(err));
+      if (err instanceof ApiError && err.status === 409 && err.existingId) {
+        setExistingId(err.existingId);
+        setExistingUnqualified(err.existingStage === "unqualified");
+      } else {
+        setError(errorMessage(err));
+      }
       setBusy(false);
     }
   }
@@ -116,7 +121,7 @@ export default function NewLeadPage() {
 
         {existingId && (
           <Notice tone="info" action={<ButtonLink href={`/leads/${existingId}`} size="sm">Open existing lead</ButtonLink>}>
-            This person is already a lead.
+            {existingUnqualified ? "This person is already a lead, marked unqualified. Open the lead to restore it." : "This person is already a lead."}
           </Notice>
         )}
         {error && <Notice>{error}</Notice>}

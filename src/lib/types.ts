@@ -4,6 +4,11 @@
  * (src/lib/repo) is the only place that maps between them.
  */
 
+/**
+ * "unqualified" is last and apart from the rest: the lead stays in the database (a re-import
+ * still finds it) but leaves the Leads and Pipeline pages for the Unqualified view until it is
+ * restored. "lost" is different: a real opportunity that did not close.
+ */
 export const STAGES = [
   "new",
   "researching",
@@ -13,8 +18,15 @@ export const STAGES = [
   "call_booked",
   "nurture",
   "lost",
+  "unqualified",
 ] as const;
 export type Stage = (typeof STAGES)[number];
+
+/** A stage a lead on the Leads and Pipeline pages can have: every stage but "unqualified". */
+export type ActiveStage = Exclude<Stage, "unqualified">;
+
+/** STAGES without "unqualified": the Pipeline's columns, and the stages a restore can lead to. */
+export const ACTIVE_STAGES: readonly ActiveStage[] = STAGES.filter((s): s is ActiveStage => s !== "unqualified");
 
 export const STAGE_LABELS: Record<Stage, string> = {
   new: "New",
@@ -25,7 +37,40 @@ export const STAGE_LABELS: Record<Stage, string> = {
   call_booked: "Call booked",
   nurture: "Nurture",
   lost: "Lost",
+  unqualified: "Unqualified",
 };
+
+/**
+ * Quick picks for why a lead is unqualified. The database stores the text, not the key: one of
+ * these labels, or the team's own words (at most UNQUALIFIED_REASON_MAX characters).
+ */
+export const UNQUALIFIED_REASONS = [
+  { key: "not_fit", label: "Not a fit" },
+  { key: "wrong_person", label: "Wrong person" },
+  { key: "no_need", label: "No need right now" },
+  { key: "competitor", label: "Competitor or partner" },
+  { key: "bad_data", label: "Bad or duplicate data" },
+] as const;
+export type UnqualifiedReasonKey = (typeof UNQUALIFIED_REASONS)[number]["key"];
+
+/** The longest reason the API and the database accept. */
+export const UNQUALIFIED_REASON_MAX = 200;
+
+/** The two lists GET /api/leads?view= serves: "active" (the Leads and Pipeline pages) and "unqualified". */
+export const LEAD_VIEWS = ["active", "unqualified"] as const;
+export type LeadView = (typeof LEAD_VIEWS)[number];
+
+/** How many leads each list has in all. A list itself returns at most LEAD_LIST_LIMIT. */
+export interface LeadCounts {
+  active: number;
+  unqualified: number;
+}
+
+/** The most leads one list returns. */
+export const LEAD_LIST_LIMIT = 500;
+
+/** The most ids POST /api/leads/bulk takes at once: one full list. */
+export const BULK_LEADS_MAX = 500;
 
 export type ResearchStatus = "idle" | "running" | "done" | "error";
 
@@ -210,6 +255,12 @@ export interface Lead {
   location: string | null;
   notes: string | null;
   stage: Stage;
+  /** When the lead was marked unqualified. Set exactly while stage is "unqualified", else null. */
+  unqualifiedAt: string | null;
+  /** Why it was marked (a reason's label or the team's own words); null when none was given, and always null unless unqualified. */
+  unqualifiedReason: string | null;
+  /** The stage it had just before it was marked, which Restore goes back to (see restoredStage). Null unless unqualified. */
+  stageBeforeUnqualified: ActiveStage | null;
   owner: string | null;
   nextStepAt: string | null;
   lastContactedAt: string | null;

@@ -388,6 +388,7 @@ export function AnglesSection({
               <Button variant="ghost" size="sm" disabled={sending} onClick={() => setSendOpen(false)}>
                 Cancel
               </Button>
+              {lead.stage === "unqualified" && <span className="text-[13px] text-quiet">This puts the lead back in Active, as Contacted.</span>}
             </>
           ) : (
             <>

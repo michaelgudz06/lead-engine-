@@ -21,7 +21,7 @@
  *   reset on log out. The access password and keys are never part of an event.
  */
 import type { CaptureResult, PostHogConfig } from "posthog-js";
-import type { ImportSource, Settings, Stage } from "./types";
+import type { ImportSource, Settings, Stage, UnqualifiedReasonKey } from "./types";
 
 // ------------------------------------------------------------------ events
 
@@ -42,6 +42,9 @@ export type SettingsField = (typeof SETTINGS_FIELDS)[number];
 
 type NoProps = Record<never, never>;
 
+/** Where leads were marked, restored or deleted: the Leads list, a lead's page or the pipeline board. */
+export type LeadSurface = "list" | "lead" | "pipeline";
+
 /** Every client event and its properties. Only these (plus $pageview and $pageleave) are sent. */
 export interface ClientEventProps {
   lead_created: { leadId: LeadId; withName: boolean; withCompany: boolean; withNotes: boolean };
@@ -52,7 +55,13 @@ export interface ClientEventProps {
   gmail_opened: AngleRef & { withRecipient: boolean };
   linkedin_profile_opened: { leadId: LeadId; from: "angles" | "header" };
   marked_sent: AngleRef & { channel: "email" | "linkedin" };
+  /** An ordinary stage change. A change to or from Unqualified sends leads_unqualified or leads_restored instead. */
   stage_changed: { leadId: LeadId; from: Stage; to: Stage; surface: "lead" | "pipeline" };
+  /** Leads were marked unqualified. reason: the quick pick's key or "none", never the text. */
+  leads_unqualified: { count: number; reason: UnqualifiedReasonKey | "none"; surface: LeadSurface };
+  /** Unqualified leads were put back (Restore, Undo, or another stage chosen). */
+  leads_restored: { count: number; surface: LeadSurface };
+  leads_deleted: { count: number; surface: "list" | "lead" };
   owner_set: { leadId: LeadId; cleared: boolean };
   /** inDays: days from today to the chosen date (negative for a past date). */
   followup_set: { leadId: LeadId; cleared: boolean; inDays?: number };
@@ -90,6 +99,9 @@ const EVENT_LIST: Record<ClientEvent, true> = {
   linkedin_profile_opened: true,
   marked_sent: true,
   stage_changed: true,
+  leads_unqualified: true,
+  leads_restored: true,
+  leads_deleted: true,
   owner_set: true,
   followup_set: true,
   notes_saved: true,

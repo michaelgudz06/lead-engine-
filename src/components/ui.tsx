@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import { STAGES, STAGE_LABELS, type Stage } from "@/lib/types";
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
@@ -88,7 +88,7 @@ export function Chip({ children, tone, className, title }: { children: React.Rea
 }
 
 export function StageChip({ stage }: { stage: Stage }) {
-  const tone = stage === "replied" || stage === "call_booked" ? "success" : stage === "lost" || stage === "nurture" || stage === "new" ? "quiet" : "default";
+  const tone = stage === "replied" || stage === "call_booked" ? "success" : stage === "lost" || stage === "nurture" || stage === "new" || stage === "unqualified" ? "quiet" : "default";
   return <Chip tone={tone}>{STAGE_LABELS[stage] ?? stage}</Chip>;
 }
 
@@ -172,7 +172,40 @@ export function ErrorState({ title = "This did not load", message, onRetry }: { 
   );
 }
 
-/** Native <dialog>: focus trapping, Escape to close and the backdrop come for free. */
+/**
+ * Native <dialog>: focus trapping, Escape to close, the backdrop, and focus going back to what
+ * opened it all come for free. While `busy`, Escape and the backdrop do nothing.
+ */
+export function Modal({ open, busy, onClose, labelledBy, children }: { open: boolean; busy?: boolean; onClose: () => void; labelledBy?: string; children: React.ReactNode }) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (open && !el.open) el.showModal();
+    if (!open && el.open) el.close();
+  }, [open]);
+  return (
+    <dialog
+      ref={ref}
+      className="modal"
+      aria-labelledby={labelledBy}
+      onCancel={(e) => {
+        e.preventDefault();
+        if (!busy) onClose();
+      }}
+      onClick={(e) => {
+        // A click on the backdrop lands on the dialog element itself.
+        if (e.target === ref.current && !busy) onClose();
+      }}
+      // Escape closes the dialog only: the page behind (a selected list, say) keeps its state.
+      onKeyDown={(e) => e.stopPropagation()}
+    >
+      {children}
+    </dialog>
+  );
+}
+
+/** A yes-or-no question before something that cannot be undone. */
 export function ConfirmDialog({
   open,
   title,
@@ -192,28 +225,13 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (open && !el.open) el.showModal();
-    if (!open && el.open) el.close();
-  }, [open]);
+  const titleId = useId();
   return (
-    <dialog
-      ref={ref}
-      className="modal"
-      onCancel={(e) => {
-        e.preventDefault();
-        if (!busy) onCancel();
-      }}
-      onClick={(e) => {
-        // A click on the backdrop lands on the dialog element itself.
-        if (e.target === ref.current && !busy) onCancel();
-      }}
-    >
+    <Modal open={open} busy={busy} onClose={onCancel} labelledBy={titleId}>
       <div className="p-5">
-        <h2 className="font-serif text-[21px] leading-snug">{title}</h2>
+        <h2 id={titleId} className="font-serif text-[21px] leading-snug">
+          {title}
+        </h2>
         <div className="mt-2 text-quiet">{children}</div>
         {error && (
           <div className="mt-3">
@@ -229,6 +247,6 @@ export function ConfirmDialog({
           </Button>
         </div>
       </div>
-    </dialog>
+    </Modal>
   );
 }

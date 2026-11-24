@@ -4,6 +4,7 @@ import { IMPORT_MAX_ROWS } from "@/lib/import/columns";
 import { duplicateReason, prepareImport, type ImportMatch } from "@/lib/import/prepare";
 import { insertImportedLeads } from "@/lib/repo/import";
 import { importLimitMessage } from "@/lib/repo/quota";
+import type { Stage } from "@/lib/types";
 import { fail, json, readJson, serverError } from "../../_lib/api";
 
 /**
@@ -13,7 +14,8 @@ import { fail, json, readJson, serverError } from "../../_lib/api";
  * (startRun in src/app/api/_lib/api.ts), and the team picks which leads to research. A row needs
  * a LinkedIn URL, or a name plus a company or an email. Rows that name a lead that already
  * exists (same LinkedIn profile, HubSpot contact or email), or an earlier row of the same
- * import, are reported as duplicates and not added. At most 1,000 rows per request, and at most
+ * import, are reported as duplicates and not added. An unqualified lead counts: it does not come
+ * back, and the reason says "(marked unqualified)". At most 1,000 rows per request, and at most
  * IMPORT_LIMIT_PER_DAY (default 2,000) new leads per rolling 24 hours across the app: a batch
  * that would pass the limit is refused whole with 429.
  */
@@ -54,6 +56,8 @@ interface ImportDuplicate {
   match: ImportMatch;
   /** For a repeat inside this import: the index of the earlier row. */
   duplicateOf: number | null;
+  /** The stage of the lead in existingId ("new" for one this import created); null when there is none. */
+  existingStage: Stage | null;
 }
 
 export async function POST(request: NextRequest) {
@@ -76,19 +80,27 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Where each kept row ended up: a new lead, or an existing one.
-    const leadOf = new Map<number, string>();
-    for (const c of outcome.created) leadOf.set(c.index, c.id);
-    for (const e of outcome.existing) leadOf.set(e.index, e.existingId);
+    // Where each kept row ended up: a new lead, or an existing one, and that lead's stage.
+    const leadOf = new Map<number, { id: string; stage: Stage }>();
+    for (const c of outcome.created) leadOf.set(c.index, { id: c.id, stage: "new" });
+    for (const e of outcome.existing) leadOf.set(e.index, { id: e.existingId, stage: e.existingStage });
 
     const duplicates: ImportDuplicate[] = [
-      ...outcome.existing.map((e) => ({ index: e.index, existingId: e.existingId, reason: duplicateReason(e.match, false), match: e.match, duplicateOf: null })),
+      ...outcome.existing.map((e) => ({
+        index: e.index,
+        existingId: e.existingId,
+        reason: duplicateReason(e.match, false, e.existingStage),
+        match: e.match,
+        duplicateOf: null,
+        existingStage: e.existingStage,
+      })),
       ...prepared.repeats.map((r) => ({
         index: r.index,
-        existingId: leadOf.get(r.duplicateOf) ?? null,
+        existingId: leadOf.get(r.duplicateOf)?.id ?? null,
         reason: duplicateReason(r.match, true),
         match: r.match,
         duplicateOf: r.duplicateOf,
+        existingStage: leadOf.get(r.duplicateOf)?.stage ?? null,
       })),
     ].sort((a, b) => a.index - b.index);
 

@@ -37,8 +37,19 @@ first angle shorter", "dig into their compute setup").
   up to 10 MB and 5,000 rows), a Google Sheet link (shared as "Anyone with the link, Viewer")
   or HubSpot contacts. Match the columns, tick the rows, import. A row needs a LinkedIn URL,
   or a name plus a company or an email. Duplicates are matched by LinkedIn profile, HubSpot
-  id, email, or for rows with none of those, the name and company as first imported.
+  id, email, or for rows with none of those, the name and company as first imported. A row
+  that matches an unqualified lead is a duplicate too ("... (marked unqualified)"), so an
+  import never brings it back.
   Importing never starts research: an imported lead reads "Not researched yet".
+- **Taking leads off the list**: tick rows on Leads (or Select all, or Shift-click a range),
+  then **Mark unqualified** (with an optional reason: Not a fit, Wrong person, No need right
+  now, Competitor or partner, Bad or duplicate data) or **Delete**. Marked leads leave Leads
+  and Pipeline at once, with Undo, and wait in the **Unqualified** view (`/?view=unqualified`)
+  with their reason and date, where Restore puts them back on the stage they had. They keep
+  their research, and imports keep skipping them. Delete is for good, and a later import can
+  add the person again. On a lead's page, **Remove** offers both; an unqualified lead shows
+  its reason (editable) and a Restore button. Pipeline hides unqualified leads and links to
+  them.
 - **Leads without LinkedIn** show "No LinkedIn yet". Add the URL on the lead page, or let
   research look for it. A wrong profile can be changed under Details, then re-run.
 - **Re-run research** on a researched lead asks why first (up to 1,200 characters, with quick
@@ -91,7 +102,7 @@ page, so on an open deploy anyone with the URL can see it.
 
 PostHog tracks page views and named actions (lead created, drafts copied, marked as sent,
 stage changes, steering, settings saved, imports, re-runs with a reason, email lookups and
-edits) through the app's own `/ingest` path. Only ids,
+edits, leads marked unqualified, restored or deleted) through the app's own `/ingest` path. Only ids,
 counts and timings are sent; never names, emails, notes or draft text. Session recording
 and autocapture are off. Set `NEXT_PUBLIC_POSTHOG_KEY` to turn it on (it is fixed at build time).
 
@@ -120,6 +131,20 @@ The Settings page shows which integrations are on and why.
    `vercel.json` pins functions to `cle1` (Cleveland), next to the Neon database in
    `us-east-2`; change it if your database lives elsewhere.
 4. Deploy, open the URL, log in with the team password, and add a lead.
+
+### Rolling back
+
+Code from before the Unqualified view has no Unqualified stage. While any lead is unqualified,
+its Leads and Pipeline pages fail to load for everyone. So before rolling back to it (a Vercel
+Instant Rollback, or any older build on this database), restore every unqualified lead:
+
+- In the app: Leads, then Unqualified, Select all, Restore. Repeat until the Unqualified count
+  is 0 (the view shows 500 at a time).
+- From a script: GET `/api/leads?view=unqualified`, then POST `/api/leads/bulk` with
+  `{"action":"restore","ids":[...]}` (at most 500 ids a call), until the view is empty.
+
+Then roll back. Migration 006 can stay applied. Restoring clears the reasons, so mark those
+leads again after you roll forward.
 
 ### Run limits
 

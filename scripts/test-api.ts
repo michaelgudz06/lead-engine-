@@ -14,18 +14,27 @@
  * 5. guards   against Neon with temp leads: the stage rule when a run ends, the stale-run reaper
  *             (research_started_at backdated) and the hourly and daily run caps (le_run_starts
  *             rows on temp leads, including a concurrent burst; all removed at the end)
+ * 6. qualify  unqualified leads: the restore mapping and the reason rules (pure), POST
+ *             /api/leads/bulk validation, then against Neon with temp leads named "LE Qualify
+ *             Test ...": the list views and counts, bulk unqualify, restore and delete (rules read
+ *             back from the rows, events, missing ids), marking twice, PATCH both ways, the 409s'
+ *             existingStage, research on an unqualified lead (repo functions only, never a run),
+ *             and the SQL restore mapping against the pure one. The old deployed code cannot show
+ *             an unqualified lead, so each block keeps its leads unqualified for as few queries
+ *             as it can and deletes them in a finally; a count at the end confirms none is left.
  *
  * Prints statuses and short snippets only: never a key, token, cookie value or header.
  */
 // First, as in Next's own server: installs globalThis.AsyncLocalStorage, which the
 // request-scope modules below need when they load.
 import "next/dist/server/node-environment-baseline";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { workAsyncStorage } from "next/dist/server/app-render/work-async-storage.external";
 import { workUnitAsyncStorage } from "next/dist/server/app-render/work-unit-async-storage.external";
 import * as leadsRoute from "../src/app/api/leads/route";
+import * as bulkRoute from "../src/app/api/leads/bulk/route";
 import * as leadRoute from "../src/app/api/leads/[id]/route";
 import * as researchRoute from "../src/app/api/leads/[id]/research/route";
 import * as steerRoute from "../src/app/api/leads/[id]/steer/route";
@@ -59,10 +68,45 @@ import {
 } from "../src/lib/auth";
 import { normaliseDomain, pushLeadToHubSpot, pushToHubSpot, splitName } from "../src/lib/providers/hubspot";
 import { query } from "../src/lib/db";
+import { nextAction, sortNeedsYouFirst } from "../src/lib/next-action";
+import {
+  cleanUnqualifiedReason,
+  justMarked,
+  restoredEventMessage,
+  restoredStage,
+  stageChangedEventMessage,
+  stageEventMessages,
+  unqualifiedEventMessage,
+  type RestoreInput,
+} from "../src/lib/qualify";
 import { listEvents } from "../src/lib/repo/events";
-import { claimResearch, createLead, deleteLead, finishResearch, getLead, updateLead } from "../src/lib/repo/leads";
+import {
+  claimResearch,
+  countLeads,
+  createLead,
+  deleteLead,
+  failStaleResearch,
+  finishResearch,
+  getLead,
+  setResearchStep,
+  updateLead,
+  type LeadPatch,
+} from "../src/lib/repo/leads";
+import { DELETE_LEADS_SQL, deleteLeads, restoreLeads, uniqueLeadIds, unqualifyLeads } from "../src/lib/repo/qualify";
 import { getSettings } from "../src/lib/repo/settings";
-import type { Angle, Brief, Lead, LeadEvent } from "../src/lib/types";
+import {
+  ACTIVE_STAGES,
+  BULK_LEADS_MAX,
+  STAGE_LABELS,
+  STAGES,
+  UNQUALIFIED_REASONS,
+  type ActiveStage,
+  type Angle,
+  type Brief,
+  type Lead,
+  type LeadEvent,
+  type ResearchStatus,
+} from "../src/lib/types";
 
 // ------------------------------------------------------------------ compile-time checks
 // The same shape Next's generated validator (.next/types/validator.ts) requires of route
@@ -71,6 +115,7 @@ type Handler<P> = (request: NextRequest, context: { params: Promise<P> }) => Pro
 type RouteHandlerConfig<P> = Partial<Record<"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS", Handler<P>>>;
 type NoParams = Record<string, never>;
 void (leadsRoute satisfies RouteHandlerConfig<NoParams>);
+void (bulkRoute satisfies RouteHandlerConfig<NoParams>);
 void (leadRoute satisfies RouteHandlerConfig<{ id: string }>);
 void (researchRoute satisfies RouteHandlerConfig<{ id: string }>);
 void (steerRoute satisfies RouteHandlerConfig<{ id: string }>);
@@ -160,6 +205,18 @@ async function callRoute(
 }
 
 const asHandler = (fn: unknown) => fn as (request: NextRequest, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
+
+/** Runs fn and returns what it wrote with console.warn meanwhile (the bulk route's log lines), without printing it. */
+async function warnsDuring<T>(fn: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
+  const lines: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
+  try {
+    return { value: await fn(), lines };
+  } finally {
+    console.warn = warn;
+  }
+}
 
 // ------------------------------------------------------------------ 1. auth
 
@@ -280,6 +337,9 @@ async function testProxy(): Promise<void> {
   check("gate off: POST with Origin null (sandboxed frame) is 403", await refusedCrossSite(await send("POST", "/api/leads", { origin: "null" })));
   check("gate off: POST from another local port is 403", await refusedCrossSite(await send("POST", "/api/leads", { origin: "http://localhost:3001" })));
   check("gate off: cross-site POST to a page path is 403 too", await refusedCrossSite(await send("POST", "/leads/new", CROSS_SITE)));
+  check("gate off: cross-site POST /api/leads/bulk (unqualify, restore, delete) is 403", await refusedCrossSite(await send("POST", "/api/leads/bulk", CROSS_SITE)));
+  check("gate off: a foreign Origin on POST /api/leads/bulk is 403", await refusedCrossSite(await send("POST", "/api/leads/bulk", { origin: "https://evil.example" })));
+  check("gate off: same-origin POST /api/leads/bulk passes", passes(await send("POST", "/api/leads/bulk", SAME_ORIGIN)));
   check("gate off: same-origin POST passes", passes(await send("POST", "/api/leads", SAME_ORIGIN)));
   check("gate off: our own Origin without Sec-Fetch-Site passes", passes(await send("POST", "/api/leads", { origin: "http://localhost:3000" })));
   check("gate off: header-less POST (a script) passes", passes(await send("POST", "/api/leads")));
@@ -434,10 +494,27 @@ async function testRoutes(): Promise<void> {
 
     const dup = await callRoute(leadsPost, { method: "POST", path: "/api/leads", body: { linkedinUrl: `https://www.linkedin.com/in/${slug.toUpperCase()}` } });
     check("duplicate is 409 with existingId", dup.status === 409 && dup.data?.existingId === id, dup.data);
+    check(
+      "duplicate's 409 names the existing lead's stage (researching), with the usual message",
+      dup.data?.existingStage === "researching" && dup.data?.error === "This person is already a lead.",
+      dup.data,
+    );
     check("duplicate starts no research", afterTasks.length === 1);
 
     const list = await callRoute(asHandler(leadsRoute.GET), { path: "/api/leads" });
     check("GET /api/leads includes the lead", list.status === 200 && (list.data?.leads as Lead[]).some((l) => l.id === id));
+    const listCounts = list.data?.counts as { active?: unknown; unqualified?: unknown } | undefined;
+    check(
+      "GET /api/leads also answers counts { active, unqualified }",
+      typeof listCounts?.active === "number" && typeof listCounts?.unqualified === "number" && listCounts.active >= 1,
+      list.data?.counts,
+    );
+    const listed = (list.data?.leads as Lead[]).find((l) => l.id === id);
+    check(
+      "a listed lead carries unqualifiedAt, unqualifiedReason and stageBeforeUnqualified (null)",
+      listed?.unqualifiedAt === null && listed?.unqualifiedReason === null && listed?.stageBeforeUnqualified === null,
+      listed && { at: listed.unqualifiedAt, reason: listed.unqualifiedReason, before: listed.stageBeforeUnqualified },
+    );
 
     const getOne = asHandler(leadRoute.GET);
     const detail = await callRoute(getOne, { path: `/api/leads/${id}`, id });
@@ -768,6 +845,9 @@ function sampleLead(over: Partial<Lead> = {}): Lead {
     location: null,
     notes: null,
     stage: "contacted",
+    unqualifiedAt: null,
+    unqualifiedReason: null,
+    stageBeforeUnqualified: null,
     owner: null,
     nextStepAt: null,
     lastContactedAt: null,
@@ -1293,6 +1373,611 @@ async function testRunGuards(): Promise<void> {
   }
 }
 
+// ------------------------------------------------------------------ 6. unqualified leads and bulk actions
+
+/** Temp leads in this section are named "LE Qualify Test <run> <label>", so they are obviously fake. */
+const QUALIFY_PREFIX = `LE Qualify Test ${randomBytes(3).toString("hex")}`;
+
+/** One row of the restore mapping: an unqualified lead as stored, and the stage Restore must give it. */
+interface RestoreCase {
+  label: string;
+  before: ActiveStage | null;
+  status: ResearchStatus;
+  /** When its latest run started: before it was marked, or after (a run on the unqualified lead). */
+  run?: "before" | "after";
+  contacted?: boolean;
+  research?: "brief" | "angles";
+  want: ActiveStage;
+}
+
+const RESTORE_CASES: RestoreCase[] = [
+  { label: "contacted goes back to contacted", before: "contacted", status: "done", research: "brief", contacted: true, want: "contacted" },
+  { label: "nurture", before: "nurture", status: "idle", want: "nurture" },
+  { label: "lost", before: "lost", status: "done", research: "brief", want: "lost" },
+  { label: "replied", before: "replied", status: "done", research: "angles", contacted: true, want: "replied" },
+  { label: "call booked, with a re-run going", before: "call_booked", status: "running", run: "after", want: "call_booked" },
+  { label: "marked mid-run, the run still going", before: "researching", status: "running", run: "before", want: "researching" },
+  { label: "marked mid-run, the run done", before: "researching", status: "done", run: "before", research: "brief", want: "researched" },
+  { label: "marked mid-run, the run failed with nothing", before: "researching", status: "error", run: "before", want: "new" },
+  { label: "marked mid-run, a re-run failed, angles kept", before: "researching", status: "error", run: "before", research: "angles", want: "researched" },
+  { label: "new, a run started after it was marked, still going", before: "new", status: "running", run: "after", want: "researching" },
+  { label: "new, a run started after it was marked, done", before: "new", status: "done", run: "after", research: "brief", want: "researched" },
+  { label: "new, a run started after it was marked, failed with nothing", before: "new", status: "error", run: "after", want: "new" },
+  { label: "new on purpose (its last run was before it was marked)", before: "new", status: "done", run: "before", research: "brief", want: "new" },
+  { label: "researched, a run since then failed, brief kept", before: "researched", status: "error", run: "after", research: "brief", want: "researched" },
+  { label: "researched, no run since", before: "researched", status: "done", run: "before", research: "brief", want: "researched" },
+  { label: "none recorded, contacted", before: null, status: "done", contacted: true, research: "brief", want: "contacted" },
+  { label: "none recorded, research done", before: null, status: "done", research: "brief", want: "researched" },
+  { label: "none recorded, a run going", before: null, status: "running", run: "after", want: "researching" },
+  { label: "none recorded, nothing", before: null, status: "idle", want: "new" },
+];
+
+const QUALIFY_BRIEF: Brief = { summary: "LE Qualify Test brief.", bullets: [], pains: [], objections: [], questions: [] };
+const QUALIFY_ANGLE: Angle = { id: "a1", name: "Angle", reasoning: "", findingIds: [], email: { subject: "s", body: "b" }, linkedinMessage: "m" };
+
+/**
+ * A case as the lead's fields. Every time is within the last few minutes, so no run here looks
+ * stale (6 minutes) to a list's reaper while the case is set up.
+ */
+function restoreInput(c: RestoreCase, markedAt: number): RestoreInput {
+  const at = (ms: number) => new Date(ms).toISOString();
+  return {
+    stageBeforeUnqualified: c.before,
+    unqualifiedAt: at(markedAt),
+    researchStatus: c.status,
+    researchStartedAt: c.run ? at(markedAt + (c.run === "after" ? 2 : -1) * 60_000) : null,
+    lastContactedAt: c.contacted ? at(markedAt - 60 * 60_000) : null,
+    brief: c.research === "brief" ? QUALIFY_BRIEF : null,
+    angles: c.research === "angles" ? [QUALIFY_ANGLE] : [],
+  };
+}
+
+async function testQualify(): Promise<void> {
+  section("6. unqualified leads and bulk actions");
+  restoreEnv();
+  setEnv({ APP_PASSWORD: undefined, HUBSPOT_ACCESS_TOKEN: undefined, RUN_LIMIT_PER_HOUR: "100000", RUN_LIMIT_PER_DAY: "100000" });
+  const tasksAtStart = afterTasks.length;
+
+  // ---- pure: stages, reasons, next action, the restore mapping, messages
+  check(
+    "STAGES ends with unqualified (label Unqualified); ACTIVE_STAGES is every other stage",
+    STAGES[STAGES.length - 1] === "unqualified" &&
+      STAGE_LABELS.unqualified === "Unqualified" &&
+      JSON.stringify(ACTIVE_STAGES) === JSON.stringify(STAGES.slice(0, -1)),
+    ACTIVE_STAGES,
+  );
+  check(
+    "UNQUALIFIED_REASONS: the five quick picks",
+    JSON.stringify(UNQUALIFIED_REASONS.map((r) => `${r.key}=${r.label}`)) ===
+      JSON.stringify(["not_fit=Not a fit", "wrong_person=Wrong person", "no_need=No need right now", "competitor=Competitor or partner", "bad_data=Bad or duplicate data"]),
+  );
+  const unq = sampleLead({ stage: "unqualified", unqualifiedAt: new Date().toISOString(), stageBeforeUnqualified: "researched" });
+  const na = nextAction(unq);
+  check("nextAction: unqualified is Unqualified, quiet, priority 99 (after lost at 95)", na.label === "Unqualified" && na.tone === "quiet" && na.priority === 99 && nextAction(sampleLead({ stage: "lost" })).priority === 95, na);
+  const naRunning = nextAction({ ...unq, researchStatus: "running" });
+  const naFailed = nextAction({ ...unq, researchStatus: "error" });
+  check("nextAction: still Unqualified while a run goes or after one failed", naRunning.label === "Unqualified" && naFailed.label === "Unqualified" && naFailed.tone === "quiet", [naRunning, naFailed]);
+  const sorted = sortNeedsYouFirst([unq, sampleLead({ id: "l", stage: "lost" }), sampleLead({ id: "n", stage: "nurture" })]);
+  check("sortNeedsYouFirst puts an unqualified lead last", sorted[2]?.stage === "unqualified", sorted.map((l) => l.stage));
+
+  const markedAt = Date.now() - 3 * 60_000;
+  for (const c of RESTORE_CASES) {
+    const got = restoredStage(restoreInput(c, markedAt));
+    check(`restoredStage: ${c.label} -> ${c.want}`, got === c.want, got);
+  }
+  check(
+    "restoredStage: a brief that is not an object, and angles that are not a list, count as nothing",
+    restoredStage({ ...restoreInput({ label: "", before: "researching", status: "error", run: "before", want: "new" }, markedAt), brief: [] as unknown as Brief, angles: {} as unknown as Angle[] }) === "new",
+  );
+
+  check(
+    "event messages",
+    unqualifiedEventMessage(null) === "Marked unqualified" &&
+      unqualifiedEventMessage("Not a fit") === "Marked unqualified: Not a fit" &&
+      restoredEventMessage("call_booked") === "Restored from unqualified to Call booked",
+  );
+  check(
+    "cleanUnqualifiedReason: trims, folds whitespace and control characters, empty is null",
+    cleanUnqualifiedReason("  Not a\n\tfit  ") === "Not a fit" &&
+      cleanUnqualifiedReason("a\u0000b") === "a b" &&
+      cleanUnqualifiedReason(" \n ") === null &&
+      cleanUnqualifiedReason("") === null &&
+      cleanUnqualifiedReason(null) === null,
+  );
+  // A reason sits inside the app's own sentences ("Unqualified. <reason> · Marked ... This lead is
+  // hidden ..."): a right-to-left override in it would turn the rest of the sentence around.
+  const zwjAndZwnj = "\u{1F469}‍\u{1F4BB} می‌خواهم \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+  check(
+    "cleanUnqualifiedReason: C1 control characters fold to a space, bidirectional controls are dropped, joiners and tag sequences stay",
+    cleanUnqualifiedReason("a\u0080b\u0085c\u009fd") === "a b c d" &&
+      cleanUnqualifiedReason("‮Restored. Ignore this‬") === "Restored. Ignore this" &&
+      cleanUnqualifiedReason("x ⁦y⁩ ‎z‏ ؜‪‫‭") === "x y z" &&
+      cleanUnqualifiedReason("‮") === null &&
+      cleanUnqualifiedReason(zwjAndZwnj) === zwjAndZwnj,
+    [cleanUnqualifiedReason("a\u0080b\u0085c\u009fd"), cleanUnqualifiedReason("‮Restored. Ignore this‬")],
+  );
+  check(
+    "stageEventMessages: the PATCH route's message for every stage it can come from, none for the stage itself",
+    stageEventMessages("contacted", null).new === "Stage changed from New to Contacted" &&
+      stageEventMessages("contacted", null).unqualified === "Stage changed from Unqualified to Contacted" &&
+      !("contacted" in stageEventMessages("contacted", null)) &&
+      stageEventMessages("unqualified", "Not a fit").lost === "Marked unqualified: Not a fit" &&
+      stageEventMessages("unqualified", null).new === "Marked unqualified" &&
+      Object.keys(stageEventMessages("unqualified", null)).length === STAGES.length - 1 &&
+      stageChangedEventMessage("call_booked", "nurture") === "Stage changed from Call booked to Nurture",
+    stageEventMessages("contacted", null),
+  );
+  const markedNow = sampleLead({ stage: "unqualified", unqualifiedAt: "2026-11-20T10:00:00.000Z", updatedAt: "2026-11-20T10:00:00.000Z" });
+  check(
+    "justMarked: only when unqualifiedAt is the write's own time (updatedAt); a lead marked earlier, or one not unqualified, is not",
+    justMarked(markedNow) &&
+      !justMarked({ ...markedNow, updatedAt: "2026-11-20T10:00:05.000Z" }) &&
+      !justMarked({ ...markedNow, stage: "lost", unqualifiedAt: null }) &&
+      !justMarked({ ...markedNow, unqualifiedAt: null }),
+  );
+  const someId = "AAAAAAAA-0000-4000-8000-000000000001";
+  check(
+    "uniqueLeadIds: lower case, each once, in order, non-UUIDs dropped",
+    JSON.stringify(uniqueLeadIds([someId, "nope", someId.toLowerCase(), "00000000-0000-4000-8000-000000000002"])) ===
+      JSON.stringify([someId.toLowerCase(), "00000000-0000-4000-8000-000000000002"]),
+  );
+
+  // ---- POST /api/leads/bulk: refused before anything is read or written
+  const bulk = asHandler(bulkRoute.POST);
+  const post = (body: unknown) => callRoute(bulk, { method: "POST", path: "/api/leads/bulk", body });
+  const ghost = "00000000-0000-4000-8000-00000000dead";
+  const manyIds = (n: number) => Array.from({ length: n }, () => randomUUID());
+  for (const [label, body, pattern] of [
+    ["an empty body", {}, /^action: Use "unqualify", "restore" or "delete"\.$/],
+    ["an unknown action", { action: "archive", ids: [ghost] }, /^action: Use "unqualify", "restore" or "delete"\.$/],
+    ["no ids", { action: "delete" }, /^ids: Send a list of lead ids\.$/],
+    ["ids that are not a list", { action: "restore", ids: ghost }, /^ids: Send a list of lead ids\.$/],
+    ["no ids at all", { action: "delete", ids: [] }, /at least one lead/],
+    [`${BULK_LEADS_MAX + 1} ids`, { action: "delete", ids: manyIds(BULK_LEADS_MAX + 1) }, /at most 500 leads/],
+    ["an id that is not a UUID", { action: "restore", ids: [ghost, "not-a-uuid"] }, /ids\.1: Each id must be a lead id/],
+    ["an id that is not text", { action: "unqualify", ids: [42] }, /Each id must be text/],
+    ["a reason over 200 characters", { action: "unqualify", ids: [ghost], reason: "x".repeat(201) }, /^reason: Keep it to 200 characters or fewer\.$/],
+    ["a reason that is not text", { action: "unqualify", ids: [ghost], reason: 5 }, /^reason: Send it as text, or null\.$/],
+  ] as const) {
+    const { value: r, lines } = await warnsDuring(() => post(body));
+    check(`POST /api/leads/bulk with ${label} is 400 that says why, and logs nothing`, r.status === 400 && pattern.test(String(r.data?.error)) && lines.length === 0, { data: r.data, lines });
+  }
+  const plain = await callRoute(bulk, { method: "POST", path: "/api/leads/bulk", rawBody: JSON.stringify({ action: "delete", ids: [ghost] }), headers: { "content-type": "text/plain" } });
+  check("POST /api/leads/bulk with a text/plain body is 415", plain.status === 415, plain.data);
+  const broken = await callRoute(bulk, { method: "POST", path: "/api/leads/bulk", rawBody: "{nope" });
+  check("POST /api/leads/bulk with broken JSON is 400", broken.status === 400, broken.data);
+  const fullBatch = manyIds(BULK_LEADS_MAX);
+  const atMax = await post({ action: "restore", ids: fullBatch });
+  check(
+    `POST /api/leads/bulk with ${BULK_LEADS_MAX} unknown ids (restore) is 200, all missing`,
+    atMax.status === 200 && (atMax.data?.leads as unknown[])?.length === 0 && JSON.stringify(atMax.data?.missing) === JSON.stringify(fullBatch),
+    atMax.status,
+  );
+  const exact200 = await post({ action: "unqualify", ids: [ghost], reason: "y".repeat(200) });
+  check("a reason of exactly 200 characters is accepted (unknown id: missing)", exact200.status === 200 && JSON.stringify(exact200.data?.missing) === JSON.stringify([ghost]), exact200.data);
+  const { value: delGhost, lines: delGhostLog } = await warnsDuring(() => post({ action: "delete", ids: [ghost, ghost.toUpperCase()] }));
+  check(
+    "bulk delete of an unknown id (twice, in two cases): 200 { deleted: [], missing: [it] }, and no log line (nothing changed)",
+    delGhost.status === 200 && JSON.stringify(delGhost.data) === JSON.stringify({ deleted: [], missing: [ghost] }) && delGhostLog.length === 0,
+    { data: delGhost.data, delGhostLog },
+  );
+  // A plain "delete ... where id = any(...)" locks rows in the order a scan meets them, and can
+  // deadlock with a bulk unqualify or restore of the same leads, which lock in id order. EXPLAIN
+  // only plans the statement: nothing is deleted.
+  const deletePlan = (await query<Record<string, string>>(`explain (costs off) ${DELETE_LEADS_SQL.replace("$1::uuid[]", `array['${ghost}']::uuid[]`)}`))
+    .map((row) => Object.values(row)[0])
+    .join("\n");
+  const lockAt = deletePlan.indexOf("LockRows");
+  check(
+    "bulk delete locks its rows in id order first, like unqualify and restore (LockRows over rows sorted by id)",
+    lockAt >= 0 && /Sort Key: [\w.]*\bid\b|Index (?:Only )?Scan using le_leads_pkey/.test(deletePlan.slice(lockAt)),
+    deletePlan,
+  );
+
+  // ---- GET /api/leads?view=
+  const list = asHandler(leadsRoute.GET);
+  const getList = (query = "") => callRoute(list, { path: `/api/leads${query}` });
+  const bogus = await getList("?view=lost");
+  check('GET /api/leads?view=lost is 400 that names the views', bogus.status === 400 && /view must be "active" or "unqualified"/.test(String(bogus.data?.error)), bogus.data);
+  const emptyView = await getList("?view=");
+  check("GET /api/leads?view= (empty) is the active list", emptyView.status === 200 && Array.isArray(emptyView.data?.leads), emptyView.status);
+
+  // ---- against the database: temp leads only, each block deletes its own in a finally
+  const made: string[] = [];
+  // A run stopped before its finally ran (Ctrl-C, a timeout, a cancelled job) leaves its temp
+  // leads behind, maybe unqualified, and a later run's prefix differs: remove any run's that are
+  // over 10 minutes old (a run going at the same moment keeps its own).
+  const sweepStale = () => query<{ id: string }>("delete from le_leads where name like 'LE Qualify Test %' and created_at < now() - interval '10 minutes' returning id");
+  const swept = await sweepStale();
+  if (swept.length) console.log(`  (removed ${swept.length} temp leads an earlier run left behind)`);
+  // Ctrl-C or SIGTERM in the middle: delete this run's temp leads before exiting.
+  const onSignal = (signal: NodeJS.Signals) =>
+    void deleteLeads(made)
+      .catch(() => undefined)
+      .finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  const make = async (label: string, over?: LeadPatch): Promise<Lead> => {
+    const lead = await createLead({ linkedinUrl: `https://www.linkedin.com/in/le-qualify-test-${randomBytes(5).toString("hex")}`, name: `${QUALIFY_PREFIX} ${label}` });
+    made.push(lead.id);
+    runLeadIds.add(lead.id);
+    return over ? ((await updateLead(lead.id, over)) ?? lead) : lead;
+  };
+  const rowOf = async (id: string) =>
+    (
+      await query<{ stage: string; unqualified_at: string | null; unqualified_reason: string | null; stage_before_unqualified: string | null; research_status: string; research_step: string | null; updated_at: string }>(
+        // Times as text: exact to the microsecond, and comparable with ===.
+        "select stage, unqualified_at::text as unqualified_at, unqualified_reason, stage_before_unqualified, research_status, research_step, updated_at::text as updated_at from le_leads where id = $1",
+        [id],
+      )
+    )[0];
+  const stageEvents = async (id: string) => (await listEvents(id)).filter((e) => e.type === "stage");
+  const idsOf = (data: Record<string, unknown> | null) => ((data?.leads ?? []) as Lead[]).map((l) => l.id);
+  const sameList = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  /** counts from the reply against a direct count; one retry, in case a teammate's change landed in between. */
+  const countsAgree = async (res: { data: Record<string, unknown> | null }, again: () => Promise<{ data: Record<string, unknown> | null }>) => {
+    for (const reply of [res, await again()]) if (sameList(reply.data?.counts, await countLeads())) return true;
+    return false;
+  };
+  const patch = asHandler(leadRoute.PATCH);
+  const patchLead = (id: string, body: unknown) => callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body });
+
+  try {
+    // ---- 0: the start-of-run sweep removes another run's leftovers and keeps a lead made just now
+    {
+      const old = await make("left behind");
+      const fresh = await make("fresh");
+      await query("update le_leads set created_at = now() - interval '20 minutes' where id = $1", [old.id]);
+      const sweptNow = (await sweepStale()).map((r) => String(r.id));
+      check(
+        "0: the sweep removes a temp lead over 10 minutes old and keeps a new one",
+        sweptNow.includes(old.id) && !sweptNow.includes(fresh.id) && (await getLead(old.id)) === null && (await getLead(fresh.id)) !== null,
+        { sweptNow, old: old.id, fresh: fresh.id },
+      );
+      await deleteLeads([fresh.id]).catch(() => undefined);
+    }
+
+    // ---- A: list views and counts, bulk unqualify, marking twice, the 409s, restore, delete
+    {
+      const a = await make("A");
+      const b = await make("B", { stage: "contacted", lastContactedAt: new Date().toISOString() });
+      const c = await make("C");
+      try {
+        const before = await getList();
+        const beforeCounts = before.data?.counts as { active: number; unqualified: number };
+        check("A: the temp leads start on the active list", ["a", "b", "c"].every((_, i) => idsOf(before.data).includes([a, b, c][i].id)));
+
+        const { value: marked, lines: markedLog } = await warnsDuring(() => post({ action: "unqualify", ids: [a.id, b.id.toUpperCase(), a.id, ghost], reason: "  Not a fit \n" }));
+        const ra = await rowOf(a.id);
+        const rb = await rowOf(b.id);
+        check(
+          "A: bulk unqualify is 200 with the leads in the order sent, repeats removed, unknown ids missing",
+          marked.status === 200 && sameList(idsOf(marked.data), [a.id, b.id]) && sameList(marked.data?.missing, [ghost]),
+          marked.data && { ids: idsOf(marked.data), missing: marked.data.missing },
+        );
+        check("A: ... and one line in the server log: the action, the count, then the ids", sameList(markedLog, [`[api] bulk unqualify: 2 of 3 leads: ${a.id} ${b.id}`]), markedLog);
+        check(
+          "A: justMarked is true for each lead this action marked (the Leads page offers Undo for exactly these)",
+          ((marked.data?.leads ?? []) as Lead[]).length === 2 && ((marked.data?.leads ?? []) as Lead[]).every(justMarked),
+          ((marked.data?.leads ?? []) as Lead[]).map((l) => ({ at: l.unqualifiedAt, updated: l.updatedAt })),
+        );
+        check(
+          "A: the rows: stage unqualified, when it was marked, the reason trimmed, the stage each had before",
+          ra?.stage === "unqualified" && Boolean(ra.unqualified_at) && ra.unqualified_reason === "Not a fit" && ra.stage_before_unqualified === "new" && rb?.stage === "unqualified" && rb.stage_before_unqualified === "contacted",
+          { ra, rb },
+        );
+        const replyA = (marked.data?.leads as Lead[] | undefined)?.[0];
+        const storedA = await getLead(a.id);
+        check(
+          "A: the reply's leads carry unqualifiedAt, unqualifiedReason and stageBeforeUnqualified",
+          replyA?.stage === "unqualified" && replyA.unqualifiedReason === "Not a fit" && replyA.stageBeforeUnqualified === "new" && Boolean(replyA.unqualifiedAt) && replyA.unqualifiedAt === storedA?.unqualifiedAt,
+          replyA && { stage: replyA.stage, at: replyA.unqualifiedAt, reason: replyA.unqualifiedReason, before: replyA.stageBeforeUnqualified },
+        );
+        const [ea, eb] = await Promise.all([stageEvents(a.id), stageEvents(b.id)]);
+        check(
+          'A: one "stage" event each: "Marked unqualified: Not a fit" with { from, to, reason }',
+          ea.length === 1 &&
+            eb.length === 1 &&
+            ea[0].message === "Marked unqualified: Not a fit" &&
+            sameList(ea[0].data, { to: "unqualified", from: "new", reason: "Not a fit" }) &&
+            (eb[0].data as { from?: string })?.from === "contacted",
+          { ea, eb },
+        );
+
+        const [active, unqualified] = await Promise.all([getList(), getList("?view=unqualified")]);
+        check("A: the active list leaves them out, keeps the rest", !idsOf(active.data).includes(a.id) && !idsOf(active.data).includes(b.id) && idsOf(active.data).includes(c.id));
+        const unqIds = idsOf(unqualified.data);
+        const order = [a.id, b.id].sort();
+        check(
+          "A: the unqualified view has them (one batch: same time, so in id order), and no active lead",
+          unqualified.status === 200 && unqIds.includes(a.id) && unqIds.includes(b.id) && !unqIds.includes(c.id) && unqIds.indexOf(order[0]) < unqIds.indexOf(order[1]) && ((unqualified.data?.leads ?? []) as Lead[]).every((l) => l.stage === "unqualified"),
+          unqIds,
+        );
+        const afterCounts = unqualified.data?.counts as { active: number; unqualified: number };
+        // Only this test makes unqualified leads (the deployed code cannot), so that count moves by
+        // exactly two; the active count is checked against a direct count, since a teammate may
+        // add a lead meanwhile.
+        check("A: counts: two more unqualified leads", afterCounts?.unqualified === beforeCounts.unqualified + 2, { beforeCounts, afterCounts });
+        check("A: the counts agree with a direct count", await countsAgree(unqualified, () => getList("?view=unqualified")));
+
+        // The single add and a LinkedIn edit say when the person is an unqualified lead.
+        const dup = await callRoute(asHandler(leadsRoute.POST), { method: "POST", path: "/api/leads", body: { linkedinUrl: a.linkedinUrl } });
+        check(
+          "A: POST /api/leads for an unqualified person is 409 with existingId, existingStage and a message that says so",
+          dup.status === 409 && dup.data?.existingId === a.id && dup.data?.existingStage === "unqualified" && dup.data?.error === "This person is already a lead (marked unqualified).",
+          dup.data,
+        );
+        const taken = await patchLead(c.id, { linkedinUrl: a.linkedinUrl });
+        check("A: PATCH linkedinUrl that an unqualified lead has is 409 with existingStage", taken.status === 409 && taken.data?.existingId === a.id && taken.data?.existingStage === "unqualified", taken.data);
+
+        // Marking twice: no reason keeps everything; a reason replaces only the reason. No second event.
+        const again = await post({ action: "unqualify", ids: [a.id] });
+        const ra2 = await rowOf(a.id);
+        check(
+          "A: marking again without a reason keeps when, the reason and the stage before",
+          again.status === 200 && ra2?.unqualified_at === ra?.unqualified_at && ra2?.unqualified_reason === "Not a fit" && ra2?.stage_before_unqualified === "new",
+          ra2,
+        );
+        const relabel = await post({ action: "unqualify", ids: [a.id], reason: "Wrong person" });
+        const ra3 = await rowOf(a.id);
+        check("A: marking again with a reason replaces the reason, keeps when it was marked", relabel.status === 200 && ra3?.unqualified_reason === "Wrong person" && ra3?.unqualified_at === ra?.unqualified_at, ra3);
+        check("A: marking twice logs no second event", (await stageEvents(a.id)).length === 1);
+        // A teammate (or another tab) marked it first: Undo on this page must not restore it.
+        const againLead = ((again.data?.leads ?? []) as Lead[])[0];
+        const relabelLead = ((relabel.data?.leads ?? []) as Lead[])[0];
+        check(
+          "A: justMarked is false for a lead that was unqualified already (marking again, with or without a reason)",
+          Boolean(againLead && relabelLead) && !justMarked(againLead) && !justMarked(relabelLead),
+          againLead && { at: againLead.unqualifiedAt, updated: againLead.updatedAt },
+        );
+
+        const { value: restored, lines: restoredLog } = await warnsDuring(() => post({ action: "restore", ids: [a.id, b.id, c.id, ghost] }));
+        const [rra, rrb] = await Promise.all([rowOf(a.id), rowOf(b.id)]);
+        check(
+          "A: bulk restore is 200 with the unqualified leads; an active lead and an unknown id are missing",
+          restored.status === 200 && sameList(idsOf(restored.data), [a.id, b.id]) && sameList(restored.data?.missing, [c.id, ghost]),
+          restored.data && { ids: idsOf(restored.data), missing: restored.data.missing },
+        );
+        check("A: ... and one line in the server log", sameList(restoredLog, [`[api] bulk restore: 2 of 4 leads: ${a.id} ${b.id}`]), restoredLog);
+        check(
+          "A: back on the stage each had, the three fields cleared (rows)",
+          rra?.stage === "new" && rrb?.stage === "contacted" && [rra, rrb].every((r) => r.unqualified_at === null && r.unqualified_reason === null && r.stage_before_unqualified === null),
+          { rra, rrb },
+        );
+        const [ra4, rb4] = await Promise.all([stageEvents(a.id), stageEvents(b.id)]);
+        check(
+          'A: one "Restored from unqualified to <stage>" event each, with { from, to }',
+          ra4.length === 2 && ra4[0].message === "Restored from unqualified to New" && sameList(ra4[0].data, { to: "new", from: "unqualified" }) && rb4[0].message === "Restored from unqualified to Contacted",
+          [ra4[0], rb4[0]],
+        );
+        const { value: restoreAgain, lines: restoreAgainLog } = await warnsDuring(() => post({ action: "restore", ids: [a.id] }));
+        check(
+          "A: restoring a lead that is not unqualified changes nothing (missing), and logs nothing",
+          restoreAgain.status === 200 && sameList(restoreAgain.data?.missing, [a.id]) && (await stageEvents(a.id)).length === 2 && restoreAgainLog.length === 0,
+          { data: restoreAgain.data, restoreAgainLog },
+        );
+        check("A: they are on the active list again", idsOf((await getList()).data).includes(a.id));
+
+        // Delete for good, as the single delete does: findings, events and raw rows go too.
+        await query("insert into le_findings (lead_id, source, kind, text) values ($1, 'notes', 'other', 'LE Qualify Test finding')", [a.id]);
+        await query("insert into le_raw (lead_id, provider, request) values ($1, 'test', '{}'::jsonb)", [a.id]);
+        const { value: del, lines: delLog } = await warnsDuring(() => post({ action: "delete", ids: [a.id, b.id, ghost] }));
+        check("A: bulk delete is 200 { deleted, missing }", del.status === 200 && sameList(del.data?.deleted, [a.id, b.id]) && sameList(del.data?.missing, [ghost]), del.data);
+        check("A: ... and one line in the server log, with the count and the ids deleted", sameList(delLog, [`[api] bulk delete: 2 of 3 leads: ${a.id} ${b.id}`]), delLog);
+        const leftovers = await query<{ n: number }>(
+          `select (select count(*) from le_leads where id = any($1::uuid[]))::int
+                + (select count(*) from le_events where lead_id = any($1::uuid[]))::int
+                + (select count(*) from le_findings where lead_id = any($1::uuid[]))::int
+                + (select count(*) from le_raw where lead_id = any($1::uuid[]))::int as n`,
+          [[a.id, b.id]],
+        );
+        check("A: the leads are gone with their events, findings and raw rows", leftovers[0]?.n === 0, leftovers[0]);
+        check("A: getLead after a bulk delete is null", (await getLead(a.id)) === null);
+      } finally {
+        await deleteLeads([a.id, b.id, c.id]).catch(() => undefined);
+      }
+    }
+
+    // ---- B: PATCH, both ways, and the reason rules
+    {
+      const d = await make("D", { stage: "researched" });
+      try {
+        const r1 = await patchLead(d.id, { unqualifiedReason: "Not a fit" });
+        check("B: PATCH a reason on an active lead is 400 that says why", r1.status === 400 && /only for an unqualified lead/.test(String(r1.data?.error)), r1.data);
+        const r2 = await patchLead(d.id, { stage: "contacted", unqualifiedReason: "Not a fit" });
+        check("B: PATCH a reason with another stage is 400", r2.status === 400 && /only for an unqualified lead/.test(String(r2.data?.error)), r2.data);
+        check("B: nothing was saved by the refusals", (await rowOf(d.id))?.stage === "researched");
+
+        const r3 = await patchLead(d.id, { stage: "unqualified", unqualifiedReason: "  No need right now  " });
+        const l3 = r3.data?.lead as Lead | undefined;
+        const row3 = await rowOf(d.id);
+        check(
+          "B: PATCH stage unqualified with a reason: marked, reason trimmed, stage before kept",
+          r3.status === 200 && l3?.stage === "unqualified" && l3.unqualifiedReason === "No need right now" && l3.stageBeforeUnqualified === "researched" && Boolean(row3?.unqualified_at),
+          l3 && { stage: l3.stage, reason: l3.unqualifiedReason, before: l3.stageBeforeUnqualified },
+        );
+        const e3 = await stageEvents(d.id);
+        check(
+          'B: PATCH logs one event, "Marked unqualified: <reason>" (no "Stage changed" event besides it)',
+          e3.length === 1 && e3[0].message === "Marked unqualified: No need right now" && sameList(e3[0].data, { to: "unqualified", from: "researched", reason: "No need right now" }),
+          e3,
+        );
+        check("B: justMarked is true for the lead the PATCH marked (the Pipeline offers Undo for it)", Boolean(l3 && justMarked(l3)), l3 && { at: l3.unqualifiedAt, updated: l3.updatedAt });
+        const r4 = await patchLead(d.id, { unqualifiedReason: "Competitor or partner" });
+        const row4 = await rowOf(d.id);
+        check("B: PATCH a reason on an unqualified lead replaces it; when it was marked is kept", r4.status === 200 && row4?.unqualified_reason === "Competitor or partner" && row4.unqualified_at === row3?.unqualified_at, row4);
+        const r4b = await patchLead(d.id, { unqualifiedReason: "‮Wrong\u0085person‬" });
+        check(
+          "B: PATCH a reason with a right-to-left override and a C1 control character: saved without them",
+          r4b.status === 200 && (await rowOf(d.id))?.unqualified_reason === "Wrong person" && (r4b.data?.lead as Lead | undefined)?.unqualifiedReason === "Wrong person",
+          r4b.data?.lead && (r4b.data.lead as Lead).unqualifiedReason,
+        );
+        const r5 = await patchLead(d.id, { unqualifiedReason: "" });
+        check('B: PATCH unqualifiedReason "" clears it', r5.status === 200 && (await rowOf(d.id))?.unqualified_reason === null, r5.data);
+        const r6 = await patchLead(d.id, { unqualifiedReason: "x".repeat(201) });
+        check("B: PATCH a reason over 200 characters is 400", r6.status === 400 && /200 characters/.test(String(r6.data?.error)), r6.data);
+        const r7 = await patchLead(d.id, { stage: "unqualified", owner: "Kim" });
+        const row7 = await rowOf(d.id);
+        check(
+          "B: PATCH stage unqualified again (with another field): saved, when and the stage before kept, no new event",
+          r7.status === 200 && (r7.data?.lead as Lead | undefined)?.owner === "Kim" && row7?.unqualified_at === row3?.unqualified_at && row7?.stage_before_unqualified === "researched" && (await stageEvents(d.id)).length === 1,
+          row7,
+        );
+        check("B: ... and justMarked is false for it (it was unqualified already: no Undo)", r7.data?.lead !== undefined && !justMarked(r7.data.lead as Lead));
+        const r8 = await patchLead(d.id, { stage: "nurture" });
+        const row8 = await rowOf(d.id);
+        const e8 = await stageEvents(d.id);
+        check(
+          "B: PATCH another stage on an unqualified lead: that stage, the three fields cleared",
+          r8.status === 200 && row8?.stage === "nurture" && row8.unqualified_at === null && row8.unqualified_reason === null && row8.stage_before_unqualified === null,
+          row8,
+        );
+        check('B: ... with one "Stage changed from Unqualified to Nurture" event', e8.length === 2 && e8[0].message === "Stage changed from Unqualified to Nurture" && sameList(e8[0].data, { to: "nurture", from: "unqualified" }), e8[0]);
+        const r9 = await patchLead(d.id, { stage: "unqualified" });
+        const e9 = await stageEvents(d.id);
+        check(
+          'B: PATCH stage unqualified without a reason: no reason, stage before nurture, "Marked unqualified" with reason null',
+          r9.status === 200 && (await rowOf(d.id))?.stage_before_unqualified === "nurture" && e9[0].message === "Marked unqualified" && (e9[0].data as { reason?: unknown })?.reason === null,
+          e9[0],
+        );
+        const r10 = await patchLead(d.id, { stage: "researched", unqualifiedReason: null });
+        check("B: PATCH another stage with unqualifiedReason null is 400 too (the lead would not be unqualified)", r10.status === 400 && (await rowOf(d.id))?.stage === "unqualified", r10.data);
+        // Mark as sent on an unqualified lead: it was contacted, so it is back on the lists as contacted.
+        const sent = await callRoute(asHandler(sentRoute.POST), { method: "POST", path: `/api/leads/${d.id}/sent`, id: d.id, body: { angleId: "a1", channel: "email" } });
+        const rowSent = await rowOf(d.id);
+        check(
+          "B: POST /sent on an unqualified lead moves it to contacted and clears the three fields",
+          sent.status === 200 && rowSent?.stage === "contacted" && rowSent.unqualified_at === null && rowSent.stage_before_unqualified === null,
+          rowSent,
+        );
+      } finally {
+        await deleteLeads([d.id]).catch(() => undefined);
+      }
+    }
+
+    // ---- C: research and an unqualified lead (repo functions only: no run, nothing is spent)
+    {
+      const e = await make("E");
+      try {
+        check("C: claimResearch on a new lead moves it to researching", (await claimResearch(e.id)) && (await rowOf(e.id))?.stage === "researching");
+        await unqualifyLeads([e.id], "Bad or duplicate data");
+        check("C: marked while the run goes: the stage before is researching", (await rowOf(e.id))?.stage_before_unqualified === "researching");
+        await setResearchStep(e.id, "Writing the brief");
+        await updateLead(e.id, { brief: QUALIFY_BRIEF, angles: [QUALIFY_ANGLE] });
+        const mid = await getLead(e.id);
+        check("C: the run's own writes still land (step, brief, angles), the lead stays unqualified", mid?.stage === "unqualified" && mid.researchStep === "Writing the brief" && mid.brief?.summary === QUALIFY_BRIEF.summary && mid.angles.length === 1, mid && { stage: mid.stage, step: mid.researchStep });
+        await finishResearch(e.id, "done");
+        const done = await rowOf(e.id);
+        check("C: finishResearch done: still unqualified (reason kept), research done", done?.stage === "unqualified" && done.research_status === "done" && done.research_step === null && done.unqualified_reason === "Bad or duplicate data", done);
+        check("C: claimResearch on an unqualified lead (a re-run) keeps it unqualified", (await claimResearch(e.id)) && (await rowOf(e.id))?.stage === "unqualified" && (await rowOf(e.id))?.research_status === "running");
+        await finishResearch(e.id, "error", "test failure");
+        check("C: finishResearch error: still unqualified", (await rowOf(e.id))?.stage === "unqualified" && (await rowOf(e.id))?.research_status === "error");
+        const backdate = () => query("update le_leads set research_started_at = now() - interval '7 minutes' where id = $1", [e.id]);
+        await claimResearch(e.id);
+        await backdate();
+        check("C: failStaleResearch (the reaper): still unqualified, research error", (await failStaleResearch(e.id, STALE_RUN_MS, "test: lost run")) && (await rowOf(e.id))?.stage === "unqualified" && (await rowOf(e.id))?.research_status === "error");
+        await claimResearch(e.id);
+        await backdate();
+        const errorsBefore = (await listEvents(e.id)).filter((ev) => ev.type === "error").length;
+        const view = await getList("?view=unqualified");
+        const reapedLead = ((view.data?.leads ?? []) as Lead[]).find((l) => l.id === e.id);
+        check(
+          "C: GET /api/leads?view=unqualified reaps a lost run in that view, and the lead stays unqualified",
+          view.status === 200 && reapedLead?.researchStatus === "error" && reapedLead.stage === "unqualified" && (await listEvents(e.id)).filter((ev) => ev.type === "error").length === errorsBefore + 1,
+          reapedLead && { status: reapedLead.researchStatus, stage: reapedLead.stage },
+        );
+        const beforeRestore = await getLead(e.id);
+        const [back] = await restoreLeads([e.id]);
+        check(
+          "C: restored after the run ended in error: researched (marked mid-run, and the brief and angles are there)",
+          back?.stage === "researched" && beforeRestore !== null && restoredStage(beforeRestore) === "researched",
+          back?.stage,
+        );
+      } finally {
+        await deleteLeads([e.id]).catch(() => undefined);
+      }
+    }
+
+    // ---- D: the SQL restore mapping agrees with restoredStage on every case
+    {
+      const leads = await Promise.all(RESTORE_CASES.map((_, i) => make(`R${i + 1}`)));
+      const ids = leads.map((l) => l.id);
+      try {
+        const marked = Date.now() - 3 * 60_000;
+        const states = RESTORE_CASES.map((c, i) => {
+          const input = restoreInput(c, marked);
+          return { id: ids[i], unqualified_at: input.unqualifiedAt, before: input.stageBeforeUnqualified, status: input.researchStatus, started_at: input.researchStartedAt, contacted_at: input.lastContactedAt, brief: input.brief, angles: input.angles };
+        });
+        // One statement sets every case up, so the leads are unqualified for three queries in all.
+        await query(
+          `update le_leads l
+              set stage = 'unqualified', unqualified_at = v.unqualified_at, stage_before_unqualified = v.before,
+                  research_status = v.status, research_started_at = v.started_at, last_contacted_at = v.contacted_at,
+                  brief = v.brief, angles = v.angles
+             from jsonb_to_recordset($1::jsonb) as v(id uuid, unqualified_at timestamptz, before text, status text, started_at timestamptz, contacted_at timestamptz, brief jsonb, angles jsonb)
+            where l.id = v.id`,
+          [JSON.stringify(states)],
+        );
+        const stored = await Promise.all(ids.map((id) => getLead(id)));
+        const restored = await restoreLeads(ids);
+        const byId = new Map(restored.map((l) => [l.id, l.stage]));
+        RESTORE_CASES.forEach((c, i) => {
+          const sqlStage = byId.get(ids[i]);
+          const tsStage = stored[i] ? restoredStage(stored[i]!) : null;
+          check(`D: restore in SQL and restoredStage agree: ${c.label} -> ${c.want}`, sqlStage === c.want && tsStage === c.want, { sql: sqlStage, ts: tsStage });
+        });
+        const events = await query<{ n: number }>("select count(*)::int as n from le_events where lead_id = any($1::uuid[]) and type = 'stage' and message like 'Restored from unqualified to %'", [ids]);
+        check(`D: one restore event per lead (${ids.length})`, events[0]?.n === ids.length, events[0]);
+      } finally {
+        await deleteLeads(ids).catch(() => undefined);
+      }
+    }
+
+    // ---- E: a PATCH and a bulk action at the same moment. The bulk unqualify is sent the instant
+    // the PATCH's own statement has answered, before the route goes on: the Activity log must still
+    // read in the order the changes happened (the PATCH writes its event in that statement).
+    {
+      const f = await make("F");
+      const inner = globalThis.fetch;
+      let raced = false;
+      try {
+        globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+          const res = await inner(input, init);
+          if (!raced && typeof init?.body === "string" && init.body.includes("with prev as materialized")) {
+            raced = true;
+            await unqualifyLeads([f.id], "Not a fit");
+          }
+          return res;
+        }) as typeof fetch;
+        const r = await patchLead(f.id, { stage: "contacted" });
+        globalThis.fetch = inner;
+        const row = await rowOf(f.id);
+        const events = await stageEvents(f.id); // newest first
+        // Replayed oldest first from "new", the events must end on the lead's stage.
+        const replayed = [...events].reverse().reduce<string | null>((at, e) => ((e.data as { from?: string })?.from === at ? ((e.data as { to?: string }).to ?? null) : null), "new");
+        check(
+          "E: PATCH stage and a bulk unqualify racing it: the newest Activity entry is the bulk mark, and the log replays to the lead's stage",
+          raced && r.status === 200 && row?.stage === "unqualified" && row.stage_before_unqualified === "contacted" && events.length === 2 && events[0].message === "Marked unqualified: Not a fit" && events[1].message === "Stage changed from New to Contacted" && replayed === "unqualified",
+          { raced, stage: row?.stage, events: events.map((e) => e.message), replayed },
+        );
+      } finally {
+        globalThis.fetch = inner;
+        await deleteLeads([f.id]).catch(() => undefined);
+      }
+    }
+    check("6: no after() task was recorded (nothing here starts a run)", afterTasks.length === tasksAtStart, afterTasks.length - tasksAtStart);
+  } finally {
+    const removed = await deleteLeads(made).catch(() => [] as string[]);
+    await sweepStale().catch(() => undefined);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    const left = await query<{ n: number }>("select count(*)::int as n from le_leads where id = any($1::uuid[]) or name like $2", [made, `${QUALIFY_PREFIX}%`]);
+    check(`6: every "${QUALIFY_PREFIX}" lead is gone (count 0)`, left[0]?.n === 0, left[0]);
+    console.log(`  (made ${made.length} temp leads; ${removed.length} were still there to delete at the end)`);
+    restoreEnv();
+  }
+}
+
 async function main(): Promise<void> {
   const started = Date.now();
   // Every provider call in this harness is mocked: keep those fake calls out of the usage ledger.
@@ -1303,6 +1988,7 @@ async function main(): Promise<void> {
     await testRoutes();
     await testHubSpot();
     await testRunGuards();
+    await testQualify();
   } finally {
     restoreEnv();
     globalThis.fetch = realFetch;

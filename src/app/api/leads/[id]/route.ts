@@ -1,13 +1,12 @@
 import { connection, type NextRequest } from "next/server";
 import { z } from "zod";
 import { normaliseLinkedinUrl } from "@/lib/http";
-import { addEvent, listEvents } from "@/lib/repo/events";
+import { listEvents } from "@/lib/repo/events";
 import { listFindings } from "@/lib/repo/findings";
 import { deleteLead, DuplicateLeadError, getLead, setLeadLinkedin, updateLead, type LeadPatch } from "@/lib/repo/leads";
-import { STAGE_LABELS, STAGES, type Lead, type LeadDetail } from "@/lib/types";
+import { STAGES, type Lead, type LeadDetail } from "@/lib/types";
 import {
   definedOnly,
-  errorText,
   fail,
   failStaleRun,
   isStaleRun,
@@ -18,6 +17,7 @@ import {
   optionalText,
   readJson,
   serverError,
+  unqualifiedReasonField,
   type LeadRouteContext,
 } from "../../_lib/api";
 
@@ -61,6 +61,8 @@ const LinkedinUrl = z
 
 const PatchBody = z.object({
   stage: z.enum(STAGES).optional(),
+  // Only while the lead is, or with this patch becomes, unqualified (checked in the handler). "" and null clear it.
+  unqualifiedReason: unqualifiedReasonField(),
   notes: optionalText(10_000),
   owner: optionalText(200),
   nextStepAt: NextStepAt,
@@ -103,10 +105,15 @@ export async function GET(_request: NextRequest, ctx: LeadRouteContext) {
 }
 
 /**
- * PATCH /api/leads/[id] -> { lead }. Logs a "stage" event when the stage changes.
- * linkedinUrl: normalised; 400 when it is not a LinkedIn profile URL, 409 { existingId } when
- * another lead has that profile; "" or null clears it. email: lower case, saved as an address
- * the team added (emailStatus "manual", no confidence); null clears it.
+ * PATCH /api/leads/[id] -> { lead }. Logs one "stage" event when the stage changes, in the same
+ * statement as the change: "Marked unqualified[: reason]" { from, to: "unqualified", reason } when
+ * it becomes unqualified (as the bulk action does), else "Stage changed from X to Y" { from, to }.
+ * stage "unqualified" follows the bulk action's rules (src/lib/repo/qualify.ts); any other stage
+ * clears the unqualified fields. unqualifiedReason (trimmed, at most 200 characters; "" or null
+ * clears it): 400 unless the lead is unqualified after this patch.
+ * linkedinUrl: normalised; 400 when it is not a LinkedIn profile URL, 409 { existingId,
+ * existingStage } when another lead has that profile; "" or null clears it. email: lower case,
+ * saved as an address the team added (emailStatus "manual", no confidence); null clears it.
  */
 export async function PATCH(request: NextRequest, ctx: LeadRouteContext) {
   const id = await leadIdFrom(ctx);
@@ -122,6 +129,9 @@ export async function PATCH(request: NextRequest, ctx: LeadRouteContext) {
   try {
     const before = await getLead(id);
     if (!before) return leadNotFound();
+    if (patch.unqualifiedReason !== undefined && (patch.stage ?? before.stage) !== "unqualified") {
+      return fail(400, 'unqualifiedReason is only for an unqualified lead. Send it with stage "unqualified", or mark the lead unqualified first.');
+    }
     // A hand-entered address replaces whatever Hunter found: it is the team's, with no score.
     if (patch.email !== undefined && patch.email !== before.email) {
       patch.emailConfidence = null;
@@ -133,26 +143,24 @@ export async function PATCH(request: NextRequest, ctx: LeadRouteContext) {
       try {
         lead = await setLeadLinkedin(id, linkedinUrl);
       } catch (err) {
-        if (err instanceof DuplicateLeadError) return fail(409, "Another lead already has this LinkedIn profile.", { existingId: err.existingId });
+        if (err instanceof DuplicateLeadError) {
+          return fail(409, "Another lead already has this LinkedIn profile.", { existingId: err.existingId, existingStage: err.existingStage });
+        }
         throw err;
       }
     }
-    if (lead && Object.keys(patch).length) lead = await updateLead(id, patch);
+    // The stage event is written by the update itself, from the stage it found under the row lock:
+    // a change made since `before` was read cannot log a wrong or second event, and a bulk action
+    // at the same moment cannot land between the change and its event.
+    if (lead && Object.keys(patch).length) lead = await updateLead(id, patch, { logStage: true });
     if (!lead) return leadNotFound(); // deleted in between
-
-    if (patch.stage && patch.stage !== before.stage) {
-      await addEvent(id, "stage", `Stage changed from ${STAGE_LABELS[before.stage] ?? before.stage} to ${STAGE_LABELS[patch.stage]}`, {
-        from: before.stage,
-        to: patch.stage,
-      }).catch((err) => console.error(`[api] could not log the stage event for lead ${id}: ${errorText(err)}`));
-    }
     return json({ lead });
   } catch (err) {
     return serverError("PATCH /api/leads/[id]", err);
   }
 }
 
-/** DELETE /api/leads/[id] -> { ok: true }. Findings, events and raw data go with it (on delete cascade). */
+/** DELETE /api/leads/[id] -> { ok: true }. Findings, events and raw data go with it (on delete cascade). POST /api/leads/bulk deletes many. */
 export async function DELETE(_request: NextRequest, ctx: LeadRouteContext) {
   const id = await leadIdFrom(ctx);
   if (!id) return leadNotFound();

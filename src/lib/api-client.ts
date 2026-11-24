@@ -3,13 +3,15 @@
  * Client-safe: imports types only, never server modules or secrets.
  */
 import type { ImportRow } from "./import/columns";
-import type { Angle, EmailStatus, ImportSource, Lead, LeadDetail, ProviderStatus, Settings, Stage } from "./types";
+import type { Angle, EmailStatus, ImportSource, Lead, LeadCounts, LeadDetail, LeadView, ProviderStatus, Settings, Stage } from "./types";
 
 /** An API failure with the HTTP status and the server's `{ error }` message. */
 export class ApiError extends Error {
   readonly status: number;
   /** Set on a 409 from POST /api/leads or PATCH /api/leads/[id]: the lead that already has this LinkedIn URL. */
   readonly existingId: string | null;
+  /** With existingId: that lead's stage, e.g. "unqualified" (the page can offer to restore it). Null when the server did not say. */
+  readonly existingStage: Stage | null;
   /** The server's machine-readable reason, when it sends one (e.g. "not_shared" for a private Google Sheet). */
   readonly code: string | null;
   /** The whole error body, for extra fields such as { limit, remaining } on an import's 429. */
@@ -22,6 +24,7 @@ export class ApiError extends Error {
     this.existingId = existingId;
     this.details = details;
     this.code = details && typeof details.code === "string" ? details.code : null;
+    this.existingStage = details && typeof details.existingStage === "string" ? (details.existingStage as Stage) : null;
   }
 }
 
@@ -39,7 +42,13 @@ export interface NewLeadInput {
 }
 
 export type LeadPatch = Partial<{
+  /** "unqualified" marks the lead (as unqualifyLeads does, with one "Marked unqualified" event); any other stage clears the unqualified fields. */
   stage: Stage;
+  /**
+   * Why the lead is unqualified: trimmed, at most 200 characters; "" or null clears it. Only while
+   * the lead is unqualified, or with stage "unqualified" in the same patch: otherwise a 400.
+   */
+  unqualifiedReason: string | null;
   notes: string | null;
   owner: string | null;
   nextStepAt: string | null;
@@ -97,6 +106,11 @@ export interface ImportDuplicate {
   match: "linkedin" | "hubspot" | "email" | "name";
   /** For a repeat inside the import: the index of the earlier row. */
   duplicateOf: number | null;
+  /**
+   * The stage of the lead in existingId ("new" for one this import created). "unqualified" means
+   * the row matched an unqualified lead: it was not added again, and the reason says so.
+   */
+  existingStage: Stage | null;
 }
 
 /** POST /api/leads/import. */
@@ -124,6 +138,24 @@ export interface EmailLookupResult {
 
 /** The most rows one import request may carry (the server refuses more). */
 export const IMPORT_BATCH_MAX = 1000;
+
+/** GET /api/leads[?view=]: one list (at most 500 leads) and how many leads each list has in all. */
+export interface LeadList {
+  leads: Lead[];
+  counts: LeadCounts;
+}
+
+/** POST /api/leads/bulk, unqualify and restore: the leads as they are now, and the ids that matched no lead (restore: no unqualified lead). */
+export interface BulkLeadsResult {
+  leads: Lead[];
+  missing: string[];
+}
+
+/** POST /api/leads/bulk, delete: the ids deleted, and the ids that matched no lead. */
+export interface BulkDeleteResult {
+  deleted: string[];
+  missing: string[];
+}
 
 // Requests only read or write our own database, so they are quick. Research itself
 // runs in the background after the response, which is why 30 s is generous.
@@ -206,7 +238,18 @@ function normalizeLead(raw: unknown): Lead {
     usage: isRecord(lead.usage) ? (lead.usage as Record<string, number>) : {},
     stage: lead.stage ?? "new",
     researchStatus: lead.researchStatus ?? "idle",
+    unqualifiedAt: lead.unqualifiedAt ?? null,
+    unqualifiedReason: lead.unqualifiedReason ?? null,
+    stageBeforeUnqualified: lead.stageBeforeUnqualified ?? null,
   };
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((x): x is string => typeof x === "string") : [];
+}
+
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function leadFrom(data: unknown): Lead {
@@ -215,9 +258,22 @@ function leadFrom(data: unknown): Lead {
 
 const enc = encodeURIComponent;
 
-export async function listLeads(): Promise<Lead[]> {
-  const data = await request<{ leads?: unknown }>("/api/leads");
-  return Array.isArray(data.leads) ? data.leads.map(normalizeLead) : [];
+/**
+ * One list of leads. "active" (the default): every lead that is not unqualified, as the Leads and
+ * Pipeline pages show them, most recently updated first. "unqualified": most recently marked
+ * first. At most 500 leads; counts are the totals of both lists.
+ */
+export async function listLeads(view: LeadView = "active"): Promise<LeadList> {
+  const data = await request<{ leads?: unknown; counts?: unknown }>(view === "active" ? "/api/leads" : `/api/leads?view=${enc(view)}`);
+  const leads = Array.isArray(data.leads) ? data.leads.map(normalizeLead) : [];
+  const counts: Record<string, unknown> = isRecord(data.counts) ? data.counts : {};
+  return {
+    leads,
+    counts: {
+      active: count(counts.active) ?? (view === "active" ? leads.length : 0),
+      unqualified: count(counts.unqualified) ?? (view === "unqualified" ? leads.length : 0),
+    },
+  };
 }
 
 export async function createLead(input: NewLeadInput): Promise<Lead> {
@@ -239,6 +295,33 @@ export async function updateLead(id: string, patch: LeadPatch): Promise<Lead> {
 
 export async function deleteLead(id: string): Promise<void> {
   await request(`/api/leads/${enc(id)}`, { method: "DELETE" });
+}
+
+function bulkLeadsFrom(data: Record<string, unknown>): BulkLeadsResult {
+  return { leads: Array.isArray(data.leads) ? data.leads.map(normalizeLead) : [], missing: strings(data.missing) };
+}
+
+/**
+ * Marks leads unqualified (1 to BULK_LEADS_MAX ids): they leave the Leads and Pipeline pages for the
+ * Unqualified view. reason: a label from UNQUALIFIED_REASONS or the team's own words (at most 200
+ * characters); without one a lead already unqualified keeps its own. Each newly marked lead logs
+ * one "Marked unqualified[: reason]" event.
+ */
+export async function unqualifyLeads(ids: readonly string[], reason?: string | null): Promise<BulkLeadsResult> {
+  const text = reason?.trim();
+  const body = text ? { action: "unqualify", ids, reason: text } : { action: "unqualify", ids };
+  return bulkLeadsFrom(await request<Record<string, unknown>>("/api/leads/bulk", { method: "POST", body }));
+}
+
+/** Puts unqualified leads back on the lists, on the stage they had (restoredStage in src/lib/qualify.ts). Ids of leads that are not unqualified come back in missing. */
+export async function restoreLeads(ids: readonly string[]): Promise<BulkLeadsResult> {
+  return bulkLeadsFrom(await request<Record<string, unknown>>("/api/leads/bulk", { method: "POST", body: { action: "restore", ids } }));
+}
+
+/** Deletes leads for good (1 to BULK_LEADS_MAX ids), with their findings and activity. */
+export async function deleteLeads(ids: readonly string[]): Promise<BulkDeleteResult> {
+  const data = await request<Record<string, unknown>>("/api/leads/bulk", { method: "POST", body: { action: "delete", ids } });
+  return { deleted: strings(data.deleted), missing: strings(data.missing) };
 }
 
 /** Starts a new research run. Rejects with status 409 when one is already running. */
@@ -292,7 +375,6 @@ export async function parseSheet(url: string): Promise<SheetTable> {
 /** Lists HubSpot contacts for an import (1 to 2,000, default 500). 400 with code "not_connected" when HubSpot has no token. */
 export async function getHubSpotContacts(limit = 500): Promise<HubSpotContacts> {
   const data = await request<Record<string, unknown>>(`/api/import/hubspot?limit=${enc(String(limit))}`, { timeoutMs: HUBSPOT_LIST_TIMEOUT_MS });
-  const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
   return { ...tableFrom(data), more: data.more === true, linkedinProperties: strings(data.linkedinProperties), warnings: strings(data.warnings) };
 }
 
@@ -308,6 +390,7 @@ function importResultFrom(data: Record<string, unknown>): ImportResult {
       reason: typeof d.reason === "string" ? d.reason : "",
       match: d.match === "linkedin" || d.match === "hubspot" || d.match === "name" ? d.match : "email",
       duplicateOf: typeof d.duplicateOf === "number" ? d.duplicateOf : null,
+      existingStage: typeof d.existingStage === "string" ? (d.existingStage as Stage) : null,
     })),
     skipped: list(data.skipped).map((k) => ({ index: Number(k.index), reason: typeof k.reason === "string" ? k.reason : "" })),
   };

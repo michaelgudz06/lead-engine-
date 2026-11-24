@@ -3,15 +3,16 @@ import { z } from "zod";
 import { trackResearchRun } from "@/lib/analytics-server";
 import { linkedinSlug, normaliseLinkedinUrl } from "@/lib/http";
 import { addEvent } from "@/lib/repo/events";
-import { createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
+import { countLeads, createLead, DuplicateLeadError, getLead, listLeads } from "@/lib/repo/leads";
 import { runResearch } from "@/lib/research/pipeline";
+import { LEAD_VIEWS, type LeadView, type Stage } from "@/lib/types";
 import {
   errorText,
   fail,
   failStaleRun,
   isStaleRun,
   json,
-  leadIdBySlug,
+  leadBySlug,
   optionalText,
   pgCode,
   readJson,
@@ -35,27 +36,49 @@ const CreateLeadBody = z.object({
   notes: optionalText(5000),
 });
 
-const DUPLICATE = "This person is already a lead.";
+/** The 409 for a person who is already a lead. existingStage lets the page offer to restore an unqualified one. */
+function duplicate(existingId: string, existingStage: Stage | null) {
+  const error = existingStage === "unqualified" ? "This person is already a lead (marked unqualified)." : "This person is already a lead.";
+  return fail(409, error, { existingId, existingStage });
+}
 
-/** GET /api/leads -> { leads } (most recently updated first). */
-export async function GET() {
+/** ?view=active|unqualified; missing or empty is "active". */
+function viewParam(request: NextRequest): { ok: true; view: LeadView } | { ok: false; error: string } {
+  const value = request.nextUrl.searchParams.get("view");
+  if (value === null || value === "") return { ok: true, view: "active" };
+  return (LEAD_VIEWS as readonly string[]).includes(value) ? { ok: true, view: value as LeadView } : { ok: false, error: 'view must be "active" or "unqualified".' };
+}
+
+/**
+ * GET /api/leads[?view=active|unqualified] -> { leads, counts: { active, unqualified } }.
+ * active (the default): every lead that is not unqualified, most recently updated first.
+ * unqualified: most recently marked first. Each list holds at most 500 leads; counts are the
+ * totals. Any other view is a 400.
+ */
+export async function GET(request: NextRequest) {
   await connection(); // reads the database: never prerender this at build time
+  const param = viewParam(request);
+  if (!param.ok) return fail(400, param.error);
+  const { view } = param;
   try {
-    let leads = await listLeads();
-    // A run that outlived its function was lost: fail it so the lists stop polling and it can be retried.
+    const [listed, counts] = await Promise.all([listLeads(view), countLeads()]);
+    let leads = listed;
+    // A run that outlived its function was lost: fail it so the lists stop polling and it can be
+    // retried. Only the stage of a "researching" lead changes, so the counts stay as they are.
     const stale = leads.filter((lead) => isStaleRun(lead));
     if (stale.length) {
       const reaped = await Promise.all(stale.map((lead) => failStaleRun(lead.id)));
-      if (reaped.some(Boolean)) leads = await listLeads();
+      if (reaped.some(Boolean)) leads = await listLeads(view);
     }
-    return json({ leads });
+    return json({ leads, counts });
   } catch (err) {
     return serverError("GET /api/leads", err);
   }
 }
 
 /**
- * POST /api/leads -> 201 { lead } with research already started; 409 { error, existingId } for a duplicate.
+ * POST /api/leads -> 201 { lead } with research already started; 409 { error, existingId, existingStage }
+ * for a duplicate (an unqualified one says so in the error).
  * Over the hourly or daily run cap the lead is still created, without a run, and an event says why.
  */
 export async function POST(request: NextRequest) {
@@ -69,11 +92,11 @@ export async function POST(request: NextRequest) {
     try {
       lead = await createLead({ ...body.data, linkedinUrl });
     } catch (err) {
-      if (err instanceof DuplicateLeadError) return fail(409, DUPLICATE, { existingId: err.existingId });
+      if (err instanceof DuplicateLeadError) return duplicate(err.existingId, err.existingStage);
       // Two requests for the same person raced past the duplicate check; the unique index stopped the second.
       if (pgCode(err) === "23505") {
-        const existingId = await leadIdBySlug(linkedinSlug(linkedinUrl));
-        if (existingId) return fail(409, DUPLICATE, { existingId });
+        const existing = await leadBySlug(linkedinSlug(linkedinUrl));
+        if (existing) return duplicate(existing.id, existing.stage);
       }
       throw err;
     }

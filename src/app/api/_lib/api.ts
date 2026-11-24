@@ -4,9 +4,10 @@ import { z } from "zod";
 import { db, query } from "@/lib/db";
 import { isEmailAddress } from "@/lib/email";
 import { optionalEnv } from "@/lib/env";
+import { cleanUnqualifiedReason } from "@/lib/qualify";
 import { addEvent } from "@/lib/repo/events";
 import { claimResearch, failStaleResearch, finishResearch } from "@/lib/repo/leads";
-import type { Lead } from "@/lib/types";
+import { UNQUALIFIED_REASON_MAX, type Lead, type Stage } from "@/lib/types";
 
 /**
  * Shared plumbing for the route handlers in src/app/api. The leading underscore
@@ -128,6 +129,23 @@ export function optionalEmail() {
     .transform((v) => (v === undefined ? undefined : v || null));
 }
 
+/**
+ * Why a lead is unqualified: text, cleaned with cleanUnqualifiedReason (bidirectional controls
+ * dropped, whitespace and control characters folded to single spaces, trimmed), then at most
+ * UNQUALIFIED_REASON_MAX (200) characters. "" and null come out as null; a missing field stays
+ * undefined.
+ */
+export function unqualifiedReasonField() {
+  return z
+    .string({ error: "Send it as text, or null." })
+    .nullable()
+    .optional()
+    .transform((v) => (v === undefined ? undefined : cleanUnqualifiedReason(v)))
+    .refine((v) => v == null || v.length <= UNQUALIFIED_REASON_MAX, {
+      message: `Keep it to ${UNQUALIFIED_REASON_MAX} characters or fewer.`,
+    });
+}
+
 /** Drops keys whose value is undefined, so a patch only carries what the client sent. */
 export function definedOnly<T extends Record<string, unknown>>(value: T): Partial<T> {
   return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
@@ -135,7 +153,8 @@ export function definedOnly<T extends Record<string, unknown>>(value: T): Partia
 
 // ------------------------------------------------------------------ route params
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A lead id: any UUID in its usual 8-4-4-4-12 hex form, either case. */
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LeadRouteContext = { params: Promise<{ id: string }> };
 
@@ -178,11 +197,11 @@ export function serverError(where: string, err: unknown): NextResponse {
 
 // ------------------------------------------------------------------ helpers
 
-/** The lead that already owns a LinkedIn slug, used when two creates race past the duplicate check. */
-export async function leadIdBySlug(slug: string | null): Promise<string | null> {
+/** The lead that already owns a LinkedIn slug, with its stage, used when two creates race past the duplicate check. */
+export async function leadBySlug(slug: string | null): Promise<{ id: string; stage: Stage } | null> {
   if (!slug) return null;
-  const rows = await query<{ id: string }>("select id from le_leads where linkedin_slug = $1 limit 1", [slug]);
-  return rows[0]?.id ?? null;
+  const rows = await query<{ id: string; stage: Stage }>("select id, stage from le_leads where linkedin_slug = $1 limit 1", [slug]);
+  return rows[0] ? { id: String(rows[0].id), stage: rows[0].stage } : null;
 }
 
 // ------------------------------------------------------------------ research run limits

@@ -432,7 +432,9 @@ async function findLinkedinProfile(leadId: string, lead: Lead, deadline: Deadlin
     if (!(err instanceof DuplicateLeadError)) throw err;
     const other = await getLead(err.existingId).catch(() => null);
     const who = other?.name?.trim() || other?.linkedinSlug || "another lead";
-    throw new ResearchStop(`Found their LinkedIn by search (${found}), but another lead already has that profile: ${who}. Open that lead instead, or delete one of the two.`);
+    // An unqualified lead is not on the Leads page: say where to find it.
+    const where = other?.stage === "unqualified" ? " (marked unqualified)" : "";
+    throw new ResearchStop(`Found their LinkedIn by search (${found}), but another lead already has that profile: ${who}${where}. Open that lead instead, or delete one of the two.`);
   }
   if (!saved) {
     // Someone added a URL on the lead page while this ran: use theirs.

@@ -15,7 +15,9 @@
  * 6. hubspot    GET /api/import/hubspot with a mocked HubSpot API: no token, paging, LinkedIn
  *               property detection, a missing schema scope
  * 7. import     POST /api/leads/import against Neon with temp leads: created, skipped, duplicates
- *               (existing and within the batch), events, no research, and the daily cap with a burst
+ *               (existing and within the batch, with the matched lead's stage), events, no research,
+ *               rows that match an unqualified lead (still duplicates: an import never brings one
+ *               back; its temp lead is unqualified for a few queries only), and the daily cap with a burst
  * 8. linkedin   research for a lead without a LinkedIn URL, with a mocked Exa: found and saved, not
  *               found (the run ends with the message), and a profile another lead already has
  * 9. email      POST /api/leads/[id]/email against Neon with a mocked Hunter: saved with its kind,
@@ -46,6 +48,7 @@ import { query } from "../src/lib/db";
 import { listEvents } from "../src/lib/repo/events";
 import { IMPORT_EVENT_MESSAGES } from "../src/lib/repo/import";
 import { createLead, deleteLead, getLead, updateLead } from "../src/lib/repo/leads";
+import { deleteLeads, unqualifyLeads } from "../src/lib/repo/qualify";
 import { creditUnits, DEFAULT_HUNTER_CREDITS_PER_DAY, DEFAULT_IMPORTS_PER_DAY, emailLookupLimitMessage, importLimitMessage, LOOKUP_MAX_UNITS, quotaLimit, quotaUsed } from "../src/lib/repo/quota";
 import { ResearchStop } from "../src/lib/research/context";
 import { identify, PROFILE_NOT_FOUND } from "../src/lib/research/identify";
@@ -397,6 +400,16 @@ function testPrepare(): void {
     "duplicate reasons",
     [duplicateReason("email", false), duplicateReason("linkedin", true), duplicateReason("name", false)],
     ["Already a lead with this email.", "Same LinkedIn profile as an earlier row in this import.", "Already a lead with this name and company."],
+  );
+  eq(
+    "duplicate reasons say when the lead is unqualified (never for a repeat inside the import)",
+    [duplicateReason("email", false, "unqualified"), duplicateReason("name", false, "unqualified"), duplicateReason("linkedin", false, "researched"), duplicateReason("hubspot", true, "unqualified")],
+    [
+      "Already a lead with this email (marked unqualified).",
+      "Already a lead with this name and company (marked unqualified).",
+      "Already a lead with this LinkedIn profile.",
+      "Same HubSpot contact as an earlier row in this import.",
+    ],
   );
   const long = prepareImport([{ name: "x".repeat(500), company: "Acme", notes: "n".repeat(9000) }], ids);
   check("long values are cut to the field limits", long.candidates[0]?.name?.length === 200 && long.candidates[0]?.notes?.length === 5000);
@@ -909,7 +922,7 @@ async function testHubSpot(): Promise<void> {
 
 // ------------------------------------------------------------------ 7. import (Neon)
 
-type Dup = { index: number; existingId: string | null; reason: string; match: string; duplicateOf: number | null };
+type Dup = { index: number; existingId: string | null; reason: string; match: string; duplicateOf: number | null; existingStage: string | null };
 
 async function testImport(): Promise<void> {
   section("7. import (Neon)");
@@ -961,10 +974,10 @@ async function testImport(): Promise<void> {
   ]);
   const idOf = (index: number) => created.find((c) => c.index === index)?.id ?? null;
   eq("import: duplicates (existing lead by profile and by email; repeats point at the lead made for the earlier row)", dups, [
-    { index: 6, existingId: existing.id, reason: "Already a lead with this LinkedIn profile.", match: "linkedin", duplicateOf: null },
-    { index: 7, existingId: existing.id, reason: "Already a lead with this email.", match: "email", duplicateOf: null },
-    { index: 8, existingId: idOf(1), reason: "Same email as an earlier row in this import.", match: "email", duplicateOf: 1 },
-    { index: 10, existingId: idOf(9), reason: "Same HubSpot contact as an earlier row in this import.", match: "hubspot", duplicateOf: 9 },
+    { index: 6, existingId: existing.id, reason: "Already a lead with this LinkedIn profile.", match: "linkedin", duplicateOf: null, existingStage: "new" },
+    { index: 7, existingId: existing.id, reason: "Already a lead with this email.", match: "email", duplicateOf: null, existingStage: "new" },
+    { index: 8, existingId: idOf(1), reason: "Same email as an earlier row in this import.", match: "email", duplicateOf: 1, existingStage: "new" },
+    { index: 10, existingId: idOf(9), reason: "Same HubSpot contact as an earlier row in this import.", match: "hubspot", duplicateOf: 9, existingStage: "new" },
   ]);
   check("import: no research started (nothing handed to after())", afterTasks.length === tasksBefore);
 
@@ -995,6 +1008,59 @@ async function testImport(): Promise<void> {
     noteIds(second);
     const dup = (second.data?.duplicates as Dup[] | undefined)?.[0];
     check("re-import after a rename: matched on the imported name and company, nothing created", Boolean(renamedId) && second.data?.created === 0 && dup?.existingId === renamedId && dup?.match === "name", second.data);
+  }
+
+  // A row that matches an unqualified lead is still a duplicate: an import never brings it back,
+  // and the reason says so. Its temp lead is unqualified for a few queries, then deleted.
+  {
+    // A run stopped in this block (Ctrl-C, a timeout) would leave its leads unqualified, under a
+    // name a later run's RUN does not match: remove any run's over 10 minutes old first, and
+    // delete this block's own on Ctrl-C or SIGTERM. scripts/test-api.ts sweeps the same names.
+    const sweepStale = () => query<{ id: string }>("delete from le_leads where name like 'LE Qualify Test %' and created_at < now() - interval '10 minutes' returning id");
+    const swept = await sweepStale();
+    if (swept.length) console.log(`  (removed ${swept.length} temp leads an earlier run left behind)`);
+    const nameRow = { name: `LE Qualify Test name ${RUN}`, company: "LE Qualify Co" };
+    const first = await send({ source: "csv", rows: [nameRow] });
+    noteIds(first);
+    const byName = (first.data?.createdIds as string[] | undefined)?.[0];
+    const gone = await tempLead({ name: `LE Qualify Test import ${RUN}`, email: `le.qualify.${RUN}@example.com`, emailStatus: "manual" });
+    const ids = [gone.id, ...(byName ? [byName] : [])];
+    const onSignal = (signal: NodeJS.Signals) =>
+      void deleteLeads(ids)
+        .catch(() => undefined)
+        .finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+    try {
+      await unqualifyLeads(ids, "Not a fit");
+      const rows = [
+        { name: "LE Qualify Test row 1", company: "Z", email: `LE.Qualify.${RUN}@Example.com` },
+        { linkedinUrl: gone.linkedinUrl, name: "LE Qualify Test row 2" },
+        { name: "LE Qualify Test row 3", company: "Y", email: `le.qualify.${RUN}@example.com` },
+        nameRow,
+      ];
+      const res = await send({ source: "sheet", rows });
+      noteIds(res);
+      eq(
+        "an unqualified lead: matched by email, profile and name, not added again; the reason and existingStage say so",
+        { created: res.data?.created, duplicates: res.data?.duplicates },
+        {
+          created: 0,
+          duplicates: [
+            { index: 0, existingId: gone.id, reason: "Already a lead with this email (marked unqualified).", match: "email", duplicateOf: null, existingStage: "unqualified" },
+            { index: 1, existingId: gone.id, reason: "Already a lead with this LinkedIn profile (marked unqualified).", match: "linkedin", duplicateOf: null, existingStage: "unqualified" },
+            { index: 2, existingId: gone.id, reason: "Same email as an earlier row in this import.", match: "email", duplicateOf: 0, existingStage: "unqualified" },
+            { index: 3, existingId: byName ?? null, reason: "Already a lead with this name and company (marked unqualified).", match: "name", duplicateOf: null, existingStage: "unqualified" },
+          ],
+        },
+      );
+      const after = await getLead(gone.id);
+      check("the unqualified lead stays as it was (stage, reason)", after?.stage === "unqualified" && after.unqualifiedReason === "Not a fit", after && { stage: after.stage, reason: after.unqualifiedReason });
+    } finally {
+      await deleteLeads(ids).catch(() => undefined);
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    }
   }
 
   for (const source of ["sheet", "hubspot"] as const) {

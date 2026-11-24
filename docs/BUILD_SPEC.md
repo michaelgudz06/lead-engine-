@@ -183,11 +183,12 @@ All JSON. Errors: `{ error: string }` with a 4xx/5xx status. Validate bodies wit
 
 | Method and path | Body | Response |
 | --- | --- | --- |
-| GET /api/leads | | `{ leads: Lead[] }` |
-| POST /api/leads | `{ linkedinUrl, name?, companyName?, notes? }` | 201 `{ lead }`; 409 `{ error, existingId }`; starts research with `claimResearch` + `after(() => runResearch(id))` |
+| GET /api/leads[?view=active\|unqualified] | | `{ leads: Lead[], counts: { active, unqualified } }`: at most 500 leads; `active` (the default) leaves out unqualified leads; any other view is a 400 (section 11) |
+| POST /api/leads | `{ linkedinUrl, name?, companyName?, notes? }` | 201 `{ lead }`; 409 `{ error, existingId, existingStage }` (the error says "(marked unqualified)" for such a lead); starts research with `claimResearch` + `after(() => runResearch(id))` |
 | GET /api/leads/[id] | | `LeadDetail` `{ lead, findings, events }`; 404 |
-| PATCH /api/leads/[id] | any of `stage, notes, owner, nextStepAt, email, name, title, companyName, angles, linkedinUrl` | `{ lead }` (log a `stage` event when the stage changes); `linkedinUrl` 409 `{ existingId }` when another lead has that profile; a typed `email` is saved as `manual` |
+| PATCH /api/leads/[id] | any of `stage, unqualifiedReason, notes, owner, nextStepAt, email, name, title, companyName, angles, linkedinUrl` | `{ lead }`; logs one `stage` event in the same statement when the stage changes ("Marked unqualified[: reason]" or "Stage changed from X to Y"); `unqualifiedReason` is a 400 unless the lead is unqualified after the patch; `linkedinUrl` 409 `{ existingId, existingStage }` when another lead has that profile; a typed `email` is saved as `manual` |
 | DELETE /api/leads/[id] | | `{ ok: true }` |
+| POST /api/leads/bulk | `{ action: "unqualify" \| "restore" \| "delete", ids (1 to 500), reason? }` | unqualify and restore: `{ leads, missing }`; delete: `{ deleted, missing }` (section 11) |
 | POST /api/leads/[id]/research | `{ focus? }` (up to 1,200 characters) | 202 `{ ok: true }`; 409 if already running; 429 over the run caps. A focus logs a `steer` event "Re-run: <focus>" |
 | POST /api/leads/[id]/steer | `{ instruction }` | 202 `{ ok: true }`; 409 if running |
 | POST /api/leads/[id]/sent | `{ angleId, channel: "email" \| "linkedin" }` | `{ lead }`: stage `contacted`, `lastContactedAt` now, `nextStepAt` now + `followUpDays`, `sent` event |
@@ -226,13 +227,17 @@ friendly empty and error states):
    name, title at company, stage chip and next-action label (`nextAction`). Search box.
    On wide screens, a two-column layout like the mock: list on the left, the selected lead
    on the right is optional; a simple list that links to `/leads/[id]` is fine.
+   An Active / Unqualified switch with counts (`/?view=unqualified`), a checkbox per row
+   (Select all, Shift-click for a range) and the selection's actions: Mark unqualified (with
+   an optional reason) and Delete on Active, Restore and Delete on Unqualified (section 11).
 3. **New lead** (`/leads/new` page or a modal): LinkedIn URL (required, validated), name,
    company, notes (textarea: "How you know them, what was said, what you want"). Submit ->
    navigate to the lead page. Handle 409 by linking to the existing lead.
 4. **Lead page `/leads/[id]`**: header (name, title at company, location, LinkedIn link,
    email if found, X handle if found); chips for stage (a select to change it), owner,
    follow-up date; actions: Re-run research, Push to HubSpot (disabled with reason when not
-   configured), Delete (confirm). While research runs: a live progress panel with the
+   configured), Remove (Mark unqualified or Delete for good). An unqualified lead shows a
+   notice with its reason (editable) and Restore. While research runs: a live progress panel with the
    current step and the latest events. Sections:
    - **Brief**: summary, bullets with small source links (finding ids -> finding url),
      pains, likely objections, questions for the first call.
@@ -246,8 +251,10 @@ friendly empty and error states):
    - **Findings**: all findings grouped by source, with title, text, date, link, and a toggle
      "Show filtered out" for findings that failed the criteria (show the reason).
    - **Activity**: the event timeline, newest first.
-5. **Pipeline `/pipeline`**: columns by stage (`STAGES`), compact cards, a stage select on
-   each card (PATCH).
+5. **Pipeline `/pipeline`**: columns by stage (`ACTIVE_STAGES`: every stage but
+   unqualified), compact cards, a stage select on each card (PATCH; Unqualified asks why,
+   then marks the lead and offers Undo), and a line "N unqualified leads are hidden" linking
+   to them.
 6. **Settings `/settings`**: sender name, sender email, Calendly link, email signature,
    follow-up days, criteria rules (editable list), and an Integrations panel from
    `GET /api/status` (configured or not, and why). Show the model line:
@@ -302,7 +309,7 @@ the URL could read leads and spend API credits. Add one shared team password:
 - Your final report lists: files written, what you tested and the output, what you could not
   test and why, anything another builder must know, and any foundation change you need.
 
-## 11. Additions after V1: import, email, usage
+## 11. Additions after V1: import, email, usage, unqualified leads
 
 **Data** (migrations 004 and 005, additive):
 
@@ -345,3 +352,28 @@ the old local-only `/admin` panel is gone.
 
 **Events:** `steer` for "Re-run: ...", `tool` for email lookups and "Found their LinkedIn by
 search: ...", `created` with `{ source }` for imports.
+
+**Unqualified leads (migration 006, additive):**
+
+- Stage `unqualified`, last in `STAGES` and apart from `lost` (a real opportunity that did
+  not close). `ACTIVE_STAGES` is every other stage. New columns: `unqualified_at` (set
+  exactly while the stage is `unqualified`), `unqualified_reason` (1 to 200 characters, or
+  null) and `stage_before_unqualified` (one of the active stages). Four named checks hold
+  these rules on every write; two partial indexes serve the two lists (500 rows each).
+- Marking keeps the lead and its research; the Leads and Pipeline pages leave it out, and an
+  import that matches it reports a duplicate "(marked unqualified)" with `existingStage`.
+  Marking a lead that is already unqualified keeps its date and earlier stage and logs no
+  second event. Research never moves a lead out of `unqualified`.
+- Restore (`restoredStage` in `src/lib/qualify.ts`, the same rule in SQL in
+  `src/lib/repo/qualify.ts`) goes back to the stage before, moved on only as research would
+  have moved it: a lead marked mid-run goes to `researching` while the run goes, else
+  `researched` or `new`.
+- `POST /api/leads/bulk` takes 1 to 500 UUIDs, lowercased and deduplicated, answered in the
+  order sent. Each action is one statement that locks its rows in id order (so two bulk
+  actions never deadlock) and writes its `stage` events with it: "Marked unqualified[:
+  reason]" `{ from, to, reason }` and "Restored from unqualified to <Stage>". Delete is for
+  good, like DELETE /api/leads/[id]. Each action that changed something logs one server line.
+- Rolling back to code from before 006 needs every unqualified lead restored first (README,
+  "Rolling back"); the migration can stay applied.
+- Analytics: `leads_unqualified { count, reason key or "none", surface }`,
+  `leads_restored { count, surface }`, `leads_deleted { count, surface }`.

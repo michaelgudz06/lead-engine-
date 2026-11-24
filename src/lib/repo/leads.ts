@@ -1,7 +1,8 @@
 import "server-only";
 import { json, query } from "../db";
 import { linkedinSlug, normaliseLinkedinUrl } from "../http";
-import type { EmailStatus, Lead, LeadSource, ResearchStatus } from "../types";
+import { cleanUnqualifiedReason, stageEventMessages } from "../qualify";
+import { LEAD_LIST_LIMIT, type EmailStatus, type Lead, type LeadCounts, type LeadSource, type LeadView, type ResearchStatus, type Stage } from "../types";
 import { toLead } from "./map";
 
 export interface CreateLeadInput {
@@ -16,7 +17,11 @@ export interface CreateLeadInput {
 }
 
 export class DuplicateLeadError extends Error {
-  constructor(public existingId: string) {
+  /** existingStage: the other lead's stage (null when not known), so a reply can say it is unqualified. */
+  constructor(
+    public existingId: string,
+    public existingStage: Stage | null = null,
+  ) {
     super("A lead with this LinkedIn profile already exists");
   }
 }
@@ -26,21 +31,22 @@ function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23505";
 }
 
-async function leadIdWithSlug(slug: string | null, exceptId?: string): Promise<string | null> {
+/** The lead (other than exceptId) that has this LinkedIn slug, with its stage. */
+export async function leadWithSlug(slug: string | null, exceptId?: string): Promise<{ id: string; stage: Stage } | null> {
   if (!slug) return null;
-  const rows = await query<{ id: string }>(
-    "select id from le_leads where linkedin_slug = $1 and ($2::uuid is null or id <> $2::uuid) limit 1",
+  const rows = await query<{ id: string; stage: Stage }>(
+    "select id, stage from le_leads where linkedin_slug = $1 and ($2::uuid is null or id <> $2::uuid) limit 1",
     [slug, exceptId ?? null],
   );
-  return rows[0]?.id ?? null;
+  return rows[0] ? { id: String(rows[0].id), stage: rows[0].stage } : null;
 }
 
 export async function createLead(input: CreateLeadInput): Promise<Lead> {
   const url = normaliseLinkedinUrl(input.linkedinUrl);
   if (!url) throw new Error("That does not look like a LinkedIn profile URL (linkedin.com/in/...)");
   const slug = linkedinSlug(url);
-  const existing = await leadIdWithSlug(slug);
-  if (existing) throw new DuplicateLeadError(existing);
+  const existing = await leadWithSlug(slug);
+  if (existing) throw new DuplicateLeadError(existing.id, existing.stage);
   const rows = await query(
     `insert into le_leads (linkedin_url, linkedin_slug, name, company_name, notes, owner, source)
      values ($1, $2, $3, $4, $5, $6, $7) returning *`,
@@ -68,8 +74,8 @@ export async function setLeadLinkedin(id: string, linkedinUrl: string | null, op
   const url = linkedinUrl === null ? null : normaliseLinkedinUrl(linkedinUrl);
   if (linkedinUrl !== null && !url) throw new Error("That does not look like a LinkedIn profile URL (linkedin.com/in/...)");
   const slug = url ? linkedinSlug(url) : null;
-  const other = await leadIdWithSlug(slug, id);
-  if (other) throw new DuplicateLeadError(other);
+  const other = await leadWithSlug(slug, id);
+  if (other) throw new DuplicateLeadError(other.id, other.stage);
   try {
     const rows = await query(
       `update le_leads set linkedin_url = $2, linkedin_slug = $3, updated_at = now()
@@ -81,8 +87,8 @@ export async function setLeadLinkedin(id: string, linkedinUrl: string | null, op
   } catch (err) {
     // Another lead took the profile between the check and the update: the unique index stopped it.
     if (isUniqueViolation(err)) {
-      const raced = await leadIdWithSlug(slug, id);
-      if (raced) throw new DuplicateLeadError(raced);
+      const raced = await leadWithSlug(slug, id);
+      if (raced) throw new DuplicateLeadError(raced.id, raced.stage);
     }
     throw err;
   }
@@ -119,9 +125,28 @@ export async function getLead(id: string): Promise<Lead | null> {
   return rows[0] ? toLead(rows[0]) : null;
 }
 
-export async function listLeads(): Promise<Lead[]> {
-  const rows = await query("select * from le_leads order by updated_at desc limit 500");
+/**
+ * One list, at most LEAD_LIST_LIMIT (500) leads. "active" (the Leads and Pipeline pages): every
+ * stage but unqualified, most recently updated first. "unqualified" (the Unqualified view): most
+ * recently marked first. The id breaks ties, so a batch marked or restored at once keeps its
+ * order between polls. The predicates are literals, so the partial indexes from migration 006 apply.
+ */
+export async function listLeads(view: LeadView = "active"): Promise<Lead[]> {
+  const rows =
+    view === "unqualified"
+      ? await query(`select * from le_leads where stage = 'unqualified' order by unqualified_at desc, id limit ${LEAD_LIST_LIMIT}`)
+      : await query(`select * from le_leads where stage <> 'unqualified' order by updated_at desc, id limit ${LEAD_LIST_LIMIT}`);
   return rows.map(toLead);
+}
+
+/** How many leads each list has in all (not capped at LEAD_LIST_LIMIT), in one query. */
+export async function countLeads(): Promise<LeadCounts> {
+  const rows = await query<{ active: number; unqualified: number }>(
+    `select count(*) filter (where stage <> 'unqualified')::int as active,
+            count(*) filter (where stage = 'unqualified')::int as unqualified
+       from le_leads`,
+  );
+  return { active: Number(rows[0]?.active ?? 0), unqualified: Number(rows[0]?.unqualified ?? 0) };
 }
 
 /** Columns the app may patch, camelCase -> snake_case. jsonb columns are flagged. */
@@ -137,7 +162,6 @@ const PATCHABLE: Record<string, { col: string; json?: boolean }> = {
   xHandle: { col: "x_handle" },
   location: { col: "location" },
   notes: { col: "notes" },
-  stage: { col: "stage" },
   owner: { col: "owner" },
   nextStepAt: { col: "next_step_at" },
   lastContactedAt: { col: "last_contacted_at" },
@@ -153,27 +177,120 @@ const PATCHABLE: Record<string, { col: string; json?: boolean }> = {
   usage: { col: "usage", json: true },
 };
 
-/** The LinkedIn profile changes through setLeadLinkedin (it must stay unique); source and HubSpot id are set once, on import. */
-export type LeadPatch = Partial<Omit<Lead, "id" | "linkedinUrl" | "linkedinSlug" | "source" | "hubspotContactId" | "createdAt" | "updatedAt">>;
+/**
+ * The LinkedIn profile changes through setLeadLinkedin (it must stay unique); source and HubSpot
+ * id are set once, on import; unqualifiedAt and stageBeforeUnqualified follow the stage.
+ */
+export type LeadPatch = Partial<
+  Omit<Lead, "id" | "linkedinUrl" | "linkedinSlug" | "source" | "hubspotContactId" | "unqualifiedAt" | "stageBeforeUnqualified" | "createdAt" | "updatedAt">
+>;
 
-export async function updateLead(id: string, patch: LeadPatch): Promise<Lead | null> {
+/**
+ * SET clauses for patch.stage and patch.unqualifiedReason. In SQL, from the row as it is, so
+ * every caller obeys the unqualified rules (migration 006 checks them as well):
+ * - to "unqualified": unqualified_at and stage_before_unqualified are set when the lead is
+ *   marked. Marking a lead that is already unqualified keeps both, and its reason unless the
+ *   patch has one.
+ * - to any other stage: all three unqualified fields are cleared.
+ * - unqualifiedReason (cleaned with cleanUnqualifiedReason) is saved only when the lead is
+ *   unqualified after the update (the PATCH route refuses it otherwise); null or "" clears it.
+ */
+function stageSets(patch: LeadPatch, param: (value: unknown) => string): string[] {
+  const sets: string[] = [];
+  const stage = patch.stage === undefined ? "stage" : `${param(patch.stage)}::text`;
+  if (patch.stage !== undefined) {
+    sets.push(
+      `stage = ${stage}`,
+      `unqualified_at = case when ${stage} = 'unqualified' then coalesce(unqualified_at, now()) end`,
+      `stage_before_unqualified = case when ${stage} = 'unqualified' then (case when stage = 'unqualified' then stage_before_unqualified else stage end) end`,
+    );
+  }
+  if (patch.unqualifiedReason !== undefined) {
+    sets.push(`unqualified_reason = case when ${stage} = 'unqualified' then ${param(cleanUnqualifiedReason(patch.unqualifiedReason))}::text end`);
+  } else if (patch.stage !== undefined) {
+    sets.push(`unqualified_reason = case when ${stage} = 'unqualified' then unqualified_reason end`);
+  }
+  return sets;
+}
+
+export interface UpdateLeadOptions {
+  /**
+   * When the stage changes, write its one "stage" event in the same statement (the PATCH route):
+   * "Marked unqualified[: reason]" { from, to: "unqualified", reason } when the lead becomes
+   * unqualified, else "Stage changed from X to Y" { from, to }. Nothing when the stage stays.
+   * The event is written after the row lock, as the bulk actions write theirs, so the Activity
+   * log lists stage changes in the order they happened, even when a bulk action races this update.
+   */
+  logStage?: boolean;
+}
+
+/**
+ * updateLead, plus the stage the lead had just before this update: read and locked in the same
+ * statement (FOR UPDATE), so a concurrent change cannot make it stale. Null when the lead does
+ * not exist.
+ */
+export async function updateLeadWithPrevious(id: string, patch: LeadPatch, opts: UpdateLeadOptions = {}): Promise<{ lead: Lead; previousStage: Stage } | null> {
   const sets: string[] = [];
   const params: unknown[] = [];
+  const param = (value: unknown) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
   for (const [key, value] of Object.entries(patch)) {
     const spec = PATCHABLE[key];
     if (!spec || value === undefined) continue;
-    params.push(spec.json ? json(value) : value);
-    sets.push(`${spec.col} = $${params.length}${spec.json ? "::jsonb" : ""}`);
+    sets.push(`${spec.col} = ${param(spec.json ? json(value) : value)}${spec.json ? "::jsonb" : ""}`);
   }
-  if (!sets.length) return getLead(id);
-  params.push(id);
+  sets.push(...stageSets(patch, param));
+  if (!sets.length) {
+    const lead = await getLead(id);
+    return lead ? { lead, previousStage: lead.stage } : null;
+  }
+  const idRef = `${param(id)}::uuid`;
+  if (patch.stage === undefined) {
+    // The stage does not change here, so the one it had is the one it has.
+    const rows = await query(`update le_leads set ${sets.join(", ")}, updated_at = now() where id = ${idRef} returning *`, params);
+    if (!rows[0]) return null;
+    const lead = toLead(rows[0]);
+    return { lead, previousStage: lead.stage };
+  }
+  // A lead that becomes unqualified here was not unqualified before, so its reason once marked is
+  // the patch's (cleaned as stageSets saves it) or none.
+  const messages = opts.logStage
+    ? param(json(stageEventMessages(patch.stage, patch.unqualifiedReason === undefined ? null : cleanUnqualifiedReason(patch.unqualifiedReason))))
+    : null;
   const rows = await query(
-    `update le_leads set ${sets.join(", ")}, updated_at = now() where id = $${params.length} returning *`,
+    `with prev as materialized (
+       select id as prev_id, stage as prev_stage from le_leads where id = ${idRef} for update
+     ), updated as (
+       update le_leads set ${sets.join(", ")}, updated_at = now()
+         from prev
+        where le_leads.id = prev.prev_id
+       returning le_leads.*, prev.prev_stage
+     )${
+       messages
+         ? `, logged as (
+       insert into le_events (lead_id, type, message, data)
+       select id, 'stage', coalesce(${messages}::jsonb ->> prev_stage, 'Stage changed'),
+              case when stage = 'unqualified'
+                   then jsonb_build_object('from', prev_stage, 'to', stage, 'reason', unqualified_reason)
+                   else jsonb_build_object('from', prev_stage, 'to', stage) end
+         from updated
+        where prev_stage <> stage
+     )`
+         : ""
+     }
+     select * from updated`,
     params,
   );
-  return rows[0] ? toLead(rows[0]) : null;
+  return rows[0] ? { lead: toLead(rows[0]), previousStage: rows[0].prev_stage as Stage } : null;
 }
 
+export async function updateLead(id: string, patch: LeadPatch, opts: UpdateLeadOptions = {}): Promise<Lead | null> {
+  return (await updateLeadWithPrevious(id, patch, opts))?.lead ?? null;
+}
+
+/** Deletes the lead for good: its findings, events and raw data go with it (on delete cascade); usage rows keep its name. */
 export async function deleteLead(id: string): Promise<boolean> {
   const rows = await query("delete from le_leads where id = $1 returning id", [id]);
   return rows.length > 0;
@@ -182,6 +299,8 @@ export async function deleteLead(id: string): Promise<boolean> {
 /**
  * Atomically marks research as running. Returns false if a run is already in
  * progress (started less than 15 minutes ago), so two clicks never start two runs.
+ * Only "new" and "researched" move to "researching": any other stage, "unqualified" included,
+ * stays as it is.
  */
 export async function claimResearch(id: string): Promise<boolean> {
   const rows = await query(
@@ -208,9 +327,14 @@ export async function setResearchStep(id: string, step: string): Promise<void> {
  * 'new'. Typed checks, so a JSON null or an odd shape counts as nothing instead of
  * failing the update.
  */
-const HAS_RESEARCH = `(jsonb_typeof(brief) = 'object'
+export const HAS_RESEARCH_SQL = `(jsonb_typeof(brief) = 'object'
   or (case when jsonb_typeof(angles) = 'array' then jsonb_array_length(angles) > 0 else false end))`;
 
+/**
+ * Records how a run ended. Only a lead still "researching" moves on (to "researched" or "new"):
+ * a stage changed during the run, "unqualified" included, is kept, and the run's other writes
+ * (brief, angles, research_status) land either way.
+ */
 export async function finishResearch(
   id: string,
   status: Exclude<ResearchStatus, "running" | "idle">,
@@ -219,7 +343,7 @@ export async function finishResearch(
   await query(
     `update le_leads
         set research_status = $2, research_error = $3, research_step = null, research_finished_at = now(),
-            stage = case when stage = 'researching' then (case when $2 = 'done' or ${HAS_RESEARCH} then 'researched' else 'new' end) else stage end,
+            stage = case when stage = 'researching' then (case when $2 = 'done' or ${HAS_RESEARCH_SQL} then 'researched' else 'new' end) else stage end,
             updated_at = now()
       where id = $1`,
     [id, status, error ?? null],
@@ -229,13 +353,14 @@ export async function finishResearch(
 /**
  * Marks a run that has been 'running' for longer than `olderThanMs` as failed (it was
  * lost: the function was killed or the server restarted), with finishResearch's stage
- * rule. False when there is no such run: it finished meanwhile, or it is younger.
+ * rule (an unqualified lead stays unqualified). False when there is no such run: it finished
+ * meanwhile, or it is younger.
  */
 export async function failStaleResearch(id: string, olderThanMs: number, error: string): Promise<boolean> {
   const rows = await query(
     `update le_leads
         set research_status = 'error', research_error = $2, research_step = null, research_finished_at = now(),
-            stage = case when stage = 'researching' then (case when ${HAS_RESEARCH} then 'researched' else 'new' end) else stage end,
+            stage = case when stage = 'researching' then (case when ${HAS_RESEARCH_SQL} then 'researched' else 'new' end) else stage end,
             updated_at = now()
       where id = $1 and research_status = 'running'
         and research_started_at < now() - make_interval(secs => $3)

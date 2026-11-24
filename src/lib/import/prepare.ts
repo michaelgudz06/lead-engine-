@@ -1,6 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { linkedinSlug, normaliseLinkedinUrl } from "../http";
+import type { Stage } from "../types";
 import { cellEmail, cellHubspotId, cellText, IMPORT_FIELD_MAX, looksLikeEmail, type ImportRow } from "./columns";
 
 /**
@@ -48,10 +49,14 @@ export const SKIP_REASONS = {
   badEmail: "The email address is not valid.",
 } as const;
 
-/** Duplicate reasons, for the import's reply. */
-export function duplicateReason(match: ImportMatch, inBatch: boolean): string {
+/**
+ * Duplicate reasons, for the import's reply. A row that matches an unqualified lead is a
+ * duplicate too (an import never brings it back), and the reason says so.
+ */
+export function duplicateReason(match: ImportMatch, inBatch: boolean, existingStage?: Stage | null): string {
   const what = match === "linkedin" ? "LinkedIn profile" : match === "hubspot" ? "HubSpot contact" : match === "email" ? "email" : "name and company";
-  return inBatch ? `Same ${what} as an earlier row in this import.` : `Already a lead with this ${what}.`;
+  if (inBatch) return `Same ${what} as an earlier row in this import.`;
+  return existingStage === "unqualified" ? `Already a lead with this ${what} (marked unqualified).` : `Already a lead with this ${what}.`;
 }
 
 /** "Jane  Doe" + "ACME" -> "jane doe|acme": the key for matching on name and company. */

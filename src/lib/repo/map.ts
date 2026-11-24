@@ -1,5 +1,5 @@
 import "server-only";
-import { EMAIL_STATUSES, LEAD_SOURCES, type Finding, type Lead, type LeadEvent } from "../types";
+import { ACTIVE_STAGES, EMAIL_STATUSES, LEAD_SOURCES, type Finding, type Lead, type LeadEvent } from "../types";
 
 type Row = Record<string, unknown>;
 
@@ -29,6 +29,9 @@ export function toLead(r: Row): Lead {
     location: str(r.location),
     notes: str(r.notes),
     stage: r.stage as Lead["stage"],
+    unqualifiedAt: iso(r.unqualified_at),
+    unqualifiedReason: str(r.unqualified_reason),
+    stageBeforeUnqualified: oneOf(r.stage_before_unqualified, ACTIVE_STAGES),
     owner: str(r.owner),
     nextStepAt: iso(r.next_step_at),
     lastContactedAt: iso(r.last_contacted_at),

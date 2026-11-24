@@ -2,18 +2,20 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { daysFromNow, track } from "@/lib/analytics";
-import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, rerunResearch, steerLead, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
-import type { Finding, Lead, LeadDetail } from "@/lib/types";
+import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, rerunResearch, restoreLeads, steerLead, unqualifyLeads, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
+import { justMarked } from "@/lib/qualify";
+import { STAGE_LABELS, UNQUALIFIED_REASONS, type Finding, type Lead, type LeadDetail, type Stage, type UnqualifiedReasonKey } from "@/lib/types";
 import { formatDate, formatDateTime, fromDateInput, hostOf, isRunning, leadName, safeUrl, settleLostRun, titleAtCompany, toDateInput } from "@/components/format";
 import { AnglesSection } from "@/components/lead/angles";
 import { AddLinkedinCard, EmailControl, LinkedinForm, NoLinkedinChip, emailKindText } from "@/components/lead/contact";
 import { Panel } from "@/components/lead/panel";
 import { RerunPanel } from "@/components/lead/rerun";
 import { leadAction } from "@/components/lead/status";
+import { ReasonChips, UnqualifyDialog, reasonLabel, unqualifiedSummary } from "@/components/lead/unqualify";
 import { ActivitySection, BriefSection, CompanySection, FindingsSection, PendingPanel, ResearchProgress } from "@/components/lead/sections";
-import { Button, Chip, ConfirmDialog, ErrorState, ExternalLink, Label, Notice, Skeleton, StageSelect } from "@/components/ui";
+import { Button, Chip, ConfirmDialog, ErrorState, ExternalLink, Label, Modal, Notice, Skeleton, StageSelect } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
 type Loaded = LeadDetail | "missing";
@@ -92,9 +94,27 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     rerunButton.current?.focus();
   }
   const [pushing, setPushing] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const unqualified = lead.stage === "unqualified";
+  // "Remove" opens one dialog with both ways out: mark unqualified, or delete for good.
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removing, setRemoving] = useState<"unqualify" | "delete" | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  // Choosing Unqualified in the Stage select asks why first, so an arrow key on the select only opens the question.
+  const [askUnqualify, setAskUnqualify] = useState(false);
+  const [savingReason, setSavingReason] = useState(false);
+  // Said to screen readers when a lead is marked: a live region that is always there, so the
+  // change of its text is announced (a notice that appears with its text may not be). Cleared
+  // when the lead is restored, so marking it again is said again.
+  const [said, setSaid] = useState("");
+  // After a lead is marked or restored, focus moves to the notice that says so (its Restore
+  // button when there is one). An effect, so it runs after the dialog has closed.
+  const notices = useRef<HTMLDivElement>(null);
+  const restoreButton = useRef<HTMLButtonElement>(null);
+  const [focusNotices, setFocusNotices] = useState(0);
+  useEffect(() => {
+    if (focusNotices > 0) (restoreButton.current ?? notices.current)?.focus();
+  }, [focusNotices]);
 
   const findingMap = useMemo(() => new Map<string, Finding>(findings.map((f) => [f.id, f])), [findings]);
 
@@ -143,10 +163,10 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   }
 
   /** Saves a change. Resolves to false (after putting the old value back) when it fails. */
-  async function patch(change: LeadPatch): Promise<boolean> {
+  async function patch(change: LeadPatch, alsoShow: Partial<Lead> = {}): Promise<boolean> {
     setActionError(null);
     const before = lead;
-    setLead({ ...lead, ...change } as Lead);
+    setLead({ ...lead, ...change, ...alsoShow } as Lead);
     try {
       setLead(await updateLead(lead.id, change));
       if (change.stage) void reload(); // brings in the new "stage" event
@@ -176,15 +196,114 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     }
   }
 
+  /**
+   * The Stage select. Unqualified opens the question that Remove asks (why, then mark); nothing is
+   * saved until it is answered, and the select shows the old stage again if it is cancelled. Any
+   * other stage on an unqualified lead restores it to that stage.
+   */
+  async function changeStage(stage: Stage) {
+    const from = lead.stage;
+    if (stage === from) return;
+    if (stage === "unqualified") {
+      setRemoveError(null);
+      setAskUnqualify(true);
+      return;
+    }
+    setNotice(null);
+    // Shown at once, with the fields the server will clear; patch() puts the old lead back if the save fails.
+    const shown: Partial<Lead> = from === "unqualified" ? { unqualifiedAt: null, unqualifiedReason: null, stageBeforeUnqualified: null } : {};
+    const ok = await patch({ stage }, shown);
+    if (!ok) return;
+    if (from === "unqualified") {
+      track("leads_restored", { count: 1, surface: "lead" });
+      setSaid("");
+      setNotice(`Restored to ${STAGE_LABELS[stage]}. This lead is back in Active and on the pipeline.`);
+    } else {
+      track("stage_changed", { leadId: lead.id, from, to: stage, surface: "lead" });
+    }
+  }
+
+  /** A quick pick on an unqualified lead's notice: sets the reason, or clears it when pressed again. */
+  async function saveReason(key: UnqualifiedReasonKey | null) {
+    setSavingReason(true);
+    setNotice(null);
+    await patch({ unqualifiedReason: reasonLabel(key) });
+    setSavingReason(false);
+  }
+
+  /** Mark as sent on an unqualified lead puts it back as contacted: say so, as Restore does. */
+  function onAnglesChange(next: Lead) {
+    if (unqualified && next.stage !== "unqualified") {
+      track("leads_restored", { count: 1, surface: "lead" });
+      setSaid("");
+      setNotice(`Marked as sent. This lead is back in Active and on the pipeline, as ${STAGE_LABELS[next.stage]}.`);
+    }
+    setLead(next);
+  }
+
+  function openRemove() {
+    setRemoveError(null);
+    setRemoveOpen(true);
+  }
+
+  async function markUnqualified(reason: UnqualifiedReasonKey | null) {
+    setRemoving("unqualify");
+    setRemoveError(null);
+    try {
+      const res = await unqualifyLeads([lead.id], reasonLabel(reason));
+      const marked = res.leads[0];
+      if (!marked) throw new Error("This lead is no longer there. It may have been deleted.");
+      // Counted once: not when someone else had marked it already.
+      if (justMarked(marked)) track("leads_unqualified", { count: 1, reason: reason ?? "none", surface: "lead" });
+      setActionError(null);
+      setNotice(null);
+      setLead(marked);
+      setRemoveOpen(false);
+      setAskUnqualify(false);
+      setSaid("Marked unqualified. This lead is hidden from Active and the pipeline.");
+      setFocusNotices((n) => n + 1);
+      void reload(); // brings in the "Marked unqualified" event
+    } catch (err) {
+      setRemoveError(errorMessage(err));
+    } finally {
+      setRemoving(null);
+    }
+  }
+
+  async function restore() {
+    setRestoring(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const res = await restoreLeads([lead.id]);
+      const restored = res.leads[0];
+      if (restored) {
+        track("leads_restored", { count: 1, surface: "lead" });
+        setSaid("");
+        setLead(restored);
+        setNotice(`Restored to ${STAGE_LABELS[restored.stage]}. This lead is back in Active and on the pipeline.`);
+        setFocusNotices((n) => n + 1);
+      }
+      // Not restored: someone else already did, or deleted it. The reload shows which.
+      void reload();
+    } catch (err) {
+      setActionError(`Could not restore: ${errorMessage(err)}`);
+    } finally {
+      setRestoring(false);
+    }
+  }
+
   async function remove() {
-    setDeleting(true);
-    setDeleteError(null);
+    setRemoving("delete");
+    setRemoveError(null);
     try {
       await deleteLead(lead.id);
-      router.push("/");
+      track("leads_deleted", { count: 1, surface: "lead" });
+      router.push(unqualified ? "/?view=unqualified" : "/");
+      // Stay busy while the list loads, so nothing on this page can be pressed again.
     } catch (err) {
-      setDeleteError(errorMessage(err));
-      setDeleting(false);
+      setRemoveError(errorMessage(err));
+      setRemoving(null);
     }
   }
 
@@ -206,11 +325,12 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   const action = leadAction(settleLostRun(lead));
   const hasResearch = Boolean(lead.brief || lead.companyPicture || lead.angles.length > 0);
   const emailKind = emailKindText(lead, "short");
+  const unqualifiedNote = unqualifiedSummary(lead);
 
   return (
     <>
-      <Link href="/" className="mb-4 inline-block text-[13.5px] text-quiet hover:text-ink">
-        ← Leads
+      <Link href={unqualified ? "/?view=unqualified" : "/"} className="mb-4 inline-block text-[13.5px] text-quiet hover:text-ink">
+        ← {unqualified ? "Unqualified leads" : "Leads"}
       </Link>
 
       <header className="mb-6 flex flex-wrap items-start justify-between gap-x-6 gap-y-4">
@@ -256,13 +376,28 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
           <Button onClick={hubspot} busy={pushing} disabledReason={hubspotReason} tipEnd>
             Push to HubSpot
           </Button>
-          <Button variant="danger" onClick={() => { setDeleteError(null); setConfirmDelete(true); }}>
-            Delete
+          <Button variant="danger" onClick={openRemove} aria-haspopup="dialog">
+            Remove
           </Button>
         </div>
       </header>
 
-      <div className="mb-5 space-y-3 empty:hidden">
+      <div ref={notices} tabIndex={-1} className="mb-5 space-y-3 rounded-lg empty:hidden">
+        {unqualified && (
+          <Notice
+            tone="info"
+            action={
+              <Button ref={restoreButton} size="sm" onClick={() => void restore()} busy={restoring}>
+                Restore
+              </Button>
+            }
+          >
+            <span className="font-medium">Unqualified.</span> <bdi>{unqualifiedNote.reason}</bdi> · {unqualifiedNote.marked}. This lead is hidden from Active and the pipeline, and imports skip it.
+            <div className="mt-2.5">
+              <ReasonChips value={UNQUALIFIED_REASONS.find((r) => r.label === lead.unqualifiedReason)?.key ?? null} onChange={(key) => void saveReason(key)} disabled={savingReason} />
+            </div>
+          </Notice>
+        )}
         {actionError && <Notice>{actionError}</Notice>}
         {notice && <Notice tone="success">{notice}</Notice>}
         {refreshError && <Notice>Live updates paused: {refreshError} Retrying…</Notice>}
@@ -312,7 +447,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
           {lead.brief ? <BriefSection brief={lead.brief} findings={findingMap} /> : running && <PendingPanel title="Brief" lines={5} />}
           {lead.companyPicture ? <CompanySection company={lead.companyPicture} findings={findingMap} /> : running && <PendingPanel title="Company picture" lines={3} />}
           {lead.angles.length > 0 ? (
-            <AnglesSection lead={lead} findings={findingMap} locked={running} onLeadChange={setLead} onActivity={() => void reload()} />
+            <AnglesSection lead={lead} findings={findingMap} locked={running} onLeadChange={onAnglesChange} onActivity={() => void reload()} />
           ) : (
             running && <PendingPanel title="Angles" lines={4} />
           )}
@@ -333,12 +468,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
                 <StageSelect
                   id="stage"
                   value={lead.stage}
-                  onChange={(stage) => {
-                    const from = lead.stage;
-                    void patch({ stage }).then((ok) => {
-                      if (ok && stage !== from) track("stage_changed", { leadId: lead.id, from, to: stage, surface: "lead" });
-                    });
-                  }}
+                  onChange={(stage) => void changeStage(stage)}
                 />
               </div>
               <EmailControl lead={lead} running={running} onLeadChange={setLead} onActivity={() => void reload()} />
@@ -434,10 +564,97 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         </aside>
       </div>
 
-      <ConfirmDialog open={confirmDelete} title="Delete this lead?" confirmLabel="Delete lead" busy={deleting} error={deleteError} onConfirm={remove} onCancel={() => setConfirmDelete(false)}>
-        {leadName(lead)}, with the brief, drafts, findings and activity, will be removed for good.
+      <p role="status" className="sr-only">
+        {said}
+      </p>
+      {/* The Stage select's question: the same one Remove asks, for this lead. */}
+      <UnqualifyDialog open={askUnqualify} count={1} busy={removing === "unqualify"} error={removeError} onConfirm={(reason) => void markUnqualified(reason)} onCancel={() => setAskUnqualify(false)} />
+      {/* An unqualified lead is already hidden, so the only way further is to delete it. */}
+      <ConfirmDialog open={removeOpen && unqualified} title="Delete this lead for good?" confirmLabel="Delete for good" busy={removing === "delete"} error={removeError} onConfirm={() => void remove()} onCancel={() => setRemoveOpen(false)}>
+        {leadName(lead)} goes with the research, drafts and activity, and a later import can add them again. Left unqualified, the lead stays hidden and out of imports.
       </ConfirmDialog>
+      <RemoveDialog
+        open={removeOpen && !unqualified}
+        name={leadName(lead)}
+        busy={removing}
+        error={removeError}
+        onUnqualify={(reason) => void markUnqualified(reason)}
+        onDelete={() => void remove()}
+        onCancel={() => setRemoveOpen(false)}
+      />
     </>
+  );
+}
+
+/** Two ways to take a lead off the lists: mark it unqualified (it can come back), or delete it for good. */
+function RemoveDialog({
+  open,
+  name,
+  busy,
+  error,
+  onUnqualify,
+  onDelete,
+  onCancel,
+}: {
+  open: boolean;
+  name: string;
+  busy: "unqualify" | "delete" | null;
+  error: string | null;
+  onUnqualify: (reason: UnqualifiedReasonKey | null) => void;
+  onDelete: () => void;
+  onCancel: () => void;
+}) {
+  const [reason, setReason] = useState<UnqualifiedReasonKey | null>(null);
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) setReason(null);
+  }
+  const titleId = useId();
+  const reasonId = useId();
+  return (
+    <Modal open={open} busy={busy !== null} onClose={onCancel} labelledBy={titleId}>
+      <div className="p-5">
+        <h2 id={titleId} className="break-words font-serif text-[21px] leading-snug">
+          Remove {name}?
+        </h2>
+
+        <section className="mt-4" aria-label="Mark unqualified">
+          <h3 className="font-medium">Mark unqualified</h3>
+          <p className="mt-1 text-[13.5px] text-quiet">Hides the lead from Active and the pipeline and keeps it out of future imports. The research stays, and you can restore it any time.</p>
+          <p id={reasonId} className="mb-1.5 mt-3 text-[13px] font-medium">
+            Reason <span className="font-normal text-quiet">Optional</span>
+          </p>
+          <ReasonChips value={reason} onChange={setReason} disabled={busy !== null} labelledBy={reasonId} />
+          <div className="mt-4">
+            <Button variant="primary" onClick={() => onUnqualify(reason)} busy={busy === "unqualify"} disabled={busy === "delete"}>
+              Mark unqualified
+            </Button>
+          </div>
+        </section>
+
+        <section className="mt-5 border-t border-hairline pt-4" aria-label="Delete for good">
+          <h3 className="font-medium">Delete for good</h3>
+          <p className="mt-1 text-[13.5px] text-quiet">Removes the lead with its research, drafts and activity. A later import can add them again.</p>
+          <div className="mt-3">
+            <Button variant="danger" onClick={onDelete} busy={busy === "delete"} disabled={busy === "unqualify"}>
+              Delete for good
+            </Button>
+          </div>
+        </section>
+
+        {error && (
+          <div className="mt-4">
+            <Notice>{error}</Notice>
+          </div>
+        )}
+        <div className="mt-5 flex justify-end border-t border-hairline pt-4">
+          <Button onClick={onCancel} disabled={busy !== null}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

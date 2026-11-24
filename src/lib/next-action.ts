@@ -18,6 +18,8 @@ function shortDate(iso: string): string {
 }
 
 export function nextAction(lead: Lead, now: number = Date.now()): NextAction {
+  // Off the lists, whatever research is doing (a run may still be going): it needs nothing from anyone.
+  if (lead.stage === "unqualified") return { label: "Unqualified", tone: "quiet", priority: 99 };
   if (lead.researchStatus === "running") return { label: "Researching", tone: "normal", priority: 50 };
   if (lead.researchStatus === "error") return { label: "Research failed, retry", tone: "urgent", priority: 20 };
   switch (lead.stage) {

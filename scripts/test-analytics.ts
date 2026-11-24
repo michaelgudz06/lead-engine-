@@ -69,7 +69,7 @@ import {
   type ServerEventProps,
 } from "../src/lib/analytics-server";
 import { getLead } from "../src/lib/repo/leads";
-import { DEFAULT_SETTINGS, type Lead } from "../src/lib/types";
+import { DEFAULT_SETTINGS, UNQUALIFIED_REASONS, type Lead } from "../src/lib/types";
 
 const ROOT = join(__dirname, "..");
 /** Demo leads: read only. Never deleted, never researched. */
@@ -341,9 +341,21 @@ async function testClient(): Promise<void> {
     );
     check("beforeSend drops every other event (autocapture, rage clicks, web vitals, exceptions...)", dropped.length === 0, dropped.join(","));
     const ours = [...CLIENT_EVENTS, "$pageleave"].filter((event) => beforeSend({ uuid: "u", event, properties: {} } as unknown as CaptureResult) === null);
-    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 25, ours.join(","));
+    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 28, ours.join(","));
     const added = ["import_source_loaded", "import_completed", "linkedin_url_added", "research_rerun_requested", "email_lookup_requested", "email_edited"];
     check("the import, re-run and email events are on the list", added.every((e) => (CLIENT_EVENTS as string[]).includes(e)), added.filter((e) => !(CLIENT_EVENTS as string[]).includes(e)).join(","));
+    const qualifyEvents = ["leads_unqualified", "leads_restored", "leads_deleted"];
+    check("the unqualified, restored and deleted events are on the list", qualifyEvents.every((e) => (CLIENT_EVENTS as string[]).includes(e)), qualifyEvents.filter((e) => !(CLIENT_EVENTS as string[]).includes(e)).join(","));
+    const reasonKeys = [...UNQUALIFIED_REASONS.map((r) => r.key), "none"];
+    const badReasonKeys = reasonKeys.filter((key) => sanitizeProps({ count: 2, reason: key, surface: "list" }).reason !== key);
+    check("leads_unqualified: every reason key, and \"none\", passes as a token", badReasonKeys.length === 0, badReasonKeys.join(","));
+    const reasonLabels = UNQUALIFIED_REASONS.filter((r) => r.label.includes(" ")).filter((r) => "reason" in sanitizeProps({ count: 1, reason: r.label, surface: "lead" }));
+    const ownWords = sanitizeProps({ count: 1, reason: "Met Ada at ICRA, not buying", surface: "pipeline", name: "Ada Lovelace" });
+    check(
+      "leads_unqualified: a reason's label or the team's own words cannot ride along, only the count and the surface",
+      reasonLabels.length === 0 && !("reason" in ownWords) && !("name" in ownWords) && ownWords.count === 1 && ownWords.surface === "pipeline",
+      JSON.stringify(ownWords),
+    );
     const importProps = sanitizeProps({ source: "sheet", created: 3, duplicates: 1, skipped: 2 });
     const rerunProps = sanitizeProps({ hasFocus: true, focusLength: 40, picks: 2, focus: "Find their work email.", email: "x@y.co" });
     check(

@@ -2,6 +2,7 @@ import "server-only";
 import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { db, query } from "@/lib/db";
+import { isEmailAddress } from "@/lib/email";
 import { optionalEnv } from "@/lib/env";
 import { addEvent } from "@/lib/repo/events";
 import { claimResearch, failStaleResearch, finishResearch } from "@/lib/repo/leads";
@@ -48,13 +49,21 @@ export function describeIssues(issues: z.ZodError["issues"]): string {
 }
 
 /**
- * Reads and validates a JSON body. An empty body counts as `{}`, so endpoints
- * whose fields are all optional accept a bare POST.
+ * Reads and validates a JSON body. An empty body (no body at all, or only whitespace, with or
+ * without a content-type) counts as `{}`, so endpoints whose fields are all optional accept a
+ * bare POST. `maxBytes` raises the size limit for a route that takes large batches (imports);
+ * `tooLarge` is its 413 message.
  */
-export async function readJson<S extends z.ZodType>(request: Request, schema: S): Promise<BodyResult<z.output<S>>> {
+export async function readJson<S extends z.ZodType>(
+  request: Request,
+  schema: S,
+  opts: { maxBytes?: number; tooLarge?: string } = {},
+): Promise<BodyResult<z.output<S>>> {
+  const maxBytes = opts.maxBytes ?? MAX_BODY_BYTES;
+  const tooLarge = opts.tooLarge ?? "The request body is too large.";
   const declared = Number(request.headers.get("content-length") ?? 0);
-  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-    return { ok: false, response: fail(413, "The request body is too large.") };
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { ok: false, response: fail(413, tooLarge) };
   }
   let text: string;
   try {
@@ -62,7 +71,7 @@ export async function readJson<S extends z.ZodType>(request: Request, schema: S)
   } catch {
     return { ok: false, response: fail(400, "Could not read the request body.") };
   }
-  if (text.length > MAX_BODY_BYTES) return { ok: false, response: fail(413, "The request body is too large.") };
+  if (text.length > maxBytes) return { ok: false, response: fail(413, tooLarge) };
   // A cross-site form or no-cors fetch can only send "simple" types such as text/plain;
   // requiring JSON refuses those even where the proxy's Origin check cannot see them.
   if (text.trim() && !/^application\/json\b/i.test(request.headers.get("content-type") ?? "")) {
@@ -83,10 +92,9 @@ export async function readJson<S extends z.ZodType>(request: Request, schema: S)
 
 // ------------------------------------------------------------------ shared field schemas
 
-const EMAIL_RE = /^[^\s@<>(),;:"\\]+@[^\s@<>(),;:"\\]+\.[^\s@<>(),;:"\\]+$/;
-
+/** One plain email address (src/lib/email.ts): never one that could add headers to a mailto: link. */
 export function isEmail(value: string): boolean {
-  return value.length <= 320 && EMAIL_RE.test(value);
+  return isEmailAddress(value);
 }
 
 export function isHttpUrl(value: string): boolean {

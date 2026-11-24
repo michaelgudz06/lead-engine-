@@ -21,7 +21,7 @@
  *   reset on log out. The access password and keys are never part of an event.
  */
 import type { CaptureResult, PostHogConfig } from "posthog-js";
-import type { Settings, Stage } from "./types";
+import type { ImportSource, Settings, Stage } from "./types";
 
 // ------------------------------------------------------------------ events
 
@@ -63,6 +63,16 @@ export interface ClientEventProps {
   /** Which settings changed, never their values. */
   settings_saved: { fields: SettingsField[]; fieldCount: number; criteriaCount: number };
   hubspot_pushed: { leadId: LeadId; ok: boolean };
+  /** A file, sheet or HubSpot list was read into the import screen. rows: how many it holds. */
+  import_source_loaded: { source: ImportSource; rows: number };
+  /** An import finished (in part, when a batch failed). Counts only. */
+  import_completed: { source: ImportSource; created: number; duplicates: number; skipped: number };
+  linkedin_url_added: NoProps;
+  /** A re-run sent from the "why re-run" panel. picks: how many quick picks were used. Never the reason itself. */
+  research_rerun_requested: { hasFocus: boolean; focusLength: number; picks: number };
+  /** "Find email" was pressed and came back. found: whether an address was saved. */
+  email_lookup_requested: { found: boolean };
+  email_edited: NoProps;
   login_succeeded: NoProps;
   logged_out: NoProps;
 }
@@ -88,6 +98,12 @@ const EVENT_LIST: Record<ClientEvent, true> = {
   findings_filter_toggled: true,
   settings_saved: true,
   hubspot_pushed: true,
+  import_source_loaded: true,
+  import_completed: true,
+  linkedin_url_added: true,
+  research_rerun_requested: true,
+  email_lookup_requested: true,
+  email_edited: true,
   login_succeeded: true,
   logged_out: true,
 };

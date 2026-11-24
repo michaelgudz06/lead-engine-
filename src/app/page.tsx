@@ -3,9 +3,11 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { listLeads } from "@/lib/api-client";
-import { nextAction, sortNeedsYouFirst } from "@/lib/next-action";
+import { sortNeedsYouFirst } from "@/lib/next-action";
 import type { Lead } from "@/lib/types";
 import { isRunning, leadName, settleLostRun, timeAgo, titleAtCompany } from "@/components/format";
+import { NoLinkedinChip } from "@/components/lead/contact";
+import { leadAction, notResearched } from "@/components/lead/status";
 import { ButtonLink, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageChip, cx } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
@@ -25,15 +27,23 @@ export default function LeadsPage() {
 
   return (
     <>
-      <PageTitle title="Leads" subtitle="Needs you first: replies, then due follow-ups, then drafts ready to send." />
+      <PageTitle title="Leads" subtitle="Needs you first: replies, then due follow-ups, then drafts ready to send." actions={<ButtonLink href="/leads/import">Import</ButtonLink>} />
 
       {loading ? (
         <ListSkeleton />
       ) : !data ? (
         <ErrorState title="Leads did not load" message={error ?? "Please try again."} onRetry={reload} />
       ) : total === 0 ? (
-        <EmptyState title="No leads yet" action={<ButtonLink href="/leads/new" variant="primary">+ New lead</ButtonLink>}>
-          Add one person by their LinkedIn URL. The agent researches them and their company, then drafts outreach for you to review and send.
+        <EmptyState
+          title="No leads yet"
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <ButtonLink href="/leads/new" variant="primary">+ New lead</ButtonLink>
+              <ButtonLink href="/leads/import">Import</ButtonLink>
+            </div>
+          }
+        >
+          Add one person by their LinkedIn URL, or import a list from a CSV file, a Google Sheet or HubSpot. The agent researches each person and their company, then drafts outreach for you to review and send.
         </EmptyState>
       ) : (
         <>
@@ -84,14 +94,17 @@ export default function LeadsPage() {
 }
 
 function LeadRow({ lead }: { lead: Lead }) {
-  const action = nextAction(lead);
+  const action = leadAction(lead);
   const sub = titleAtCompany(lead);
   return (
     <li>
       <Link href={`/leads/${lead.id}`} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1.5 px-4 py-3.5 transition-colors hover:bg-wash focus-visible:bg-wash sm:grid-cols-[minmax(0,1fr)_auto_190px] sm:px-5">
         <div className="min-w-0">
-          <div className="truncate font-medium">{leadName(lead)}</div>
-          <div className="truncate text-[13.5px] text-quiet">{sub || "Details appear once research finishes"}</div>
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate font-medium">{leadName(lead)}</span>
+            {!lead.linkedinUrl && <NoLinkedinChip className="shrink-0" />}
+          </div>
+          <div className="truncate text-[13.5px] text-quiet">{sub || (notResearched(lead) ? "Details appear after research" : "Details appear once research finishes")}</div>
         </div>
         <div className="row-span-1 justify-self-end">
           <StageChip stage={lead.stage} />

@@ -21,7 +21,8 @@ export interface Person {
   /** Where the domain came from (see domain.ts). Absent on a rebuilt context. */
   domainSource?: DomainSource | null;
   location: string | null;
-  linkedinUrl: string;
+  /** Null only on a context rebuilt for steering a lead that has no profile yet. */
+  linkedinUrl: string | null;
   companyLinkedinUrl: string | null;
 }
 
@@ -36,6 +37,24 @@ export interface RunContext {
   apolloPerson: ApolloPerson | null;
   /** Apollo's company record matched by the company's LinkedIn URL during identify, when there is one. */
   apolloOrg?: ApolloOrg | null;
+  /**
+   * What the teammate asked this re-run to look into (POST /api/leads/[id]/research { focus }).
+   * The agent searches for it first, gather adds a web search for it, extraction keeps facts
+   * that serve it and the writer leans on it. Always wrapped as data in prompts.
+   */
+  focus?: string | null;
+}
+
+/**
+ * A run that has to stop for a reason the team can act on, such as "Could not find their
+ * LinkedIn profile. Add the URL on this page and run research again." The pipeline records the
+ * message as it is, without the "Research stopped after Ns" prefix of an unexpected failure.
+ */
+export class ResearchStop extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResearchStop";
+  }
 }
 
 /** The lead was deleted while its research was running. Nothing is left to record against. */

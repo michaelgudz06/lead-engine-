@@ -5,7 +5,7 @@ import { getSettings } from "../repo/settings";
 import { DEFAULT_SETTINGS, type Settings } from "../types";
 import { withUsageContext } from "../usage/ledger";
 import { runGapFill } from "./agent";
-import { LeadGoneError, note, step } from "./context";
+import { LeadGoneError, note, ResearchStop, step } from "./context";
 import { extract } from "./extract";
 import { writeVerifySave } from "./finish";
 import { gather } from "./gather";
@@ -56,17 +56,27 @@ async function finish(leadId: string, started: number, failure?: unknown): Promi
   } catch (err) {
     console.error(`[research] could not record the failure for lead ${leadId}: ${errorMessage(err)}`);
   }
-  await note(leadId, "error", `Research stopped after ${seconds}s: ${message}`);
+  // A planned stop already says what happened and what to do next.
+  await note(leadId, "error", failure instanceof ResearchStop ? message : `Research stopped after ${seconds}s: ${message}`);
+}
+
+export interface ResearchOptions {
+  /**
+   * What the teammate wants this re-run to look into, from POST /api/leads/[id]/research
+   * { focus }. Trimmed and at most 1,200 characters (the route checks; longer is cut here).
+   */
+  focus?: string | null;
 }
 
 /** Full research run for a lead whose research was already claimed with claimResearch(). */
-export function runResearch(leadId: string): Promise<void> {
+export function runResearch(leadId: string, opts: ResearchOptions = {}): Promise<void> {
   // Usage ledger: every outside call in the run is tagged to this lead, and the rows are
   // flushed before the promise resolves, so a serverless function cannot drop them.
-  return withUsageContext(leadId, () => research(leadId));
+  const focus = truncate(typeof opts?.focus === "string" ? opts.focus.trim() : "", 1200) || null;
+  return withUsageContext(leadId, () => research(leadId, focus));
 }
 
-async function research(leadId: string): Promise<void> {
+async function research(leadId: string, focus: string | null): Promise<void> {
   const started = Date.now();
   try {
     const lead = await getLead(leadId);
@@ -79,6 +89,7 @@ async function research(leadId: string): Promise<void> {
     const settings = await loadSettings(leadId);
 
     const ctx = await identify(leadId, lead, settings, deadline);
+    ctx.focus = focus;
     const gathered = await gather(ctx);
 
     // A re-run starts from a clean slate so findings are not duplicated. Done only
@@ -90,7 +101,8 @@ async function research(leadId: string): Promise<void> {
     }
 
     const findings = await extract(ctx, gathered);
-    const agent = await runGapFill(ctx, findings);
+    // A re-run with a focus: the agent spends its searches on that first.
+    const agent = await runGapFill(ctx, findings, focus ? { priority: focus } : {});
     const result = await writeVerifySave(ctx, { scope: "all" });
 
     await finish(leadId, started);

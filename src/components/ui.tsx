@@ -19,6 +19,8 @@ interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   disabledReason?: string | null;
   /** Anchor the tooltip to the right edge (for buttons near the screen edge). */
   tipEnd?: boolean;
+  /** The <button> itself (React 19 passes ref as a prop), e.g. to give focus back to it. */
+  ref?: React.Ref<HTMLButtonElement>;
 }
 
 export function Button({ variant = "secondary", size = "md", busy, disabledReason, tipEnd, className, children, disabled, type, ...rest }: ButtonProps) {

@@ -107,6 +107,127 @@ export function hubspotStatus(): ProviderStatus {
   };
 }
 
+// ------------------------------------------------------------------ contact list (import)
+
+/** Columns of listHubSpotContacts, in order. guessMapping (src/lib/import/columns.ts) maps every one. */
+export const HUBSPOT_CONTACT_HEADERS = ["HubSpot ID", "First name", "Last name", "Email", "Company", "Job title", "LinkedIn URL"] as const;
+/** The most contacts one listing returns. */
+export const HUBSPOT_LIST_MAX = 2000;
+const PAGE_SIZE = 100;
+/** Read when the account's property list cannot be read; a property that does not exist is simply left out of the answer. */
+const FALLBACK_LINKEDIN_PROPERTIES = ["hs_linkedin_url", "linkedin_url", "linkedin_profile_url", "linkedin_profile", "linkedin"];
+
+export interface HubSpotContactList {
+  headers: string[];
+  /** One row per contact, in HUBSPOT_CONTACT_HEADERS order; "" for an empty field. */
+  rows: string[][];
+  total: number;
+  /** HubSpot has more contacts than the limit allowed. */
+  more: boolean;
+  /** The contact properties read for a LinkedIn URL, best first. */
+  linkedinProperties: string[];
+  warnings: string[];
+}
+
+interface PropertyDef {
+  name: string;
+  label: string;
+  type: string;
+}
+
+/**
+ * Contact properties that may hold a LinkedIn profile URL: text properties whose name or label
+ * mentions LinkedIn, the URL-like ones first. Bios, connection counts and company pages are not
+ * profile links. Pure.
+ */
+export function linkedinPropertyNames(props: ReadonlyArray<{ name?: unknown; label?: unknown; type?: unknown }>): string[] {
+  const found: Array<{ name: string; rank: number }> = [];
+  for (const p of props) {
+    const name = typeof p.name === "string" ? p.name : "";
+    const label = typeof p.label === "string" ? p.label : "";
+    const type = typeof p.type === "string" ? p.type : "string";
+    const words = `${name} ${label}`.toLowerCase();
+    if (!name || !/linked[\s_-]?in/.test(words) || type !== "string") continue;
+    if (/bio|connection|follower|company|organi[sz]ation|headline|summary|count/.test(words)) continue;
+    // "link" inside "LinkedIn" itself does not count.
+    const rank = name === "hs_linkedin_url" ? 0 : /url|profile|link|page/.test(words.replace(/linked[\s_-]?in/g, " ")) ? 1 : 2;
+    found.push({ name, rank });
+  }
+  return found.sort((a, b) => a.rank - b.rank).map((f) => f.name).slice(0, 5);
+}
+
+/** The first value that is a LinkedIn profile link, normalised (https://www.linkedin.com/in/<slug>); "" when none is. */
+function profileLink(values: Array<string | null | undefined>): string {
+  for (const v of values) {
+    const m = typeof v === "string" ? /linkedin\.com\/in\/([^/?#\s]+)/i.exec(v) : null;
+    if (!m) continue;
+    let slug: string;
+    try {
+      slug = decodeURIComponent(m[1]).trim();
+    } catch {
+      continue;
+    }
+    if (!slug) continue;
+    return `https://www.linkedin.com/in/${/^A[CD]o[A-Za-z0-9_-]{8,}$/.test(slug) ? slug : slug.toLowerCase()}`;
+  }
+  return "";
+}
+
+/**
+ * Lists contacts for an import: id, name, email, company, job title and LinkedIn URL, 100 a page
+ * (the `after` cursor) up to `limit` (at most 2,000). The LinkedIn URL comes from whichever
+ * property holds one: hs_linkedin_url, or any property of the account whose name or label
+ * mentions LinkedIn (read from the properties API, scope crm.schemas.contacts.read; without
+ * that scope a fixed list of common names is tried and a warning says so). Throws HubSpotError.
+ * Scope: crm.objects.contacts.read.
+ */
+export function listHubSpotContacts(opts: { limit?: number } = {}): Promise<HubSpotContactList> {
+  // Usage ledger: the listing's requests are written before this returns (no lead to tag).
+  return withUsageContext(null, () => listContacts(opts));
+}
+
+async function listContacts(opts: { limit?: number }): Promise<HubSpotContactList> {
+  const token = optionalEnv("HUBSPOT_ACCESS_TOKEN");
+  if (!token) throw new HubSpotError("HubSpot is not configured: set HUBSPOT_ACCESS_TOKEN.", 0, null);
+  const limit = Math.max(1, Math.min(HUBSPOT_LIST_MAX, Math.floor(Number(opts.limit) || 500)));
+  const warnings: string[] = [];
+  const hs = new HubSpotClient(token, warnings, "Listing HubSpot contacts");
+
+  let linkedinProperties: string[];
+  try {
+    linkedinProperties = linkedinPropertyNames(await hs.contactProperties());
+  } catch (err) {
+    if (err instanceof HubSpotError && err.status === 401) throw err;
+    linkedinProperties = FALLBACK_LINKEDIN_PROPERTIES;
+    hs.warn(
+      `Could not read the account's contact properties (${message(err)}), so only the usual LinkedIn properties were checked. Add the crm.schemas.contacts.read scope to read every one.`,
+    );
+  }
+
+  const base = ["firstname", "lastname", "email", "company", "jobtitle"];
+  const properties = [...new Set([...base, ...linkedinProperties])];
+  const rows: string[][] = [];
+  let after: string | null = null;
+  let more = false;
+  // One page more than the limit needs at most: a cursor that never ends cannot loop forever.
+  for (let pages = 0; pages <= Math.ceil(limit / PAGE_SIZE); pages++) {
+    const want = Math.min(PAGE_SIZE, limit - rows.length);
+    const page = await hs.listContacts(properties, want, after);
+    for (const c of page.results.slice(0, want)) {
+      const p = c.properties;
+      const value = (key: string) => (p[key] ?? "").replace(/\s+/g, " ").trim();
+      rows.push([c.id, value("firstname"), value("lastname"), value("email"), value("company"), value("jobtitle"), profileLink(linkedinProperties.map((k) => p[k]))]);
+    }
+    after = page.after;
+    if (!after || !page.results.length) break;
+    if (rows.length >= limit) {
+      more = true;
+      break;
+    }
+  }
+  return { headers: [...HUBSPOT_CONTACT_HEADERS], rows, total: rows.length, more, linkedinProperties, warnings };
+}
+
 /**
  * Pushes one lead. Never throws: failures come back as { ok: false, error } along
  * with the ids of anything already written, so a retry can pick up where it stopped
@@ -163,7 +284,7 @@ async function pushLead(input: HubSpotPushInput): Promise<HubSpotPushResult> {
 
 // ------------------------------------------------------------------ steps
 
-interface CrmObject {
+export interface CrmObject {
   id: string;
   properties: Record<string, string | null | undefined>;
 }
@@ -230,6 +351,14 @@ async function upsertCompany(hs: HubSpotClient, lead: Lead, ownerId: string | nu
   return created.id;
 }
 
+/** Whether a contact found by its record id is this lead's person: the same email, or the same first and last name. Pure. */
+export function samePerson(contact: CrmObject, person: { first: string | null; last: string | null }, email: string | null): boolean {
+  const norm = (v: unknown) => (typeof v === "string" ? v.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase() : "");
+  const p = contact.properties ?? {};
+  if (email && norm(p.email) && norm(p.email) === norm(email)) return true;
+  return Boolean(person.first && person.last && norm(p.firstname) === norm(person.first) && norm(p.lastname) === norm(person.last));
+}
+
 async function upsertContact(
   hs: HubSpotClient,
   lead: Lead,
@@ -248,14 +377,15 @@ async function upsertContact(
     // Not every HubSpot account has this property; create/update drop it when refused.
     hs_linkedin_url: cleanUrl(lead.linkedinUrl),
   });
-  const read = Object.keys(wanted);
+  const read = [...new Set([...Object.keys(wanted), "email", "firstname", "lastname"])];
 
-  let existing: CrmObject | null = null;
-  if (email) {
-    existing = await hs.getContactByEmail(email, read);
-  } else {
-    existing = await findContactByNameAndCompany(hs, person, companyId, clean(lead.companyName, 200), read);
-  }
+  // A lead imported from HubSpot goes back to the contact it came from, unless that was deleted
+  // or is someone else: an import row can carry any record id, so nothing is written to a
+  // contact found by id unless it has this email or this first and last name.
+  let existing: CrmObject | null = lead.hubspotContactId ? await hs.getContactById(lead.hubspotContactId, read) : null;
+  if (existing && !samePerson(existing, person, email)) existing = null;
+  if (!existing && email) existing = await hs.getContactByEmail(email, read);
+  else if (!existing) existing = await findContactByNameAndCompany(hs, person, companyId, clean(lead.companyName, 200), read);
 
   if (existing) {
     await hs.fillBlanks("contacts", existing, wanted);
@@ -438,7 +568,9 @@ function dealName(lead: Lead): string {
 
 function dealDescription(lead: Lead): string | null {
   const summary = clean(lead.brief?.summary, 1500);
-  return summary ? `${summary}\n\nFrom Lead Engine. LinkedIn: ${lead.linkedinUrl}` : `From Lead Engine. LinkedIn: ${lead.linkedinUrl}`;
+  const link = cleanUrl(lead.linkedinUrl);
+  const from = link ? `From Lead Engine. LinkedIn: ${link}` : "From Lead Engine.";
+  return summary ? `${summary}\n\n${from}` : from;
 }
 
 /** hs_note_body is rich text: escaped HTML, paragraphs and line breaks. */
@@ -679,6 +811,8 @@ class HubSpotClient {
   constructor(
     private readonly token: string,
     private readonly warnings: string[],
+    /** What the calls are for, in the message when the whole job runs out of time. */
+    private readonly job: string = "The HubSpot push",
   ) {}
 
   warn(text: string): void {
@@ -710,7 +844,7 @@ class HubSpotClient {
     const url = new URL(path, API_BASE);
     for (const [k, v] of Object.entries(opts.query ?? {})) url.searchParams.set(k, v);
     for (let attempt = 1; ; attempt++) {
-      if (this.deadline.aborted) throw new HubSpotError(`The HubSpot push took longer than ${PUSH_BUDGET_MS / 1000} s and was stopped.`, 0, null);
+      if (this.deadline.aborted) throw new HubSpotError(`${this.job} took longer than ${PUSH_BUDGET_MS / 1000} s and was stopped.`, 0, null);
       let res: Response;
       try {
         res = await fetch(url, {
@@ -725,7 +859,7 @@ class HubSpotClient {
           cache: "no-store",
         });
       } catch (err) {
-        if (this.deadline.aborted) throw new HubSpotError(`The HubSpot push took longer than ${PUSH_BUDGET_MS / 1000} s and was stopped.`, 0, null);
+        if (this.deadline.aborted) throw new HubSpotError(`${this.job} took longer than ${PUSH_BUDGET_MS / 1000} s and was stopped.`, 0, null);
         if (attempt === 1 && opts.idempotent) {
           await sleep(800);
           continue;
@@ -765,6 +899,39 @@ class HubSpotClient {
 
   async dealPipelines(): Promise<Pipeline[]> {
     return parsePipelines(await this.call("GET", `/crm/pipelines/${VERSION}/deals`, { idempotent: true }));
+  }
+
+  /** Every contact property of the account (name, label, type). Scope: crm.schemas.contacts.read. */
+  async contactProperties(): Promise<PropertyDef[]> {
+    const raw = await this.call("GET", `/crm/properties/${VERSION}/contacts`, { idempotent: true });
+    const results = isRecord(raw) && Array.isArray(raw.results) ? raw.results : [];
+    return results.filter(isRecord).map((p) => ({
+      name: typeof p.name === "string" ? p.name : "",
+      label: typeof p.label === "string" ? p.label : "",
+      type: typeof p.type === "string" ? p.type : "",
+    }));
+  }
+
+  /** One page of contacts with the given properties; `after` is the cursor from the previous page. */
+  async listContacts(properties: string[], limit: number, after: string | null): Promise<{ results: CrmObject[]; after: string | null }> {
+    const query: Record<string, string> = { limit: String(limit), properties: properties.join(","), archived: "false" };
+    if (after) query.after = after;
+    const raw = await this.call("GET", `/crm/objects/${VERSION}/contacts`, { query, idempotent: true });
+    const results = isRecord(raw) && Array.isArray(raw.results) ? raw.results.map(parseObject).filter((o): o is CrmObject => o !== null) : [];
+    const paging = isRecord(raw) && isRecord(raw.paging) && isRecord(raw.paging.next) ? raw.paging.next : null;
+    const next = paging ? idString(paging.after) : null;
+    return { results, after: next };
+  }
+
+  /** The contact with this record id, or null when there is none (deleted or merged away). */
+  async getContactById(id: string, properties: string[]): Promise<CrmObject | null> {
+    if (!/^\d{1,30}$/.test(id)) return null;
+    try {
+      return parseObject(await this.call("GET", `/crm/objects/${VERSION}/contacts/${id}`, { query: { properties: properties.join(",") }, idempotent: true }));
+    } catch (err) {
+      if (err instanceof HubSpotError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   async getContactByEmail(email: string, properties: string[]): Promise<CrmObject | null> {

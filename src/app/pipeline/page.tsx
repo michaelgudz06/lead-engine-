@@ -4,9 +4,11 @@ import Link from "next/link";
 import { useState } from "react";
 import { track } from "@/lib/analytics";
 import { errorMessage, listLeads, updateLead } from "@/lib/api-client";
-import { nextAction, sortNeedsYouFirst } from "@/lib/next-action";
+import { sortNeedsYouFirst } from "@/lib/next-action";
 import { STAGES, STAGE_LABELS, type Lead, type Stage } from "@/lib/types";
 import { isRunning, leadName, settleLostRun, titleAtCompany } from "@/components/format";
+import { NoLinkedinChip } from "@/components/lead/contact";
+import { leadAction } from "@/components/lead/status";
 import { ButtonLink, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageSelect, cx } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
@@ -55,7 +57,15 @@ export default function PipelinePage() {
       ) : !data ? (
         <ErrorState title="The pipeline did not load" message={error ?? "Please try again."} onRetry={reload} />
       ) : data.length === 0 ? (
-        <EmptyState title="Nothing in the pipeline yet" action={<ButtonLink href="/leads/new" variant="primary">+ New lead</ButtonLink>}>
+        <EmptyState
+          title="Nothing in the pipeline yet"
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <ButtonLink href="/leads/new" variant="primary">+ New lead</ButtonLink>
+              <ButtonLink href="/leads/import">Import</ButtonLink>
+            </div>
+          }
+        >
           Leads appear here by stage once you add them.
         </EmptyState>
       ) : (
@@ -97,13 +107,14 @@ export default function PipelinePage() {
 }
 
 function PipelineCard({ lead, busy, onMove }: { lead: Lead; busy: boolean; onMove: (stage: Stage) => void }) {
-  const action = nextAction(lead);
+  const action = leadAction(lead);
   const sub = titleAtCompany(lead);
   return (
     <li className="card p-3">
       <Link href={`/leads/${lead.id}`} className="block rounded">
         <div className="truncate font-medium hover:underline hover:underline-offset-2">{leadName(lead)}</div>
         {sub && <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug text-quiet">{sub}</div>}
+        {!lead.linkedinUrl && <NoLinkedinChip className="mt-1.5" />}
       </Link>
       <div className={cx("mt-2 text-[12.5px]", action.tone === "urgent" ? "font-medium text-danger" : action.tone === "normal" ? "text-ink" : "text-quiet")}>{action.label}</div>
       <div className="mt-2.5">

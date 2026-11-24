@@ -8,6 +8,7 @@ import type { Angle, Finding, Lead } from "@/lib/types";
 import { AutoTextarea } from "../auto-textarea";
 import { safeUrl } from "../format";
 import { Button, ButtonLink, Chip, Label, Notice, cx } from "../ui";
+import { EmailControl } from "./contact";
 import { Panel, PlainList, Sources, SubHeading } from "./panel";
 
 const LINKEDIN_LIMIT = 300;
@@ -323,13 +324,13 @@ export function AnglesSection({
               <ButtonLink
                 external
                 href={gmailComposeUrl({ to: lead.email, subject: active.email.subject, body: active.email.body })}
-                title={lead.email ? `To ${lead.email}` : "No email found: add the address in Gmail"}
+                title={lead.email ? `To ${lead.email}` : "No email yet: the draft opens without a recipient"}
                 onClick={() => track("gmail_opened", { ...refOf(active), withRecipient: Boolean(lead.email) })}
               >
                 Open in Gmail ↗
               </ButtonLink>
             </div>
-            {!lead.email && <p className="mt-2 text-[13px] text-quiet">No email address was found, so the Gmail draft opens without a recipient.</p>}
+            <EmailControl variant="to" lead={lead} running={locked} onLeadChange={onLeadChange} onActivity={onActivity} />
           </div>
 
           <div>

@@ -11,13 +11,16 @@ import {
   type HubDataset,
   type HubModel,
 } from "../providers/huggingface";
-import { findEmail, hunterStatus } from "../providers/hunter";
+import { findEmail, hunterStatus, type FoundEmailStatus } from "../providers/hunter";
 import { getLinkedInPosts, linkedinStatus, type LinkedInPost } from "../providers/linkedin";
 import { findXHandle, getXPosts, xStatus, type XPost } from "../providers/xsearch";
-import { addUsage, updateLead } from "../repo/leads";
+import { addUsage, saveFoundEmail, updateLead } from "../repo/leads";
+import { creditUnits, LOOKUP_MAX_UNITS, releaseQuota, reserveQuota, settleQuota } from "../repo/quota";
+import type { Person } from "./context";
 import { attempt, isConfigured, note, raw, step, type RunContext } from "./context";
 import { sameCompanyName } from "./domain";
-import { cleanXHandle, compact, emailScore, isoDateMonthsAgo, normaliseName, uniqueBy, urlKey } from "./util";
+import { givenEmail } from "./identify";
+import { cleanXHandle, compact, emailScore, isoDateMonthsAgo, normaliseName, truncate, uniqueBy, urlKey } from "./util";
 
 /**
  * Step 2: collect raw material from every source, in parallel. Each source is
@@ -32,13 +35,23 @@ export interface Gathered {
   exaPeople: ExaResult[];
   exaTalks: ExaResult[];
   exaNews: ExaResult[];
+  /** A web search for what the teammate asked a re-run to look into (empty without a focus). */
+  exaFocus: ExaResult[];
   hub: {
     accounts: Array<HubAccount & { matched: "company" | "person" }>;
     models: HubModel[];
     datasets: HubDataset[];
     inspections: Array<{ repoId: string; result: InspectResult }>;
   };
-  email: { email: string; score: number | null; status: string | null; sources: string[] } | null;
+  email: {
+    email: string;
+    score: number | null;
+    status: string | null;
+    sources: string[];
+    /** found: Hunter's Email Finder; verified or guess: built from the company's email pattern. */
+    emailStatus?: FoundEmailStatus | null;
+    pattern?: string | null;
+  } | null;
   x: { handle: string; confidence: number; evidence: string | null; posts: XPost[]; summary: string | null } | null;
 }
 
@@ -50,6 +63,7 @@ export function emptyGathered(): Gathered {
     exaPeople: [],
     exaTalks: [],
     exaNews: [],
+    exaFocus: [],
     hub: { accounts: [], models: [], datasets: [], inspections: [] },
     email: null,
     x: null,
@@ -82,8 +96,10 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
     (async (): Promise<Outcome> => {
       const label = "LinkedIn posts";
       if (!isConfigured(linkedinStatus)) return { label, status: "skipped", detail: "LinkedIn not connected" };
+      const profileUrl = person.linkedinUrl;
+      if (!profileUrl) return { label, status: "skipped", detail: "no LinkedIn URL" };
       const res = await attempt(label, within(80_000), () =>
-        getLinkedInPosts(person.linkedinUrl, { limit: 15, providerId: ctx.profile?.providerId ?? null }),
+        getLinkedInPosts(profileUrl, { limit: 15, providerId: ctx.profile?.providerId ?? null }),
       );
       if (!res.ok) return { label, status: "failed", detail: res.error };
       await raw(leadId, "linkedin.posts", { url: person.linkedinUrl }, res.value);
@@ -145,6 +161,17 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
       return { query, opts: { category: "news" as const, numResults: 6, textChars: 2000, startPublishedDate: isoDateMonthsAgo(12) } };
     }, (r) => (out.exaNews = r)),
 
+    // Web: what the teammate asked this re-run to look into. Only on a re-run with a reason, so a
+    // plain run reports no skipped search for it.
+    ...(ctx.focus?.trim()
+      ? [
+          exaTask("Web search for what you asked", "exa.focus", () => {
+            const query = focusQuery(person, ctx.focus);
+            return query ? { query, opts: { numResults: 6, textChars: 2000 } } : null;
+          }, (r) => (out.exaFocus = r)),
+        ]
+      : []),
+
     // Hugging Face: accounts, models, datasets, and the Abstract inspect check
     (async (): Promise<Outcome> => {
       const label = "Hugging Face";
@@ -161,12 +188,18 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
       };
     })(),
 
-    // Hunter: one call per lead, and none when an email is already known
+    // Hunter: the finder, then the company's email pattern. None when an email is already known:
+    // one the team typed in or imported is never replaced, and one an earlier run found stays.
     (async (): Promise<Outcome> => {
       const label = "Email lookup";
-      if (ctx.lead.email) return { label, status: "skipped", detail: "email already known" };
+      if (ctx.lead.email) return { label, status: "skipped", detail: givenEmail(ctx.lead) ? "you gave an email" : "email already known" };
       if (!isConfigured(hunterStatus)) return { label, status: "skipped", detail: "Hunter not connected" };
-      const res = await attempt(label, within(30_000), () =>
+      // Hunter credits come out of the same daily budget as "Find email" on the lead page: the
+      // most a lookup can cost first, settled to what Hunter charged once it answers.
+      const slot = await reserveQuota("email_lookup", LOOKUP_MAX_UNITS, leadId).catch(() => null);
+      if (!slot) return { label, status: "failed", detail: "could not check the Hunter credit budget" };
+      if (!slot.ok) return { label, status: "skipped", detail: slot.limit === 0 ? "email lookups are paused" : "today's Hunter credit budget is used up" };
+      const res = await attempt(label, within(55_000), () =>
         findEmail({
           linkedinUrl: person.linkedinUrl,
           fullName: person.nameIsGuess ? null : person.name,
@@ -174,14 +207,25 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
           lastName: person.nameIsGuess ? null : person.lastName,
           domain: person.domain,
           company: person.company,
+          budgetMs: within(50_000),
         }),
       );
-      await count({ hunterCalls: 1 });
+      await count({ hunterCalls: res.ok ? Math.max(1, res.value.requests ?? 1) : 1 });
+      // A lookup that failed or timed out keeps the whole slot: Hunter may have charged anyway.
+      if (res.ok && !res.value.requests) await releaseQuota(slot.id);
+      else if (res.ok && !res.value.error) await settleQuota(slot.id, creditUnits(res.value.credits));
       if (!res.ok) return { label, status: "failed", detail: res.error };
       await raw(leadId, "hunter", { linkedinUrl: person.linkedinUrl, domain: person.domain }, res.value);
-      if (!res.value.email) return { label, status: res.value.error ? "failed" : "empty", detail: res.value.error ?? "no email found" };
-      out.email = { email: res.value.email, score: res.value.score, status: res.value.status, sources: res.value.sources ?? [] };
-      return { label, status: "ok", detail: "found" };
+      if (!res.value.email) return { label, status: res.value.error ? "failed" : "empty", detail: res.value.error ?? res.value.reason ?? "no email found" };
+      out.email = {
+        email: res.value.email,
+        score: res.value.score,
+        status: res.value.status,
+        sources: res.value.sources ?? [],
+        emailStatus: res.value.emailStatus ?? "found",
+        pattern: res.value.pattern ?? null,
+      };
+      return { label, status: "ok", detail: EMAIL_DETAIL[out.email.emailStatus ?? "found"] };
     })(),
 
     // X: find the handle (or reuse a known one), then read recent posts pinned to it
@@ -236,10 +280,12 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
   // Contact details go on the lead as soon as they are known.
   try {
     if (out.email && !ctx.lead.email) {
+      // Only onto a lead that still has no email: the teammate may have typed one in meanwhile.
       ctx.lead =
-        (await updateLead(leadId, {
+        (await saveFoundEmail(leadId, {
           email: out.email.email,
-          // le_leads.email_confidence is an integer 0..100 (Hunter's score scale).
+          emailStatus: out.email.emailStatus ?? "found",
+          // le_leads.email_confidence is an integer 0..100 (Hunter's score scale; 50 for a guess).
           emailConfidence: emailScore(out.email.score),
         })) ?? ctx.lead;
     }
@@ -251,6 +297,24 @@ export async function gather(ctx: RunContext): Promise<Gathered> {
   }
 
   return out;
+}
+
+const EMAIL_DETAIL: Record<FoundEmailStatus, string> = {
+  found: "found",
+  verified: "built from the company's email pattern and verified",
+  guess: "built from the company's email pattern (a best guess: their mail server accepts every address)",
+};
+
+/**
+ * The web search for a re-run's focus: who and where, then the teammate's words (cut to about
+ * 200 characters). Null without a focus, or when neither the name nor the company is known. Pure.
+ */
+export function focusQuery(person: Pick<Person, "name" | "nameIsGuess" | "company">, focus: string | null | undefined): string | null {
+  const text = focus?.replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const who = compact([person.nameIsGuess ? null : person.name, person.company]).join(" ");
+  if (!who) return null;
+  return `${who}: ${truncate(text, 200).replace(/…$/, "")}`;
 }
 
 /** Hub accounts whose name matches the company (org) or the person (user). Pure. */

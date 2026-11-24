@@ -334,6 +334,24 @@ export function hubFindings(hub: Gathered["hub"]): NewFinding[] {
 export function emailFinding(email: Gathered["email"], person: Person): NewFinding[] {
   if (!email) return [];
   const score = emailScore(email.score);
+  const domain = email.email.split("@")[1] ?? "the company's domain";
+  const pattern = email.pattern ? ` (${email.pattern})` : "";
+  if (email.emailStatus === "verified" || email.emailStatus === "guess") {
+    return [
+      {
+        source: "hunter",
+        kind: "email",
+        title: "Work email",
+        text:
+          email.emailStatus === "verified"
+            ? `${email.email} was built from ${domain}'s email pattern${pattern} for ${person.name ?? "this person"}, and Hunter verified that it can receive mail${score != null ? ` (score ${score} of 100)` : ""}.`
+            : `${email.email} was built from ${domain}'s email pattern${pattern} for ${person.name ?? "this person"}. The mail server accepts every address, so it could not be verified: a best guess.`,
+        url: null,
+        confidence: email.emailStatus === "verified" ? Math.max(0.5, (score ?? 70) / 100) : 0.5,
+        relevance: 0.3,
+      },
+    ];
+  }
   return [
     {
       source: "hunter",
@@ -466,6 +484,17 @@ export function buildBundles(ctx: Pick<RunContext, "person" | "profile">, gather
     });
   }
 
+  if (gathered.exaFocus.length) {
+    bundles.push({
+      key: "exa.focus",
+      source: "exa",
+      label: "Web search results for what the teammate asked this re-run to look into",
+      hint: "This search was run for the teammate's request (see THE TEAMMATE'S REQUEST). Keep what answers it. Results about other people or companies with similar names get low confidence.",
+      data: gathered.exaFocus.map((r) => slimResult(r, 2000)),
+      maxFindings: 6,
+    });
+  }
+
   if (gathered.x?.posts.length) {
     const handle = gathered.x.handle;
     bundles.push({
@@ -560,6 +589,8 @@ export async function extractBundle(input: {
   bundle: SourceBundle;
   /** Facts already recorded in code (role, career, company basics), so the model skips them. */
   known?: string[];
+  /** What the teammate asked this re-run to look into: facts that serve it are kept. */
+  focus?: string | null;
   timeoutMs?: number;
 }): Promise<NewFinding[]> {
   const { bundle } = input;
@@ -575,6 +606,7 @@ export async function extractBundle(input: {
       data: bundle.data,
       maxFindings: bundle.maxFindings,
       known: input.known,
+      focus: input.focus,
     }),
     schema: ExtractSchema,
     maxTokens: 6_000,
@@ -606,7 +638,7 @@ export async function extract(ctx: RunContext, gathered: Gathered): Promise<Find
       return [] as NewFinding[];
     }
     try {
-      return await extractBundle({ leadId, person, criteria: settings.criteria, bundle, known, timeoutMs });
+      return await extractBundle({ leadId, person, criteria: settings.criteria, bundle, known, focus: ctx.focus, timeoutMs });
     } catch (err) {
       if (err instanceof ClaudeError && err.kind === "config") fatal = err;
       await note(leadId, "tool", `Could not read ${bundle.label} (${errorMessage(err)}). Skipped.`);

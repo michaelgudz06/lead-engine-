@@ -90,7 +90,7 @@ async function drain(pending: Set<Promise<void>>): Promise<void> {
 /** Records one outside call. Fire-and-forget: returns at once, never throws. */
 export function recordUsage(entry: UsageEntry): void {
   // Test harnesses that drive providers against mocks set this so fake calls never
-  // reach the real ledger (and the owner's usage panel).
+  // reach the real ledger (and the Usage tab).
   if (process.env.USAGE_LEDGER_DISABLED === "1") return;
   try {
     const ctx = storage.getStore();

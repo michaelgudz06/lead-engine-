@@ -9,7 +9,8 @@ import { domainFromUrl, domainMatchesCompany, normaliseName } from "./util";
  *
  *   1. the website on the LinkedIn company page
  *   2. Apollo's primary domain for the company's LinkedIn URL (an exact identifier)
- *   3. a domain on the LinkedIn profile, then Apollo's person match
+ *   3. a domain on the LinkedIn profile, then Apollo's person match, then the domain of a work
+ *      email the team imported or typed in
  *   4. a web search for the company's site
  *   5. whatever an earlier run saved on the lead
  *
@@ -18,7 +19,7 @@ import { domainFromUrl, domainMatchesCompany, normaliseName } from "./util";
  * whenever any source knows the global one.
  */
 
-export type DomainSource = "linkedin_company" | "apollo_org" | "linkedin_profile" | "apollo_person" | "search" | "previous";
+export type DomainSource = "linkedin_company" | "apollo_org" | "linkedin_profile" | "apollo_person" | "email" | "search" | "previous";
 
 export interface DomainCandidate {
   /** A domain or a URL; cleaned here. */
@@ -38,6 +39,8 @@ const TRUST: Record<DomainSource, number> = {
   apollo_org: 90,
   linkedin_profile: 70,
   apollo_person: 60,
+  /** The domain of a work email the team imported or typed in. */
+  email: 50,
   search: 40,
   previous: 20,
 };

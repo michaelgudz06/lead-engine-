@@ -148,9 +148,50 @@ export interface Approach {
   dealBreakers: string[];
 }
 
+/** Where a lead came from: the single-add form, or an import from a CSV file, a Google Sheet or HubSpot. */
+export const LEAD_SOURCES = ["manual", "csv", "sheet", "hubspot"] as const;
+export type LeadSource = (typeof LEAD_SOURCES)[number];
+/** The sources an import can name. */
+export type ImportSource = Exclude<LeadSource, "manual">;
+
+export const LEAD_SOURCE_LABELS: Record<LeadSource, string> = {
+  manual: "Added by hand",
+  csv: "CSV file",
+  sheet: "Google Sheet",
+  hubspot: "HubSpot",
+};
+
+/**
+ * What kind of address Lead.email is.
+ * - found: Hunter's Email Finder returned it (emailConfidence is Hunter's score).
+ * - verified: built from the company's email pattern and verified by Hunter (the verifier's score).
+ * - guess: built from the pattern on a domain that accepts every address, so it cannot be verified (50).
+ * - imported: came with an import. manual: typed in on the lead page. Research never replaces these two.
+ */
+export const EMAIL_STATUSES = ["found", "verified", "guess", "imported", "manual"] as const;
+export type EmailStatus = (typeof EMAIL_STATUSES)[number];
+
+export const EMAIL_STATUS_LABELS: Record<EmailStatus, string> = {
+  found: "Found by Hunter",
+  verified: "Verified",
+  guess: "Best guess",
+  imported: "Imported",
+  manual: "Added by hand",
+};
+
+/** One line on each status, for a tooltip or a note under the address. */
+export const EMAIL_STATUS_HINTS: Record<EmailStatus, string> = {
+  found: "Hunter found this address.",
+  verified: "Built from the company's email pattern, and Hunter checked that it can receive mail.",
+  guess: "Built from the company's email pattern. Their mail server accepts every address, so it could not be checked.",
+  imported: "This address came with your import.",
+  manual: "You added this address.",
+};
+
 export interface Lead {
   id: string;
-  linkedinUrl: string;
+  /** Null for an imported contact whose profile is not known yet: research looks for it first. */
+  linkedinUrl: string | null;
   linkedinSlug: string | null;
   name: string | null;
   title: string | null;
@@ -159,6 +200,12 @@ export interface Lead {
   companyLinkedinUrl: string | null;
   email: string | null;
   emailConfidence: number | null;
+  /** What kind of address `email` is; null when there is no email (or for an address from before this was tracked). */
+  emailStatus: EmailStatus | null;
+  /** Null for leads added before sources were tracked. */
+  source: LeadSource | null;
+  /** The HubSpot contact the lead was imported from. */
+  hubspotContactId: string | null;
   xHandle: string | null;
   location: string | null;
   notes: string | null;

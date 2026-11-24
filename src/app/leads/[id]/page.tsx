@@ -2,14 +2,16 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { daysFromNow, track } from "@/lib/analytics";
-import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, startResearch, steerLead, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
-import { nextAction } from "@/lib/next-action";
+import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, rerunResearch, steerLead, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
 import type { Finding, Lead, LeadDetail } from "@/lib/types";
 import { formatDate, formatDateTime, fromDateInput, hostOf, isRunning, leadName, safeUrl, settleLostRun, titleAtCompany, toDateInput } from "@/components/format";
 import { AnglesSection } from "@/components/lead/angles";
+import { AddLinkedinCard, EmailControl, LinkedinForm, NoLinkedinChip, emailKindText } from "@/components/lead/contact";
 import { Panel } from "@/components/lead/panel";
+import { RerunPanel } from "@/components/lead/rerun";
+import { leadAction } from "@/components/lead/status";
 import { ActivitySection, BriefSection, CompanySection, FindingsSection, PendingPanel, ResearchProgress } from "@/components/lead/sections";
 import { Button, Chip, ConfirmDialog, ErrorState, ExternalLink, Label, Notice, Skeleton, StageSelect } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
@@ -70,6 +72,25 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [rerunOpen, setRerunOpen] = useState(false);
+  const [editingLinkedin, setEditingLinkedin] = useState(false);
+  // Focus goes back to what opened a panel or form when it closes.
+  const rerunButton = useRef<HTMLButtonElement>(null);
+  const linkedinReturn = useRef(false);
+  const focusLinkedinChange = (el: HTMLButtonElement | null) => {
+    if (el && linkedinReturn.current) {
+      linkedinReturn.current = false;
+      el.focus();
+    }
+  };
+  function closeLinkedin() {
+    linkedinReturn.current = true;
+    setEditingLinkedin(false);
+  }
+  function closeRerun() {
+    setRerunOpen(false);
+    rerunButton.current?.focus();
+  }
   const [pushing, setPushing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -81,15 +102,22 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
     document.title = `${leadName(lead)} · Lead Engine`;
   }, [lead]);
 
+  /** Starts a run, with the reason for it when there is one. Rejects when the server refuses. */
+  async function startRun(focus?: string) {
+    await rerunResearch(lead.id, focus);
+    track("research_rerun", { leadId: lead.id, hadResearch: hasResearch, afterFailure: failed });
+    // Show the running state at once; the next poll brings the real step.
+    setLead({ ...lead, researchStatus: "running", researchStep: "Starting research", researchError: null, researchStartedAt: new Date().toISOString() });
+  }
+
+  /** A first run or a retry: starts at once. */
   async function rerun() {
     setStarting(true);
     setActionError(null);
     setNotice(null);
+    setRerunOpen(false);
     try {
-      await startResearch(lead.id);
-      track("research_rerun", { leadId: lead.id, hadResearch: hasResearch, afterFailure: failed });
-      // Show the running state at once; the next poll brings the real step.
-      setLead({ ...lead, researchStatus: "running", researchStep: "Starting research", researchError: null, researchStartedAt: new Date().toISOString() });
+      await startRun();
     } catch (err) {
       // 409 means a run is already going: just show it.
       if (!(err instanceof ApiError && err.status === 409)) setActionError(errorMessage(err));
@@ -97,6 +125,21 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
       setStarting(false);
       void reload();
     }
+  }
+
+  /** A re-run from the panel: its errors (the run limits) show in the panel. */
+  async function rerunWithReason(focus: string, picks: number) {
+    setActionError(null);
+    setNotice(null);
+    try {
+      await startRun(focus);
+    } catch (err) {
+      void reload();
+      throw err;
+    }
+    track("research_rerun_requested", { hasFocus: focus.length > 0, focusLength: focus.length, picks });
+    setRerunOpen(false);
+    void reload();
   }
 
   /** Saves a change. Resolves to false (after putting the old value back) when it fails. */
@@ -160,8 +203,9 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   const linkedin = safeUrl(lead.linkedinUrl);
   const companyUrl = lead.companyDomain ? safeUrl(`https://${lead.companyDomain.replace(/^https?:\/\//, "")}`) : null;
   const xHandle = lead.xHandle?.replace(/^@/, "").trim();
-  const action = nextAction(settleLostRun(lead));
+  const action = leadAction(settleLostRun(lead));
   const hasResearch = Boolean(lead.brief || lead.companyPicture || lead.angles.length > 0);
+  const emailKind = emailKindText(lead, "short");
 
   return (
     <>
@@ -185,13 +229,13 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
               if (linkedin && e.target instanceof Element && e.target.closest("a")?.getAttribute("href") === linkedin) track("linkedin_profile_opened", { leadId: lead.id, from: "header" });
             }}
           >
-            {linkedin && <ExternalLink href={linkedin}>LinkedIn ↗</ExternalLink>}
+            {linkedin ? <ExternalLink href={linkedin}>LinkedIn ↗</ExternalLink> : <NoLinkedinChip />}
             {lead.email && (
               <span>
-                <a href={`mailto:${lead.email}`} className="text-link underline-offset-2 hover:underline">
+                <a href={`mailto:${encodeURIComponent(lead.email)}`} className="text-link underline-offset-2 hover:underline">
                   {lead.email}
                 </a>
-                {typeof lead.emailConfidence === "number" && <span className="text-quiet"> · {Math.round(lead.emailConfidence)}% sure</span>}
+                {emailKind && <span className="text-quiet"> · {emailKind}</span>}
               </span>
             )}
             {xHandle && <ExternalLink href={`https://x.com/${encodeURIComponent(xHandle)}`}>@{xHandle} ↗</ExternalLink>}
@@ -199,7 +243,14 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button onClick={rerun} busy={starting} disabledReason={running ? "Research is already running." : null}>
+          {/* A lead with research is asked why first; a first run or a retry starts at once. */}
+          <Button
+            ref={rerunButton}
+            onClick={hasResearch ? () => setRerunOpen((open) => !open) : rerun}
+            busy={starting}
+            aria-expanded={hasResearch ? rerunOpen : undefined}
+            disabledReason={running ? "Research is already running." : null}
+          >
             {hasResearch || failed ? "Re-run research" : "Run research"}
           </Button>
           <Button onClick={hubspot} busy={pushing} disabledReason={hubspotReason} tipEnd>
@@ -215,6 +266,20 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         {actionError && <Notice>{actionError}</Notice>}
         {notice && <Notice tone="success">{notice}</Notice>}
         {refreshError && <Notice>Live updates paused: {refreshError} Retrying…</Notice>}
+        {rerunOpen && !running && (
+          <RerunPanel
+            onSubmit={rerunWithReason}
+            onCancel={closeRerun}
+            onWrongPerson={
+              lead.linkedinUrl
+                ? () => {
+                    setRerunOpen(false);
+                    setEditingLinkedin(true);
+                  }
+                : undefined
+            }
+          />
+        )}
         {failed && (
           <Notice action={<Button size="sm" onClick={rerun} busy={starting}>Retry research</Button>}>
             <span className="font-medium">Research failed.</span>{" "}
@@ -227,10 +292,15 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
         <div className="min-w-0 space-y-6">
           {running && <ResearchProgress lead={lead} events={events} />}
 
+          {!lead.linkedinUrl && !running && <AddLinkedinCard lead={lead} onLeadChange={setLead} />}
+
           {!running && !hasResearch && !failed && (
             <div className="card px-5 py-8 text-center">
               <h2 className="font-serif text-[21px]">No research yet</h2>
-              <p className="mx-auto mt-1.5 max-w-md text-quiet">Run research to get a sourced brief, a picture of the company and drafted outreach.</p>
+              <p className="mx-auto mt-1.5 max-w-md text-quiet">
+                Run research to get a sourced brief, a picture of the company and drafted outreach.
+                {!lead.linkedinUrl && " It starts by looking for their LinkedIn profile."}
+              </p>
               <div className="mt-4">
                 <Button variant="primary" onClick={rerun} busy={starting}>
                   Run research
@@ -271,6 +341,31 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
                   }}
                 />
               </div>
+              <EmailControl lead={lead} running={running} onLeadChange={setLead} onActivity={() => void reload()} />
+              {lead.linkedinUrl && (
+                <div>
+                  {editingLinkedin ? (
+                    <LinkedinForm lead={lead} label="LinkedIn URL" autoFocus onLeadChange={setLead} onDone={closeLinkedin} onCancel={closeLinkedin} />
+                  ) : (
+                    <>
+                      <div className="mb-1.5 flex items-baseline justify-between gap-3 text-[13px] font-medium">
+                        <span>LinkedIn</span>
+                        <button
+                          ref={focusLinkedinChange}
+                          type="button"
+                          className="font-normal text-quiet underline underline-offset-2 hover:text-ink disabled:no-underline disabled:opacity-60"
+                          disabled={running}
+                          title={running ? "Wait for research to finish first." : "Wrong profile? Change the URL, then re-run research."}
+                          onClick={() => setEditingLinkedin(true)}
+                        >
+                          Change
+                        </button>
+                      </div>
+                      <p className="wrap-anywhere text-quiet">{lead.linkedinSlug ? `linkedin.com/in/${lead.linkedinSlug}` : hostOf(lead.linkedinUrl)}</p>
+                    </>
+                  )}
+                </div>
+              )}
               <SavedField
                 id="owner"
                 label="Owner"

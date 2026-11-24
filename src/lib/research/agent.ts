@@ -63,7 +63,11 @@ const slim = (results: ExaResult[], chars: number) =>
     text: truncate(r.text, chars),
   }));
 
-export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focus?: string | null } = {}): Promise<AgentOutcome> {
+/**
+ * `focus` (steering): research only that topic. `priority` (a re-run with a reason): research
+ * that first, then the usual open questions with the searches left.
+ */
+export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focus?: string | null; priority?: string | null } = {}): Promise<AgentOutcome> {
   const { leadId, person, settings, deadline } = ctx;
   const skipped: AgentOutcome = { ran: false, findings: [], summary: null, result: null };
 
@@ -78,7 +82,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
     return skipped;
   }
 
-  await step(leadId, opts.focus ? "Digging into what you asked for" : "Filling the gaps with a deeper search");
+  await step(leadId, opts.focus || opts.priority ? "Digging into what you asked for" : "Filling the gaps with a deeper search");
   // A tool must not outlive the agent: the loop's abort only stops the model call, not a running tool.
   const agentEndsAt = Date.now() + timeoutMs;
   const toolTimeout = (capMs: number = TOOL_TIMEOUT_MS) => Math.min(capMs, Math.max(1_000, agentEndsAt - Date.now()));
@@ -292,7 +296,7 @@ export async function runGapFill(ctx: RunContext, known: Finding[], opts: { focu
     leadId,
     label: "Deeper search",
     system: agentSystem(tools.map((t) => t.name), AGENT_MAX_TOOL_CALLS),
-    prompt: agentPrompt({ person, criteria: settings.criteria, findings: known, focus: opts.focus, notes: ctx.lead.notes }),
+    prompt: agentPrompt({ person, criteria: settings.criteria, findings: known, focus: opts.focus, priority: opts.priority, notes: ctx.lead.notes }),
     tools,
     maxToolCalls: AGENT_MAX_TOOL_CALLS,
     // Search calls plus a few turns that only record findings or wrap up.

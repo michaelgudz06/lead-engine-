@@ -108,7 +108,11 @@ The fixed signatures are in `src/lib/providers/*.ts` (read them). Implementation
 - **apollo.ts**: header `x-api-key`. `organizations/enrich?domain=`, job postings by org id,
   `people/match` (403 on the free plan: return `planBlocked: true`, no error).
 - **hunter.ts**: Email Finder; it accepts a LinkedIn handle
-  (see hunter.io/api and its changelog), else name + domain. One call per lead.
+  (see hunter.io/api and its changelog), else name + domain. When it has no address and the
+  company domain is known: Domain Search for the pattern, an address built from it, and the
+  Email Verifier unless the domain accepts every address (then the address is a `guess`,
+  confidence 50). At most 1.5 credits a lookup. Ledger operations: `email-finder`,
+  `domain-search`, `email-verifier`, each with units `{ lookups: 1, credits }`.
 - **exa.ts**: `POST https://api.exa.ai/search` and `/contents`, header `x-api-key`.
   Check current docs (docs.exa.ai) for the people category and filters.
 - **xsearch.ts**: OpenRouter chat completions (`https://openrouter.ai/api/v1/chat/completions`)
@@ -126,7 +130,9 @@ The fixed signatures are in `src/lib/providers/*.ts` (read them). Implementation
 
 ## 6. Research pipeline (owned by the research agent)
 
-`runResearch(leadId)` (research already claimed by the caller):
+`runResearch(leadId, { focus? })` (research already claimed by the caller). `focus` is a
+re-run's reason: the agent looks into it first, gather adds one web search for it, and the
+brief and drafts lean on it. A lead without a LinkedIn URL is looked up first (section 11).
 
 1. **Identify.** Read the lead. Fetch the LinkedIn profile. Fill name, title, company,
    location, company LinkedIn URL. Find the company domain (LinkedIn company website,
@@ -180,9 +186,9 @@ All JSON. Errors: `{ error: string }` with a 4xx/5xx status. Validate bodies wit
 | GET /api/leads | | `{ leads: Lead[] }` |
 | POST /api/leads | `{ linkedinUrl, name?, companyName?, notes? }` | 201 `{ lead }`; 409 `{ error, existingId }`; starts research with `claimResearch` + `after(() => runResearch(id))` |
 | GET /api/leads/[id] | | `LeadDetail` `{ lead, findings, events }`; 404 |
-| PATCH /api/leads/[id] | any of `stage, notes, owner, nextStepAt, email, name, title, companyName, angles` | `{ lead }` (log a `stage` event when the stage changes) |
+| PATCH /api/leads/[id] | any of `stage, notes, owner, nextStepAt, email, name, title, companyName, angles, linkedinUrl` | `{ lead }` (log a `stage` event when the stage changes); `linkedinUrl` 409 `{ existingId }` when another lead has that profile; a typed `email` is saved as `manual` |
 | DELETE /api/leads/[id] | | `{ ok: true }` |
-| POST /api/leads/[id]/research | | 202 `{ ok: true }`; 409 if already running |
+| POST /api/leads/[id]/research | `{ focus? }` (up to 1,200 characters) | 202 `{ ok: true }`; 409 if already running; 429 over the run caps. A focus logs a `steer` event "Re-run: <focus>" |
 | POST /api/leads/[id]/steer | `{ instruction }` | 202 `{ ok: true }`; 409 if running |
 | POST /api/leads/[id]/sent | `{ angleId, channel: "email" \| "linkedin" }` | `{ lead }`: stage `contacted`, `lastContactedAt` now, `nextStepAt` now + `followUpDays`, `sent` event |
 | POST /api/leads/[id]/events | `{ type: "copied" \| "note", message }` | `{ ok: true }` |
@@ -215,7 +221,7 @@ Tailwind v4 `@theme`):
 friendly empty and error states):
 
 1. **App shell**: top bar with the serif wordmark "Lead Engine", nav (Leads, Pipeline,
-   Settings) and a primary "+ New lead" button.
+   Usage, Settings) and a primary "+ New lead" button.
 2. **Leads `/`**: "Needs you first" list sorted with `sortNeedsYouFirst`, each row showing
    name, title at company, stage chip and next-action label (`nextAction`). Search box.
    On wide screens, a two-column layout like the mock: list on the left, the selected lead
@@ -295,3 +301,47 @@ the URL could read leads and spend API credits. Add one shared team password:
 - No secrets printed. No edits outside your files.
 - Your final report lists: files written, what you tested and the output, what you could not
   test and why, anything another builder must know, and any foundation change you need.
+
+## 11. Additions after V1: import, email, usage
+
+**Data** (migrations 004 and 005, additive):
+
+- `le_leads.linkedin_url` and `linkedin_slug` are nullable (imported contacts). New columns:
+  `source` (`csv | sheet | hubspot`, null for single adds), `hubspot_contact_id` (unique when
+  set), `email_status` (`found | verified | guess | imported | manual`), `import_key`
+  (`lower(name)|lower(company)` as imported, for re-imports of rows with no other key), and an
+  index on `lower(email)`. `Lead` gains `source`, `hubspotContactId` and `emailStatus`.
+- `le_quota_uses (kind, units, lead_id, created_at)`: daily budgets with no row of their own,
+  reserved in one transaction behind an advisory lock like `le_run_starts`. `import` counts
+  new leads (`IMPORT_LIMIT_PER_DAY`, default 2,000). `email_lookup` counts Hunter
+  half-credits (`HUNTER_CREDITS_PER_DAY`, default 10 credits): a lookup reserves 1.5 credits,
+  then keeps only what Hunter charged. Find email and research's email step share it.
+- Research and Find email never replace an `imported` or `manual` address.
+
+**Routes:**
+
+| Method and path | Body | Response |
+| --- | --- | --- |
+| POST /api/leads/import | `{ source, rows }` (at most 1,000 rows, 4 MB) | `{ created, createdIds, createdRows, duplicates, skipped }`; 429 `{ limit, remaining, wanted }` over the import budget (nothing is added). Never starts research; logs a `created` event `{ source }` |
+| POST /api/import/sheet | `{ url }` (docs.google.com only) | `{ headers, rows, total, truncated, headerRow }`: the first 5,000 rows; the CSV is parsed only that far |
+| GET /api/import/hubspot?limit= | | `{ headers, rows, total, more, linkedinProperties, warnings }` (up to 2,000); 403 `needs_password` on Vercel while `APP_PASSWORD` is unset; 400 `not_connected` without a token |
+| POST /api/leads/[id]/email | | `{ email, emailStatus, emailConfidence, message, creditsUsed, lead }`; 409 for an address the team added; 429 `hunter_budget` when the day's Hunter credits are used up |
+| GET /api/usage?window= | | `UsageResponse` (summary, leads, daily, operations, runs) |
+| GET /api/usage/calls?window=&sort=&provider=&operation= | | `{ calls, total }` (a deleted lead's calls show "Deleted lead") |
+| GET /api/usage/balances[?refresh=1] | | `{ balances, checkedAt, cached, refreshableAt }` (cached 60 s, refresh at most every 30 s) |
+| GET /api/usage/export?window= | | CSV with a BOM; cells that start like a formula get a leading apostrophe |
+
+**Leads without LinkedIn:** identify searches Exa (up to 2 searches) and takes a profile only
+when the name matches and so does the company or the email's domain; otherwise the run stops
+with a message asking for the URL.
+
+**HubSpot push:** a contact found by its record id is only written to when it has the lead's
+email or first and last name; otherwise the push falls back to the email or name match.
+
+**Usage tab (`/usage`):** a run starts at its `le_run_starts` row and ends at the lead's first
+`done` event, or else its last `error` event, within 6 minutes and before the next run. Its
+cost is the lead's ledger rows from start to end plus 15 s. The proxy has rules 1 to 4 only;
+the old local-only `/admin` panel is gone.
+
+**Events:** `steer` for "Re-run: ...", `tool` for email lookups and "Found their LinkedIn by
+search: ...", `created` with `{ source }` for imports.

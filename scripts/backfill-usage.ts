@@ -1,6 +1,6 @@
 /**
  * One-time backfill of the usage ledger (le_usage) for the two demo leads, from the
- * counters their research runs left in le_leads.usage, so the admin panel is not empty.
+ * counters their research runs left in le_leads.usage, so the Usage tab is not empty.
  *
  * Idempotent: a lead that already has rows with operation "backfill" is skipped, so it is
  * safe to run again. Every row is marked operation "backfill" and cost basis "estimated":

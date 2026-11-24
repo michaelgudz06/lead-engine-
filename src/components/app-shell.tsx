@@ -10,6 +10,7 @@ import { cx } from "./ui";
 const NAV = [
   { href: "/", label: "Leads" },
   { href: "/pipeline", label: "Pipeline" },
+  { href: "/usage", label: "Usage" },
   { href: "/settings", label: "Settings" },
 ];
 

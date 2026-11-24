@@ -235,8 +235,91 @@ export function nameFromSlug(slug: string | null | undefined): string | null {
     .join(" ");
 }
 
+/** Free and personal mail providers: an address there says nothing about the employer. */
+const FREE_MAIL = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "yahoo.com",
+  "ymail.com",
+  "hotmail.com",
+  "outlook.com",
+  "live.com",
+  "msn.com",
+  "icloud.com",
+  "me.com",
+  "mac.com",
+  "aol.com",
+  "proton.me",
+  "protonmail.com",
+  "pm.me",
+  "gmx.com",
+  "gmx.de",
+  "gmx.net",
+  "web.de",
+  "mail.com",
+  "yandex.com",
+  "yandex.ru",
+  "zoho.com",
+  "qq.com",
+  "163.com",
+  "126.com",
+  "hey.com",
+  "fastmail.com",
+  "tutanota.com",
+  "comcast.net",
+  "att.net",
+  "verizon.net",
+]);
+
+/** True for gmail.com, outlook.com and other free mail providers (any yahoo.* or hotmail.* country site too). */
+export function isFreeMailDomain(domain: string | null | undefined): boolean {
+  const d = (domain ?? "").trim().toLowerCase();
+  if (!d) return false;
+  return FREE_MAIL.has(d) || /^(yahoo|hotmail|outlook|live|gmx|aol)\.[a-z.]{2,6}$/.test(d);
+}
+
+/** The domain of a work address ("jane@mecka.ai" -> "mecka.ai"); null for free mail and anything that is not an address. */
+export function workEmailDomain(email: string | null | undefined): string | null {
+  const m = /^[^\s@]+@([a-z0-9.-]+\.[a-z]{2,})$/i.exec((email ?? "").trim());
+  const domain = m ? m[1].toLowerCase() : null;
+  return domain && !isFreeMailDomain(domain) ? domain : null;
+}
+
+const NAME_NOISE = new Set(["dr", "prof", "professor", "mr", "mrs", "ms", "mx", "sir", "dame", "phd", "md", "mba", "msc", "bsc", "jr", "sr", "ii", "iii", "iv", "cfa", "cpa", "pmp", "esq"]);
+
+/** A person's name as comparable words: lower case, accents and punctuation gone, titles and credentials ("Dr", "PhD") dropped. */
+export function nameTokens(name: string | null | undefined): string[] {
+  return (name ?? "")
+    .split(/[|•·–—]|\s-\s/)[0]
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9\s'-]/g, " ")
+    .replace(/['-]/g, "")
+    .split(/\s+/)
+    .filter((t) => t && !NAME_NOISE.has(t));
+}
+
+/**
+ * True when `candidate` names the same person as `wanted`: the first and last name of `wanted`
+ * both appear among the candidate's words (middle names and order do not matter). An initial
+ * ("Jane D.") is not enough, and a one-word name must match the whole candidate name.
+ */
+export function sameName(wanted: string | null | undefined, candidate: string | null | undefined): boolean {
+  const want = nameTokens(wanted);
+  const got = nameTokens(candidate);
+  if (!want.length || !got.length) return false;
+  if (want.length === 1) return got.length === 1 && got[0] === want[0];
+  const first = want[0];
+  const last = want[want.length - 1];
+  if (first.length < 2 || last.length < 2) return false;
+  return got.includes(first) && got.includes(last);
+}
+
 export function splitName(full: string | null | undefined): { first: string | null; last: string | null } {
   const parts = (full ?? "")
+    .split(/\s[|•·–—-]\s/)[0] // "Jane Doe | Robotics", "Jane Doe - CEO": the tagline is not a name
     .replace(/\(.*?\)/g, " ")
     .replace(/,.*$/, "")
     .trim()

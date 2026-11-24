@@ -1,16 +1,19 @@
 import "server-only";
-import type { Finding, Lead, LeadEvent } from "../types";
+import { EMAIL_STATUSES, LEAD_SOURCES, type Finding, type Lead, type LeadEvent } from "../types";
 
 type Row = Record<string, unknown>;
 
 const iso = (v: unknown): string | null => (v == null ? null : new Date(v as string).toISOString());
 const str = (v: unknown): string | null => (v == null ? null : String(v));
 const num = (v: unknown): number | null => (v == null ? null : Number(v));
+/** One of a fixed set of values, else null (the database checks these too). */
+const oneOf = <T extends string>(v: unknown, allowed: readonly T[]): T | null =>
+  typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : null;
 
 export function toLead(r: Row): Lead {
   return {
     id: String(r.id),
-    linkedinUrl: String(r.linkedin_url),
+    linkedinUrl: str(r.linkedin_url),
     linkedinSlug: str(r.linkedin_slug),
     name: str(r.name),
     title: str(r.title),
@@ -19,6 +22,9 @@ export function toLead(r: Row): Lead {
     companyLinkedinUrl: str(r.company_linkedin_url),
     email: str(r.email),
     emailConfidence: num(r.email_confidence),
+    emailStatus: oneOf(r.email_status, EMAIL_STATUSES),
+    source: oneOf(r.source, LEAD_SOURCES),
+    hubspotContactId: str(r.hubspot_contact_id),
     xHandle: str(r.x_handle),
     location: str(r.location),
     notes: str(r.notes),

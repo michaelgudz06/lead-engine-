@@ -1,11 +1,16 @@
 import "server-only";
 import { query } from "../db";
 import {
+  BACKFILL_OPERATION,
   USAGE_PROVIDERS,
+  type CallSort,
   type CostBasis,
   type DailySpend,
   type LeadUsage,
+  type OperationStats,
   type ProviderTotals,
+  type RunOutcome,
+  type RunUsage,
   type UsageProvider,
   type UsageRecord,
   type UsageSummary,
@@ -14,8 +19,8 @@ import {
 } from "./types";
 
 /**
- * Read side of the usage ledger, for the admin panel.
- * CONTRACT: signatures fixed; bodies owned by the usage-ledger builder.
+ * Read side of the usage ledger, for the Usage tab (/usage). leadCostUsd() is also read by
+ * src/lib/analytics-server.ts, so its signature stays as it is.
  *
  * Windows are whole UTC days: "today" starts at the last UTC midnight, "7d" and "30d"
  * cover today plus the 6 or 29 UTC days before it (the same days getDailySpend(7 | 30)
@@ -23,11 +28,32 @@ import {
  *
  * Three kinds of row (see ledger.ts):
  * - tied to a lead: lead_id set;
- * - tied to a lead that was deleted since: lead_id null, lead_name kept;
+ * - tied to a lead that was deleted since: lead_id null, lead_name kept (to tell it from
+ *   untagged spend; it is never shown: LEAD_NAME_SQL);
  * - never tied to a lead ("untagged"): both null.
+ *
+ * The backfill rows (BACKFILL_OPERATION) count in the totals (summary, per lead, daily
+ * spend) and are left out of per-call figures (time and cost per request, run costs); the
+ * call list puts them last when it sorts by cost.
  */
 
 const DAY_MS = 86_400_000;
+
+/** Shown instead of a deleted lead's name in the call list and the CSV export. */
+export const DELETED_LEAD_NAME = "Deleted lead";
+/** The name column for a ledger row u joined to le_leads l: never a deleted lead's name. */
+export const LEAD_NAME_SQL = `case when u.lead_id is null and u.lead_name is not null then '${DELETED_LEAD_NAME}' else coalesce(l.name, u.lead_name) end`;
+
+/**
+ * The longest a research or steer run can take. A run still going after this long was lost:
+ * the API marks it failed then (STALE_RUN_MS in src/app/api/_lib/api.ts), and on Vercel a run
+ * is cut at 300 s anyway. An end recorded later than this is that mark, written whenever
+ * someone next opened the lead, so it says nothing about how long the run took.
+ */
+export const RUN_MAX_MS = 6 * 60_000;
+
+/** Ledger rows a run may still write after its end event (its last inserts finish in the background). */
+export const RUN_END_GRACE_MS = 15_000;
 
 /** Start of the window, or null for all time. Exported for tests. */
 export function windowStart(window: UsageWindow, now: Date = new Date()): Date | null {
@@ -204,33 +230,22 @@ export async function getLeadUsage(window: UsageWindow, limit = 200): Promise<Le
   });
 }
 
-/** The most recent ledger rows, newest first. */
-export async function getRecentUsage(limit = 100): Promise<UsageRecord[]> {
-  const max = Math.max(1, Math.min(1000, Math.round(num(limit)) || 100));
-  const rows = await query<{
-    id: string;
-    lead_id: string | null;
-    lead_name: string | null;
-    provider: string;
-    operation: string;
-    units: unknown;
-    cost_usd: string | null;
-    cost_basis: string;
-    ok: boolean;
-    ms: number | null;
-    created_at: string;
-  }>(
-    // The lead's current name when it still exists; the name written with the row for a
-    // deleted lead (lead_id is null then, so the panel can still say who it was).
-    `select u.id, u.lead_id, coalesce(l.name, u.lead_name) as lead_name, u.provider, u.operation, u.units,
-            u.cost_usd, u.cost_basis, u.ok, u.ms, u.created_at
-       from le_usage u
-       left join le_leads l on l.id = u.lead_id
-      order by u.id desc
-      limit $1`,
-    [max],
-  );
-  return rows.map((r) => ({
+interface RecordRow {
+  id: string;
+  lead_id: string | null;
+  lead_name: string | null;
+  provider: string;
+  operation: string;
+  units: unknown;
+  cost_usd: string | null;
+  cost_basis: string;
+  ok: boolean;
+  ms: number | null;
+  created_at: string;
+}
+
+function toRecord(r: RecordRow): UsageRecord {
+  return {
     id: num(r.id),
     leadId: r.lead_id,
     leadName: r.lead_name,
@@ -242,7 +257,251 @@ export async function getRecentUsage(limit = 100): Promise<UsageRecord[]> {
     ok: r.ok,
     ms: r.ms === null ? null : num(r.ms),
     createdAt: iso(r.created_at),
-  }));
+  };
+}
+
+/**
+ * ORDER BY per sort. Fixed strings: nothing from a request is ever spliced into the SQL.
+ * Rows without a duration come last when sorting by time, rows without a cost (and the
+ * backfill rows, which each stand for many calls) last when sorting by cost.
+ */
+const CALL_ORDER: Record<CallSort, string> = {
+  newest: "u.id desc",
+  slowest: "u.ms desc nulls last, u.id desc",
+  costliest: `(u.operation = '${BACKFILL_OPERATION}'), u.cost_usd desc nulls last, u.id desc`,
+};
+
+export interface CallQuery {
+  window: UsageWindow;
+  /** Default "newest". */
+  sort?: CallSort;
+  provider?: UsageProvider | null;
+  operation?: string | null;
+  /** 1..1000, default 100. */
+  limit?: number;
+}
+
+/**
+ * Ledger rows in the window, newest, slowest or most expensive first, optionally for one
+ * provider and one operation, plus how many rows match (whatever the sort).
+ */
+export async function listCalls(q: CallQuery): Promise<{ calls: UsageRecord[]; total: number }> {
+  const sort: CallSort = q.sort && Object.hasOwn(CALL_ORDER, q.sort) ? q.sort : "newest";
+  const max = Math.max(1, Math.min(1000, Math.round(num(q.limit)) || 100));
+  const from = windowStart(q.window);
+  const provider = q.provider && isProvider(q.provider) ? q.provider : null;
+  const operation = typeof q.operation === "string" && q.operation ? q.operation.slice(0, 80) : null;
+  const params = [from ? from.toISOString() : null, provider, operation];
+  const where = `($1::timestamptz is null or u.created_at >= $1::timestamptz)
+     and ($2::text is null or u.provider = $2::text)
+     and ($3::text is null or u.operation = $3::text)`;
+  const [rows, counts] = await Promise.all([
+    // The lead's current name when it still exists. A deleted lead (lead_id null, its name
+    // kept on the row so its spend still counts as tied to a lead) shows as "Deleted lead": the
+    // open tab must not keep publishing the name of someone the team removed.
+    query<RecordRow>(
+      `select u.id, u.lead_id, ${LEAD_NAME_SQL} as lead_name, u.provider, u.operation, u.units,
+              u.cost_usd, u.cost_basis, u.ok, u.ms, u.created_at
+         from le_usage u
+         left join le_leads l on l.id = u.lead_id
+        where ${where}
+        order by ${CALL_ORDER[sort]}
+        limit $4`,
+      [...params, max],
+    ),
+    query<{ total: string }>(`select count(*) as total from le_usage u where ${where}`, params),
+  ]);
+  return { calls: rows.map(toRecord), total: num(counts[0]?.total) };
+}
+
+/**
+ * Time and cost per request: one row per provider and operation with calls in the window,
+ * slowest first (by median, then 95th percentile). Durations are interpolated percentiles of
+ * le_usage.ms over the calls that recorded one; failed calls count, since they took time too.
+ * The backfill rows are left out (no duration, and each stands for many calls).
+ */
+export async function getOperationStats(window: UsageWindow): Promise<OperationStats[]> {
+  const from = windowStart(window);
+  const rows = await query<{
+    provider: string;
+    operation: string;
+    calls: string;
+    failed: string;
+    timed: string;
+    median_ms: number | string | null;
+    p95_ms: number | string | null;
+    max_ms: number | string | null;
+    priced: string;
+    total_cost: string | null;
+    avg_cost: string | null;
+    max_cost: string | null;
+    estimated: boolean | null;
+  }>(
+    `select provider, operation,
+            count(*) as calls,
+            count(*) filter (where not ok) as failed,
+            count(ms) as timed,
+            percentile_cont(0.5) within group (order by ms) as median_ms,
+            percentile_cont(0.95) within group (order by ms) as p95_ms,
+            max(ms) as max_ms,
+            count(cost_usd) as priced,
+            sum(cost_usd) as total_cost,
+            avg(cost_usd) as avg_cost,
+            max(cost_usd) as max_cost,
+            bool_or(cost_basis = 'estimated' and coalesce(cost_usd, 0) > 0) as estimated
+       from le_usage
+      where ($1::timestamptz is null or created_at >= $1::timestamptz)
+        and operation <> $2
+      group by provider, operation
+      order by median_ms desc nulls last, p95_ms desc nulls last, provider, operation`,
+    [from ? from.toISOString() : null, BACKFILL_OPERATION],
+  );
+  const ms = (v: unknown): number | null => (v === null || v === undefined ? null : Math.round(num(v)));
+  return rows
+    .filter((r) => isProvider(r.provider))
+    .map((r) => {
+      const priced = num(r.priced);
+      return {
+        provider: r.provider as UsageProvider,
+        operation: r.operation,
+        calls: num(r.calls),
+        failed: num(r.failed),
+        timedCalls: num(r.timed),
+        medianMs: ms(r.median_ms),
+        p95Ms: ms(r.p95_ms),
+        maxMs: ms(r.max_ms),
+        pricedCalls: priced,
+        totalCostUsd: usd(r.total_cost),
+        avgCostUsd: priced > 0 ? usd(r.avg_cost) : null,
+        maxCostUsd: priced > 0 ? usd(r.max_cost) : null,
+        costEstimated: r.estimated === true,
+      };
+    });
+}
+
+/**
+ * Research and steer runs that started in the window, newest first (at most `limit`), plus
+ * how many the window holds. Runs of leads deleted since are left out: their events went
+ * with the lead, and their ledger rows no longer name it.
+ *
+ * - Start: the run's row in le_run_starts (written when the run was allowed to start).
+ * - End: the lead's first 'done' event after the start, or else its last 'error' event (a run
+ *   can log an error, such as findings it could not save, and still carry on). Only events
+ *   before the lead's next run and within RUN_MAX_MS of the start count.
+ * - Cost: the lead's ledger rows from the start to the end (plus RUN_END_GRACE_MS for rows
+ *   still being written), never past the lead's next run. Without an end: up to RUN_MAX_MS.
+ *
+ * `now` decides which runs without an end are still running; tests pass their own.
+ */
+export async function listRuns(window: UsageWindow, limit = 50, now: Date = new Date()): Promise<{ runs: RunUsage[]; total: number }> {
+  const from = windowStart(window, now);
+  const fromIso = from ? from.toISOString() : null;
+  const max = Math.max(1, Math.min(500, Math.round(num(limit)) || 50));
+  const [rows, counts] = await Promise.all([
+    query<{
+      id: string;
+      lead_id: string;
+      kind: string;
+      started_at: string;
+      lead_name: string | null;
+      company: string | null;
+      end_type: string | null;
+      end_message: string | null;
+      ended_at: string | null;
+      running: boolean;
+      calls: string;
+      failed: string;
+      priced: string;
+      cost: string | null;
+      estimated: boolean | null;
+    }>(
+      `with starts as (
+         select r.id, r.lead_id, r.kind, r.created_at as started_at,
+                lead(r.created_at) over (partition by r.lead_id order by r.created_at, r.id) as next_start
+           from le_run_starts r
+          where r.lead_id is not null
+            and ($1::timestamptz is null or r.created_at >= $1::timestamptz)
+       ),
+       picked as (
+         select s.*, coalesce(nullif(btrim(l.name), ''), l.linkedin_slug) as lead_name, l.company_name as company
+           from starts s
+           join le_leads l on l.id = s.lead_id
+          order by s.started_at desc, s.id desc
+          limit $2
+       ),
+       ended as (
+         select p.*, fin.type as end_type, fin.message as end_message, fin.created_at as ended_at
+           from picked p
+           left join lateral (
+             select e.type, e.message, e.created_at
+               from le_events e
+              where e.lead_id = p.lead_id
+                and e.type in ('done', 'error')
+                and e.created_at >= p.started_at
+                and e.created_at <= p.started_at + make_interval(secs => $3)
+                and (p.next_start is null or e.created_at < p.next_start)
+              order by (e.type = 'done') desc,
+                       case when e.type = 'done' then e.created_at end asc,
+                       e.created_at desc,
+                       e.id desc
+              limit 1
+           ) fin on true
+       )
+       select x.id, x.lead_id, x.kind, x.started_at, x.lead_name, x.company,
+              x.end_type, left(x.end_message, 300) as end_message, x.ended_at,
+              (x.ended_at is null and x.next_start is null and $6::timestamptz - x.started_at <= make_interval(secs => $3)) as running,
+              c.calls, c.failed, c.priced, c.cost, c.estimated
+         from ended x
+         left join lateral (
+           select count(*) as calls,
+                  count(*) filter (where not u.ok) as failed,
+                  count(u.cost_usd) as priced,
+                  sum(u.cost_usd) as cost,
+                  bool_or(u.cost_basis = 'estimated' and coalesce(u.cost_usd, 0) > 0) as estimated
+             from le_usage u
+            where u.lead_id = x.lead_id
+              and u.operation <> $5
+              and u.created_at >= x.started_at
+              and u.created_at < least(
+                    coalesce(x.next_start, 'infinity'::timestamptz),
+                    case when x.ended_at is null then x.started_at + make_interval(secs => $3)
+                         else x.ended_at + make_interval(secs => $4) end)
+         ) c on true
+        order by x.started_at desc, x.id desc`,
+      [fromIso, max, RUN_MAX_MS / 1000, RUN_END_GRACE_MS / 1000, BACKFILL_OPERATION, now.toISOString()],
+    ),
+    query<{ total: string }>(
+      `select count(*) as total
+         from le_run_starts r
+         join le_leads l on l.id = r.lead_id
+        where ($1::timestamptz is null or r.created_at >= $1::timestamptz)`,
+      [fromIso],
+    ),
+  ]);
+
+  const runs = rows.map((r): RunUsage => {
+    const startedAt = iso(r.started_at);
+    const endedAt = r.ended_at ? iso(r.ended_at) : null;
+    const outcome: RunOutcome = r.end_type === "done" ? "done" : r.end_type === "error" ? "failed" : r.running ? "running" : "lost";
+    const priced = num(r.priced);
+    return {
+      id: num(r.id),
+      kind: r.kind === "steer" ? "steer" : "research",
+      leadId: r.lead_id,
+      leadName: r.lead_name,
+      company: r.company,
+      startedAt,
+      endedAt,
+      outcome,
+      durationMs: endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : null,
+      calls: num(r.calls),
+      failedCalls: num(r.failed),
+      costUsd: priced > 0 ? usd(r.cost) : null,
+      costEstimated: r.estimated === true,
+      endMessage: r.end_message,
+    };
+  });
+  return { runs, total: num(counts[0]?.total) };
 }
 
 /** One row per UTC day for the last `days` days (zero-filled), oldest first. */

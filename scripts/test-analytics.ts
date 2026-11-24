@@ -341,7 +341,16 @@ async function testClient(): Promise<void> {
     );
     check("beforeSend drops every other event (autocapture, rage clicks, web vitals, exceptions...)", dropped.length === 0, dropped.join(","));
     const ours = [...CLIENT_EVENTS, "$pageleave"].filter((event) => beforeSend({ uuid: "u", event, properties: {} } as unknown as CaptureResult) === null);
-    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 19, ours.join(","));
+    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 25, ours.join(","));
+    const added = ["import_source_loaded", "import_completed", "linkedin_url_added", "research_rerun_requested", "email_lookup_requested", "email_edited"];
+    check("the import, re-run and email events are on the list", added.every((e) => (CLIENT_EVENTS as string[]).includes(e)), added.filter((e) => !(CLIENT_EVENTS as string[]).includes(e)).join(","));
+    const importProps = sanitizeProps({ source: "sheet", created: 3, duplicates: 1, skipped: 2 });
+    const rerunProps = sanitizeProps({ hasFocus: true, focusLength: 40, picks: 2, focus: "Find their work email.", email: "x@y.co" });
+    check(
+      "their properties are counts and flags: a reason or an address cannot ride along",
+      JSON.stringify(importProps) === JSON.stringify({ source: "sheet", created: 3, duplicates: 1, skipped: 2 }) && JSON.stringify(rerunProps) === JSON.stringify({ hasFocus: true, focusLength: 40, picks: 2 }),
+      `${JSON.stringify(importProps)} ${JSON.stringify(rerunProps)}`,
+    );
     check("beforeSend(null) is null", beforeSend(null) === null);
 
     // --- init options
@@ -685,6 +694,7 @@ interface PwLocator {
   count(): Promise<number>;
   first(): PwLocator;
   locator(selector: string): PwLocator;
+  getByRole(role: string, o?: { name?: string | RegExp; exact?: boolean }): PwLocator;
   waitFor(o?: { state?: "attached" | "visible"; timeout?: number }): Promise<void>;
 }
 interface PwPage {
@@ -1208,11 +1218,16 @@ async function e2eWithKey(pw: Playwright): Promise<void> {
       [
         "re-run research (POST mocked: no run)",
         async () => {
-          const rerun = page.getByRole("button", { name: "Re-run research" });
+          // The header button opens the "why re-run" panel; the panel's own button starts the run.
+          const rerun = page.getByRole("button", { name: "Re-run research" }).first();
           if (!(await waitForAsync(() => rerun.isEnabled(), 30_000))) throw new Error("Re-run research stayed disabled");
-          const wait = page.waitForRequest((r) => r.url().endsWith("/research"), { timeout: 30_000 });
           await rerun.click();
-          await wait;
+          const panel = page.getByRole("region", { name: "Re-run research" });
+          await panel.getByRole("button", { name: "Look for newer news" }).click();
+          const wait = page.waitForRequest((r) => r.url().endsWith("/research"), { timeout: 30_000 });
+          await panel.getByRole("button", { name: "Re-run research" }).click();
+          const sentBody = (await wait).postData() ?? "";
+          if (!/"focus":"Look for news/.test(sentBody)) throw new Error("the re-run did not send the reason as focus");
           await page.waitForTimeout(1_500);
         },
       ],
@@ -1287,6 +1302,11 @@ async function e2eWithKey(pw: Playwright): Promise<void> {
       ["hubspot_pushed", "ok", (e) => e.properties.ok === true],
       ["steer_sent", "", (e) => e.properties.instructionLength === typed.steer.length],
       ["research_rerun", "", (e) => e.properties.hadResearch === true && e.properties.afterFailure === false],
+      [
+        "research_rerun_requested",
+        "counts only, never the reason",
+        (e) => e.properties.hasFocus === true && e.properties.picks === 1 && typeof e.properties.focusLength === "number" && Object.values(e.properties).every((v) => typeof v !== "string" || !/news/i.test(v)),
+      ],
       ["logged_out", "", () => true],
       ["login_succeeded", "", () => true],
     ];

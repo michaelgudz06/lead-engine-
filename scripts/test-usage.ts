@@ -26,7 +26,7 @@ import {
   HUNTER_PLAN,
   roundUsd,
 } from "../src/lib/usage/prices";
-import { getDailySpend, getLeadUsage, getRecentUsage, getUsageSummary, leadCostUsd, windowStart } from "../src/lib/usage/queries";
+import { DELETED_LEAD_NAME, getDailySpend, getLeadUsage, getUsageSummary, leadCostUsd, listCalls, windowStart } from "../src/lib/usage/queries";
 import { USAGE_PROVIDER_LABELS, USAGE_PROVIDERS } from "../src/lib/usage/types";
 
 let passed = 0;
@@ -258,10 +258,10 @@ async function integration(): Promise<void> {
     check("summary: the 10-day-old $0.50 is in 30d and all, not in 7d", after.month.totalCostUsd - after.week.totalCostUsd >= 0.5 - 1e-6 && after.all.totalCostUsd >= after.month.totalCostUsd - 1e-6 && after.all.totalCostUsd - before.all.totalCostUsd >= recent + 0.5 - 1e-6);
     check("summary: providers come in the contract's order", after.all.providers.every((p, i, list) => i === 0 || USAGE_PROVIDERS.indexOf(list[i - 1].provider) < USAGE_PROVIDERS.indexOf(p.provider)));
 
-    // --- getRecentUsage ---
-    const recentRows = await getRecentUsage(500);
+    // --- listCalls (the Usage tab's call list; its other orders are in test-usage-tab.ts) ---
+    const { calls: recentRows } = await listCalls({ window: "all", sort: "newest", limit: 500 });
     const mine = recentRows.filter((r) => r.operation.startsWith(`${run}:`));
-    check("getRecentUsage returns the test rows, newest first", mine.length === 9 && recentRows.every((r, i) => i === 0 || recentRows[i - 1].id > r.id), `${mine.length} rows`);
+    check("listCalls returns the test rows, newest first", mine.length === 9 && recentRows.every((r, i) => i === 0 || recentRows[i - 1].id > r.id), `${mine.length} rows`);
     const exaRow = mine.find((r) => r.operation === op("search"));
     check(
       "a record has typed fields (number id and cost, ISO time, lead name)",
@@ -269,7 +269,7 @@ async function integration(): Promise<void> {
     );
     const xRow = mine.find((r) => r.operation === op("x-posts"));
     check("an unpriced record keeps costUsd null and basis unknown", !!xRow && xRow.costUsd === null && xRow.costBasis === "unknown" && xRow.ok === false);
-    check("getRecentUsage honours the limit", (await getRecentUsage(3)).length === 3);
+    check("listCalls honours the limit", (await listCalls({ window: "all", limit: 3 })).calls.length === 3);
 
     // --- getDailySpend ---
     const days = await getDailySpend(30);
@@ -326,8 +326,9 @@ async function integration(): Promise<void> {
     check("the ledger rows survive with lead_id null and the name kept", orphans.length === rowIds.length && orphans.filter((r) => r.operation !== op("bad")).every((r) => r.lead_id === null && r.lead_name === leadName));
     const gone = (await getLeadUsage("today")).find((l) => l.leadId === null);
     check("getLeadUsage groups deleted leads under leadId null", !!gone && gone.leadName === null && gone.totalCostUsd >= recent - 1e-6);
-    const rec = (await getRecentUsage(500)).find((r) => r.operation === op("search"));
-    check("getRecentUsage shows the deleted lead's name from the snapshot", !!rec && rec.leadId === null && rec.leadName === leadName);
+    const rec = (await listCalls({ window: "all", operation: op("search") })).calls[0];
+    // The snapshot keeps the spend tied to a lead, but the open Usage tab never shows the name.
+    check("listCalls shows a deleted lead as Deleted lead, never its name", !!rec && rec.leadId === null && rec.leadName === DELETED_LEAD_NAME);
     const s = await getUsageSummary("today");
     check("summary: a deleted lead's usage is not counted as untagged", near(s.untaggedCostUsd, after.today.untaggedCostUsd, 1e-6) || s.untaggedCostUsd < after.today.untaggedCostUsd + recent);
   } finally {

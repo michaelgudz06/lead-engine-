@@ -303,6 +303,13 @@ const EVENT_LABELS: Record<string, string> = {
   note: "Note",
 };
 
+/** A re-run's reason is logged as a steer, and an email lookup as an agent step: name them for what they are. */
+function eventLabel(e: LeadEvent): string {
+  if (e.type === "steer" && e.message.startsWith("Re-run:")) return "Re-run";
+  if (e.type === "tool" && e.message.startsWith("Email lookup")) return "Email";
+  return EVENT_LABELS[e.type] ?? e.type;
+}
+
 export function ActivitySection({ events }: { events: LeadEvent[] }) {
   const [all, setAll] = useState(false);
   const sorted = useMemo(() => newestFirst(events), [events]);
@@ -318,7 +325,7 @@ export function ActivitySection({ events }: { events: LeadEvent[] }) {
             {shown.map((e) => (
               <li key={e.id} className="text-[13.5px]">
                 <div className="flex items-baseline justify-between gap-3">
-                  <span className={cx("eyebrow", e.type === "error" && "!text-danger")}>{EVENT_LABELS[e.type] ?? e.type}</span>
+                  <span className={cx("eyebrow", e.type === "error" && "!text-danger")}>{eventLabel(e)}</span>
                   <time dateTime={e.createdAt} title={formatDateTime(e.createdAt)} className="shrink-0 text-[12px] text-quiet">
                     {timeAgo(e.createdAt)}
                   </time>

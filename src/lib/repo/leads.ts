@@ -1,15 +1,18 @@
 import "server-only";
 import { json, query } from "../db";
 import { linkedinSlug, normaliseLinkedinUrl } from "../http";
-import type { Lead, ResearchStatus } from "../types";
+import type { EmailStatus, Lead, LeadSource, ResearchStatus } from "../types";
 import { toLead } from "./map";
 
 export interface CreateLeadInput {
+  /** The single-add form always has one; imports go through importLeads (src/lib/repo/import.ts). */
   linkedinUrl: string;
   name?: string | null;
   companyName?: string | null;
   notes?: string | null;
   owner?: string | null;
+  /** Default "manual" (the single-add form). */
+  source?: LeadSource;
 }
 
 export class DuplicateLeadError extends Error {
@@ -18,15 +21,29 @@ export class DuplicateLeadError extends Error {
   }
 }
 
+/** Postgres unique_violation, as the Neon driver reports it. */
+function isUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23505";
+}
+
+async function leadIdWithSlug(slug: string | null, exceptId?: string): Promise<string | null> {
+  if (!slug) return null;
+  const rows = await query<{ id: string }>(
+    "select id from le_leads where linkedin_slug = $1 and ($2::uuid is null or id <> $2::uuid) limit 1",
+    [slug, exceptId ?? null],
+  );
+  return rows[0]?.id ?? null;
+}
+
 export async function createLead(input: CreateLeadInput): Promise<Lead> {
   const url = normaliseLinkedinUrl(input.linkedinUrl);
   if (!url) throw new Error("That does not look like a LinkedIn profile URL (linkedin.com/in/...)");
   const slug = linkedinSlug(url);
-  const existing = await query<{ id: string }>("select id from le_leads where linkedin_slug = $1", [slug]);
-  if (existing[0]) throw new DuplicateLeadError(existing[0].id);
+  const existing = await leadIdWithSlug(slug);
+  if (existing) throw new DuplicateLeadError(existing);
   const rows = await query(
-    `insert into le_leads (linkedin_url, linkedin_slug, name, company_name, notes, owner)
-     values ($1, $2, $3, $4, $5, $6) returning *`,
+    `insert into le_leads (linkedin_url, linkedin_slug, name, company_name, notes, owner, source)
+     values ($1, $2, $3, $4, $5, $6, $7) returning *`,
     [
       url,
       slug,
@@ -34,9 +51,66 @@ export async function createLead(input: CreateLeadInput): Promise<Lead> {
       input.companyName?.trim() || null,
       input.notes?.trim() || null,
       input.owner?.trim() || null,
+      input.source ?? "manual",
     ],
   );
   return toLead(rows[0]);
+}
+
+/**
+ * Sets (or, with null, clears) the lead's LinkedIn profile: the normalised URL and its slug.
+ * Throws DuplicateLeadError when another lead already has the profile, and an Error for a URL
+ * that is not a LinkedIn profile. `onlyIfMissing` changes nothing when the lead got a URL in
+ * the meantime (research saving a profile it found). Null when the lead does not exist, or
+ * (with onlyIfMissing) already had a URL.
+ */
+export async function setLeadLinkedin(id: string, linkedinUrl: string | null, opts: { onlyIfMissing?: boolean } = {}): Promise<Lead | null> {
+  const url = linkedinUrl === null ? null : normaliseLinkedinUrl(linkedinUrl);
+  if (linkedinUrl !== null && !url) throw new Error("That does not look like a LinkedIn profile URL (linkedin.com/in/...)");
+  const slug = url ? linkedinSlug(url) : null;
+  const other = await leadIdWithSlug(slug, id);
+  if (other) throw new DuplicateLeadError(other);
+  try {
+    const rows = await query(
+      `update le_leads set linkedin_url = $2, linkedin_slug = $3, updated_at = now()
+        where id = $1 ${opts.onlyIfMissing ? "and linkedin_url is null" : ""}
+        returning *`,
+      [id, url, slug],
+    );
+    return rows[0] ? toLead(rows[0]) : null;
+  } catch (err) {
+    // Another lead took the profile between the check and the update: the unique index stopped it.
+    if (isUniqueViolation(err)) {
+      const raced = await leadIdWithSlug(slug, id);
+      if (raced) throw new DuplicateLeadError(raced);
+    }
+    throw err;
+  }
+}
+
+/** Addresses a lookup may replace: none at all, or one an earlier lookup found. Never one the team typed in or imported. */
+const REPLACEABLE_EMAIL = `(email is null
+  or email_status in ('found', 'verified', 'guess')
+  or (email_status is null and email_confidence is not null))`;
+
+/**
+ * Saves an address an email lookup found, with its kind and confidence. `replace` "empty" saves
+ * only when the lead has no email (a research run: the teammate may have typed one in while it
+ * ran); "lookup" may also replace an address an earlier lookup found. An address the team typed
+ * in or imported is never replaced. Null when nothing was saved.
+ */
+export async function saveFoundEmail(
+  id: string,
+  found: { email: string; emailStatus: Extract<EmailStatus, "found" | "verified" | "guess">; emailConfidence: number | null },
+  replace: "empty" | "lookup" = "empty",
+): Promise<Lead | null> {
+  const rows = await query(
+    `update le_leads set email = $2, email_status = $3, email_confidence = $4, updated_at = now()
+      where id = $1 and ${replace === "empty" ? "email is null" : REPLACEABLE_EMAIL}
+      returning *`,
+    [id, found.email, found.emailStatus, found.emailConfidence],
+  );
+  return rows[0] ? toLead(rows[0]) : null;
 }
 
 export async function getLead(id: string): Promise<Lead | null> {
@@ -59,6 +133,7 @@ const PATCHABLE: Record<string, { col: string; json?: boolean }> = {
   companyLinkedinUrl: { col: "company_linkedin_url" },
   email: { col: "email" },
   emailConfidence: { col: "email_confidence" },
+  emailStatus: { col: "email_status" },
   xHandle: { col: "x_handle" },
   location: { col: "location" },
   notes: { col: "notes" },
@@ -78,7 +153,8 @@ const PATCHABLE: Record<string, { col: string; json?: boolean }> = {
   usage: { col: "usage", json: true },
 };
 
-export type LeadPatch = Partial<Omit<Lead, "id" | "linkedinUrl" | "linkedinSlug" | "createdAt" | "updatedAt">>;
+/** The LinkedIn profile changes through setLeadLinkedin (it must stay unique); source and HubSpot id are set once, on import. */
+export type LeadPatch = Partial<Omit<Lead, "id" | "linkedinUrl" | "linkedinSlug" | "source" | "hubspotContactId" | "createdAt" | "updatedAt">>;
 
 export async function updateLead(id: string, patch: LeadPatch): Promise<Lead | null> {
   const sets: string[] = [];

@@ -153,6 +153,8 @@ export async function writeBrief(input: {
   person: Person;
   findings: Finding[];
   instruction?: string | null;
+  /** What the teammate asked this re-run to look into. */
+  focus?: string | null;
   timeoutMs?: number;
 }): Promise<{ brief: Brief; companyPicture: CompanyPicture }> {
   const map = aliasFindings(input.findings);
@@ -160,7 +162,7 @@ export async function writeBrief(input: {
     leadId: input.leadId,
     label: "Writing the brief",
     system: BRIEF_SYSTEM,
-    prompt: briefPrompt({ person: input.person, findings: input.findings, aliasOf: map.aliasOf, instruction: input.instruction }),
+    prompt: briefPrompt({ person: input.person, findings: input.findings, aliasOf: map.aliasOf, instruction: input.instruction, focus: input.focus }),
     schema: BriefSchema,
     maxTokens: 10_000,
     timeoutMs: input.timeoutMs,
@@ -247,6 +249,8 @@ export async function writeAngles(input: {
   notes?: string | null;
   instruction?: string | null;
   currentAngles?: Angle[];
+  /** What the teammate asked this re-run to look into. */
+  focus?: string | null;
   timeoutMs?: number;
 }): Promise<{ angles: Angle[]; approach: Approach }> {
   const map = aliasFindings(input.findings);
@@ -262,6 +266,7 @@ export async function writeAngles(input: {
       notes: input.notes,
       instruction: input.instruction,
       currentAngles: input.currentAngles,
+      focus: input.focus,
     }),
     schema: AnglesSchema,
     maxTokens: 12_000,

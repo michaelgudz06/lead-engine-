@@ -47,7 +47,7 @@ export async function writeVerifySave(ctx: RunContext, opts: WriteOptions): Prom
   const writeTimeout = Math.max(20_000, deadline.budget(WRITE_CAP_MS, 20_000));
   const [briefRes, anglesRes] = await Promise.allSettled([
     opts.scope === "all"
-      ? writeBrief({ leadId, person, findings: selected, instruction: opts.instruction, timeoutMs: writeTimeout })
+      ? writeBrief({ leadId, person, findings: selected, instruction: opts.instruction, focus: ctx.focus, timeoutMs: writeTimeout })
       : Promise.resolve(null),
     writeAngles({
       leadId,
@@ -57,6 +57,7 @@ export async function writeVerifySave(ctx: RunContext, opts: WriteOptions): Prom
       notes: ctx.lead.notes,
       instruction: opts.instruction,
       currentAngles: opts.currentAngles,
+      focus: ctx.focus,
       timeoutMs: writeTimeout,
     }),
   ]);

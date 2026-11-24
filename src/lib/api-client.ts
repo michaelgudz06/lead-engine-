@@ -2,19 +2,26 @@
  * Typed fetch helpers for every endpoint in BUILD_SPEC section 7.
  * Client-safe: imports types only, never server modules or secrets.
  */
-import type { Angle, Lead, LeadDetail, ProviderStatus, Settings, Stage } from "./types";
+import type { ImportRow } from "./import/columns";
+import type { Angle, EmailStatus, ImportSource, Lead, LeadDetail, ProviderStatus, Settings, Stage } from "./types";
 
 /** An API failure with the HTTP status and the server's `{ error }` message. */
 export class ApiError extends Error {
   readonly status: number;
-  /** Set on a 409 from POST /api/leads: the lead that already has this LinkedIn URL. */
+  /** Set on a 409 from POST /api/leads or PATCH /api/leads/[id]: the lead that already has this LinkedIn URL. */
   readonly existingId: string | null;
+  /** The server's machine-readable reason, when it sends one (e.g. "not_shared" for a private Google Sheet). */
+  readonly code: string | null;
+  /** The whole error body, for extra fields such as { limit, remaining } on an import's 429. */
+  readonly details: Record<string, unknown> | null;
 
-  constructor(message: string, status: number, existingId: string | null = null) {
+  constructor(message: string, status: number, existingId: string | null = null, details: Record<string, unknown> | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.existingId = existingId;
+    this.details = details;
+    this.code = details && typeof details.code === "string" ? details.code : null;
   }
 }
 
@@ -36,7 +43,10 @@ export type LeadPatch = Partial<{
   notes: string | null;
   owner: string | null;
   nextStepAt: string | null;
+  /** Saved lower case, as an address the team added (emailStatus "manual"); null clears it. */
   email: string | null;
+  /** A LinkedIn profile URL; null or "" clears it. 400 when it is not a profile URL, 409 (ApiError.existingId) when another lead has it. */
+  linkedinUrl: string | null;
   name: string | null;
   title: string | null;
   companyName: string | null;
@@ -50,9 +60,80 @@ export interface HubspotResult {
   dealId?: string;
 }
 
+/** A sheet, file or HubSpot list as the import screen reads it: a header and rows of cells. */
+export interface ImportTable {
+  headers: string[];
+  rows: string[][];
+  /** Data rows in the source (rows may hold fewer when the sheet was cut short). */
+  total: number;
+}
+
+/** POST /api/import/sheet. */
+export interface SheetTable extends ImportTable {
+  /** Only the first rows came back (the sheet has more than 5,000, or is very wide). */
+  truncated: boolean;
+  /** The header's row number in the sheet; the first data row is headerRow + 1 (for toImportRows). */
+  headerRow: number;
+}
+
+/** GET /api/import/hubspot. Headers: HubSpot ID, First name, Last name, Email, Company, Job title, LinkedIn URL. */
+export interface HubSpotContacts extends ImportTable {
+  /** HubSpot has more contacts than the limit allowed. */
+  more: boolean;
+  /** The contact properties read for LinkedIn URLs. */
+  linkedinProperties: string[];
+  /** Problems that did not stop the listing, e.g. a missing scope. */
+  warnings: string[];
+}
+
+/** A row that named a lead that already exists, or an earlier row of the same import. */
+export interface ImportDuplicate {
+  /** Index into the rows that were sent. */
+  index: number;
+  /** The lead that has this person: an existing lead, or the one this import created for an earlier row. */
+  existingId: string | null;
+  reason: string;
+  /** The key that matched. "name" (same name and company) is used only for rows with no LinkedIn URL, HubSpot id or email. */
+  match: "linkedin" | "hubspot" | "email" | "name";
+  /** For a repeat inside the import: the index of the earlier row. */
+  duplicateOf: number | null;
+}
+
+/** POST /api/leads/import. */
+export interface ImportResult {
+  created: number;
+  createdIds: string[];
+  /** Which row became which lead. */
+  createdRows: Array<{ index: number; id: string }>;
+  duplicates: ImportDuplicate[];
+  /** Rows that cannot become a lead, with the reason. */
+  skipped: Array<{ index: number; reason: string }>;
+}
+
+/** POST /api/leads/[id]/email. email is null when nothing was found; message says what happened either way. */
+export interface EmailLookupResult {
+  email: string | null;
+  emailStatus: EmailStatus | null;
+  emailConfidence: number | null;
+  message: string;
+  /** Hunter credits the lookup used. */
+  creditsUsed: number;
+  /** The lead after the lookup. */
+  lead: Lead;
+}
+
+/** The most rows one import request may carry (the server refuses more). */
+export const IMPORT_BATCH_MAX = 1000;
+
 // Requests only read or write our own database, so they are quick. Research itself
 // runs in the background after the response, which is why 30 s is generous.
 const TIMEOUT_MS = 30_000;
+// Calls that wait on another service: the server gives a Google Sheet 15 s, a HubSpot listing
+// 45 s and an email lookup 50 s; an import is one database transaction of up to 1,000 rows.
+const SHEET_TIMEOUT_MS = 40_000;
+const HUBSPOT_LIST_TIMEOUT_MS = 65_000;
+const IMPORT_TIMEOUT_MS = 60_000;
+const EMAIL_LOOKUP_TIMEOUT_MS = 65_000;
 // The HubSpot push is the exception: the server gives it up to 45 s of HubSpot calls
 // inside a 60 s function limit. Stopping sooner would report a push that went through
 // as failed, and a retry would log a second note.
@@ -109,7 +190,7 @@ async function request<T>(path: string, init: { method?: string; body?: unknown;
     }
     const message = isRecord(data) && typeof data.error === "string" && data.error ? data.error : statusMessage(res.status);
     const existingId = isRecord(data) && typeof data.existingId === "string" ? data.existingId : null;
-    throw new ApiError(message, res.status, existingId);
+    throw new ApiError(message, res.status, existingId, isRecord(data) ? data : null);
   }
   if (data === null) throw new ApiError("The server sent an empty or unreadable reply.", res.status);
   return data as T;
@@ -163,6 +244,136 @@ export async function deleteLead(id: string): Promise<void> {
 /** Starts a new research run. Rejects with status 409 when one is already running. */
 export async function startResearch(id: string): Promise<void> {
   await request(`/api/leads/${enc(id)}/research`, { method: "POST" });
+}
+
+/**
+ * Re-runs research with a reason: what to look into or try again (at most 1,200 characters).
+ * The agent searches for it first and the drafts lean on it; it shows in the activity as
+ * "Re-run: <focus>". An empty focus is a plain re-run. 409 while a run is going, 429 over the run caps.
+ */
+export async function rerunResearch(id: string, focus?: string | null): Promise<void> {
+  const text = focus?.trim();
+  await request(`/api/leads/${enc(id)}/research`, text ? { method: "POST", body: { focus: text } } : { method: "POST" });
+}
+
+/**
+ * Looks up the lead's work email with Hunter now (no research run) and saves what it finds.
+ * Resolves with email null and a message when nothing was found. 409 when the lead has an
+ * address the team added or research is running, 429 when the daily lookup limit is reached.
+ */
+export async function findEmail(id: string): Promise<EmailLookupResult> {
+  const data = await request<Record<string, unknown>>(`/api/leads/${enc(id)}/email`, { method: "POST", timeoutMs: EMAIL_LOOKUP_TIMEOUT_MS });
+  return {
+    email: typeof data.email === "string" ? data.email : null,
+    emailStatus: typeof data.emailStatus === "string" ? (data.emailStatus as EmailStatus) : null,
+    emailConfidence: typeof data.emailConfidence === "number" ? data.emailConfidence : null,
+    message: typeof data.message === "string" ? data.message : "",
+    creditsUsed: typeof data.creditsUsed === "number" ? data.creditsUsed : 0,
+    lead: normalizeLead(data.lead),
+  };
+}
+
+function tableFrom(data: Record<string, unknown>): ImportTable {
+  const headers = Array.isArray(data.headers) ? data.headers.map((h) => (typeof h === "string" ? h : "")) : [];
+  const rows = Array.isArray(data.rows) ? data.rows.filter(Array.isArray).map((r) => (r as unknown[]).map((c) => (typeof c === "string" ? c : c == null ? "" : String(c)))) : [];
+  return { headers, rows, total: typeof data.total === "number" ? data.total : rows.length };
+}
+
+/**
+ * Reads a Google Sheet shared as "anyone with the link" (its header and rows). A private sheet
+ * rejects with status 400 and code "not_shared"; others: bad_link, not_found, too_large (400),
+ * timeout (504), upstream (502).
+ */
+export async function parseSheet(url: string): Promise<SheetTable> {
+  const data = await request<Record<string, unknown>>("/api/import/sheet", { method: "POST", body: { url }, timeoutMs: SHEET_TIMEOUT_MS });
+  return { ...tableFrom(data), truncated: data.truncated === true, headerRow: typeof data.headerRow === "number" ? data.headerRow : 1 };
+}
+
+/** Lists HubSpot contacts for an import (1 to 2,000, default 500). 400 with code "not_connected" when HubSpot has no token. */
+export async function getHubSpotContacts(limit = 500): Promise<HubSpotContacts> {
+  const data = await request<Record<string, unknown>>(`/api/import/hubspot?limit=${enc(String(limit))}`, { timeoutMs: HUBSPOT_LIST_TIMEOUT_MS });
+  const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  return { ...tableFrom(data), more: data.more === true, linkedinProperties: strings(data.linkedinProperties), warnings: strings(data.warnings) };
+}
+
+function importResultFrom(data: Record<string, unknown>): ImportResult {
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter(isRecord) : []);
+  return {
+    created: typeof data.created === "number" ? data.created : 0,
+    createdIds: Array.isArray(data.createdIds) ? data.createdIds.filter((x): x is string => typeof x === "string") : [],
+    createdRows: list(data.createdRows).map((r) => ({ index: Number(r.index), id: String(r.id) })),
+    duplicates: list(data.duplicates).map((d) => ({
+      index: Number(d.index),
+      existingId: typeof d.existingId === "string" ? d.existingId : null,
+      reason: typeof d.reason === "string" ? d.reason : "",
+      match: d.match === "linkedin" || d.match === "hubspot" || d.match === "name" ? d.match : "email",
+      duplicateOf: typeof d.duplicateOf === "number" ? d.duplicateOf : null,
+    })),
+    skipped: list(data.skipped).map((k) => ({ index: Number(k.index), reason: typeof k.reason === "string" ? k.reason : "" })),
+  };
+}
+
+/**
+ * Adds leads from up to 1,000 rows (toImportRows in src/lib/import/columns.ts). Never starts
+ * research. Rejects with 429 (ApiError.details: limit, remaining, wanted) when the batch would
+ * pass the daily import limit; nothing is added then.
+ */
+export async function importLeads(source: ImportSource, rows: ImportRow[]): Promise<ImportResult> {
+  return importResultFrom(await request<Record<string, unknown>>("/api/leads/import", { method: "POST", body: { source, rows }, timeoutMs: IMPORT_TIMEOUT_MS }));
+}
+
+/** Thrown by importLeadsInBatches when a batch fails: the batches before it were imported. */
+export class ImportBatchError extends ApiError {
+  /** What the earlier batches did, with indexes into the full list of rows. */
+  readonly partial: ImportResult;
+  /** Index of the first row that was not imported. */
+  readonly failedAt: number;
+
+  constructor(cause: ApiError, partial: ImportResult, failedAt: number) {
+    super(cause.message, cause.status, cause.existingId, cause.details);
+    this.name = "ImportBatchError";
+    this.partial = partial;
+    this.failedAt = failedAt;
+  }
+}
+
+/**
+ * importLeads for any number of rows: batches of at most `batchSize` (default 500) rows and
+ * about 2 MB each, one after another, merged into one result with indexes into `rows`. A
+ * failed batch stops the import with an ImportBatchError that carries what was done.
+ */
+export async function importLeadsInBatches(
+  source: ImportSource,
+  rows: ImportRow[],
+  opts: { batchSize?: number; onProgress?: (done: number, total: number) => void } = {},
+): Promise<ImportResult> {
+  const size = Math.max(1, Math.min(IMPORT_BATCH_MAX, opts.batchSize ?? 500));
+  const total: ImportResult = { created: 0, createdIds: [], createdRows: [], duplicates: [], skipped: [] };
+  let start = 0;
+  while (start < rows.length) {
+    let end = start;
+    let bytes = 0;
+    while (end < rows.length && end - start < size) {
+      bytes += JSON.stringify(rows[end]).length;
+      if (end > start && bytes > 2_000_000) break;
+      end++;
+    }
+    let part: ImportResult;
+    try {
+      part = await importLeads(source, rows.slice(start, end));
+    } catch (err) {
+      if (err instanceof ApiError) throw new ImportBatchError(err, total, start);
+      throw err;
+    }
+    total.created += part.created;
+    total.createdIds.push(...part.createdIds);
+    total.createdRows.push(...part.createdRows.map((r) => ({ ...r, index: r.index + start })));
+    total.duplicates.push(...part.duplicates.map((d) => ({ ...d, index: d.index + start, duplicateOf: d.duplicateOf === null ? null : d.duplicateOf + start })));
+    total.skipped.push(...part.skipped.map((k) => ({ ...k, index: k.index + start })));
+    start = end;
+    opts.onProgress?.(start, rows.length);
+  }
+  return total;
 }
 
 export async function steerLead(id: string, instruction: string): Promise<void> {

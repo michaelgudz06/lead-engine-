@@ -1,9 +1,10 @@
 import { connection, type NextRequest } from "next/server";
 import { z } from "zod";
+import { normaliseLinkedinUrl } from "@/lib/http";
 import { addEvent, listEvents } from "@/lib/repo/events";
 import { listFindings } from "@/lib/repo/findings";
-import { deleteLead, getLead, updateLead, type LeadPatch } from "@/lib/repo/leads";
-import { STAGE_LABELS, STAGES, type LeadDetail } from "@/lib/types";
+import { deleteLead, DuplicateLeadError, getLead, setLeadLinkedin, updateLead, type LeadPatch } from "@/lib/repo/leads";
+import { STAGE_LABELS, STAGES, type Lead, type LeadDetail } from "@/lib/types";
 import {
   definedOnly,
   errorText,
@@ -49,12 +50,23 @@ const NextStepAt = z
   })
   .transform((v) => (v === undefined ? undefined : v ? new Date(v).toISOString() : null));
 
+/** A LinkedIn profile URL (normalised in the handler); "" and null clear it. */
+const LinkedinUrl = z
+  .string()
+  .trim()
+  .max(500, "That URL is too long.")
+  .nullable()
+  .optional()
+  .transform((v) => (v === undefined ? undefined : v || null));
+
 const PatchBody = z.object({
   stage: z.enum(STAGES).optional(),
   notes: optionalText(10_000),
   owner: optionalText(200),
   nextStepAt: NextStepAt,
-  email: optionalEmail(),
+  // Saved lower case, as an address the team added (email_status "manual"); null clears it.
+  email: optionalEmail().transform((v) => (typeof v === "string" ? v.toLowerCase() : v)),
+  linkedinUrl: LinkedinUrl,
   name: optionalText(300),
   title: optionalText(300),
   companyName: optionalText(300),
@@ -90,22 +102,42 @@ export async function GET(_request: NextRequest, ctx: LeadRouteContext) {
   }
 }
 
-/** PATCH /api/leads/[id] -> { lead }. Logs a "stage" event when the stage changes. */
+/**
+ * PATCH /api/leads/[id] -> { lead }. Logs a "stage" event when the stage changes.
+ * linkedinUrl: normalised; 400 when it is not a LinkedIn profile URL, 409 { existingId } when
+ * another lead has that profile; "" or null clears it. email: lower case, saved as an address
+ * the team added (emailStatus "manual", no confidence); null clears it.
+ */
 export async function PATCH(request: NextRequest, ctx: LeadRouteContext) {
   const id = await leadIdFrom(ctx);
   if (!id) return leadNotFound();
   const body = await readJson(request, PatchBody);
   if (!body.ok) return body.response;
-  const patch = definedOnly(body.data) as LeadPatch;
-  if (Object.keys(patch).length === 0) return fail(400, `Nothing to update. Send any of: ${PATCHABLE_FIELDS}.`);
+  const { linkedinUrl: rawLinkedin, ...fields } = definedOnly(body.data);
+  const patch = fields as LeadPatch;
+  if (Object.keys(patch).length === 0 && rawLinkedin === undefined) return fail(400, `Nothing to update. Send any of: ${PATCHABLE_FIELDS}.`);
+  const linkedinUrl = rawLinkedin ? normaliseLinkedinUrl(rawLinkedin) : rawLinkedin;
+  if (rawLinkedin && !linkedinUrl) return fail(400, "That does not look like a LinkedIn profile URL (linkedin.com/in/...).");
 
   try {
     const before = await getLead(id);
     if (!before) return leadNotFound();
-    // A hand-entered address replaces whatever Hunter scored, so its confidence no longer applies.
-    if (patch.email !== undefined && patch.email !== before.email) patch.emailConfidence = null;
+    // A hand-entered address replaces whatever Hunter found: it is the team's, with no score.
+    if (patch.email !== undefined && patch.email !== before.email) {
+      patch.emailConfidence = null;
+      patch.emailStatus = patch.email ? "manual" : null;
+    }
 
-    const lead = await updateLead(id, patch);
+    let lead: Lead | null = before;
+    if (linkedinUrl !== undefined && linkedinUrl !== before.linkedinUrl) {
+      try {
+        lead = await setLeadLinkedin(id, linkedinUrl);
+      } catch (err) {
+        if (err instanceof DuplicateLeadError) return fail(409, "Another lead already has this LinkedIn profile.", { existingId: err.existingId });
+        throw err;
+      }
+    }
+    if (lead && Object.keys(patch).length) lead = await updateLead(id, patch);
     if (!lead) return leadNotFound(); // deleted in between
 
     if (patch.stage && patch.stage !== before.stage) {

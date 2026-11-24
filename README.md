@@ -2,7 +2,8 @@
 
 A research agent for one-off, high-value leads, built for Abstract (abstract.inc).
 
-Add a LinkedIn URL and a few notes. The agent reads the person's LinkedIn profile and
+Add a LinkedIn URL and a few notes, or import contacts from a CSV file, a Google Sheet or
+HubSpot. The agent reads the person's LinkedIn profile and
 posts, their company, the web, Hugging Face and X, and writes a sourced brief, a picture
 of the company and three or four outreach angles, each with an email and a LinkedIn
 message. You review, edit and send. Every claim in a draft links back to the page it
@@ -13,10 +14,13 @@ about 1.5 minutes and costs a few cents.
 
 ## How a run works
 
-1. **Identify**: LinkedIn profile (Unipile, Apify as fallback), company and domain.
+1. **Identify**: LinkedIn profile (Unipile, Apify as fallback), company and domain. A lead
+   without a URL is looked up first: up to 2 Exa searches, and a profile is only taken when
+   the name matches and so does the company or the email's domain.
 2. **Gather, in parallel**: LinkedIn posts and company page, Apollo company data and job
    postings, Exa web and people search, Hugging Face accounts and models, a Hunter email,
-   and X posts through Grok (only once the handle is verified).
+   and X posts through Grok (only once the handle is verified). A re-run with a reason adds
+   one web search for it.
 3. **Extract**: Haiku turns each source into small sourced facts and applies your criteria
    (for example, "no personal life").
 4. **Fill gaps**: a short Haiku tool loop searches for what is still missing: robots and
@@ -26,6 +30,26 @@ about 1.5 minutes and costs a few cents.
 
 Progress shows live on the lead page. You can steer a lead in plain English ("make the
 first angle shorter", "dig into their compute setup").
+
+## Working with leads
+
+- **Import** (`/leads/import`, the Import button on Leads): a CSV file (read in the browser,
+  up to 10 MB and 5,000 rows), a Google Sheet link (shared as "Anyone with the link, Viewer")
+  or HubSpot contacts. Match the columns, tick the rows, import. A row needs a LinkedIn URL,
+  or a name plus a company or an email. Duplicates are matched by LinkedIn profile, HubSpot
+  id, email, or for rows with none of those, the name and company as first imported.
+  Importing never starts research: an imported lead reads "Not researched yet".
+- **Leads without LinkedIn** show "No LinkedIn yet". Add the URL on the lead page, or let
+  research look for it. A wrong profile can be changed under Details, then re-run.
+- **Re-run research** on a researched lead asks why first (up to 1,200 characters, with quick
+  picks). The agent looks into the reason first, and the brief and drafts lean on it. It
+  shows in the activity as "Re-run: ...". An empty reason is a plain re-run.
+- **Email**: each address shows its kind: found by Hunter, verified from the company's
+  pattern, a guess from the pattern (the mail server accepts every address, so it could not
+  be checked; 50% sure), imported, or added by you. "Find email" runs one Hunter lookup
+  without a research run; research and Find email never replace an address you added or
+  imported. "Open in Gmail" fills the To line with it, and the line next to the button
+  shows which address the draft will use.
 
 ## Stack
 
@@ -38,9 +62,9 @@ Next.js 16 (App Router), React 19, Tailwind 4, Neon Postgres over HTTPS
 | Company data | Apollo (company enrich and job postings work on the free plan) |
 | Web and people | Exa |
 | X | Grok through OpenRouter with X search, pinned to the person's handle |
-| Email | Hunter (one lookup per lead) |
+| Email | Hunter: the Email Finder, then the company's email pattern (Domain Search and the verifier) |
 | Models | Hugging Face Hub API; Abstract's checkpoint inspect when a key is set |
-| CRM | HubSpot (V1, built but not yet tested against a live account) |
+| CRM | HubSpot push and contact import (built, not yet tested against a live account) |
 
 ## Run it locally
 
@@ -53,21 +77,21 @@ npm run dev                  # http://localhost:3000
 
 The access gate is off locally unless `APP_PASSWORD` is set.
 
-### Usage panel (owner only)
+### Usage tab
 
-```bash
-npm run admin                # then open http://127.0.0.1:3001/admin
-```
-
-Shows what every API key has used and spent, per lead and in total, with live balances
-(Hunter credits, OpenRouter limit, Apify monthly usage, Apollo credits, Unipile status).
-It has no password because it only answers on your own machine: on Vercel, on a
-production build or from any other computer, `/admin` is a plain 404.
+`/usage`, in the main nav. It shows what every API key has used and spent: totals, a card per
+provider with its live balance (Hunter credits, OpenRouter limit, Apify monthly usage, Apollo
+credits, Unipile status), daily spend over 30 days, the duration and cost of each research run,
+the median and 95th-percentile time and the cost of each kind of request, cost per lead, and
+every call (sortable, with a CSV export). Balances are free reads, checked at most once a
+minute (or every 30 seconds with Refresh balances). It follows the same access rules as every
+page, so on an open deploy anyone with the URL can see it.
 
 ### Analytics
 
 PostHog tracks page views and named actions (lead created, drafts copied, marked as sent,
-stage changes, steering, settings saved) through the app's own `/ingest` path. Only ids,
+stage changes, steering, settings saved, imports, re-runs with a reason, email lookups and
+edits) through the app's own `/ingest` path. Only ids,
 counts and timings are sent; never names, emails, notes or draft text. Session recording
 and autocapture are off. Set `NEXT_PUBLIC_POSTHOG_KEY` to turn it on (it is fixed at build time).
 
@@ -108,6 +132,19 @@ does not give runs back. Over a cap, the API answers 429 and a new lead is saved
 Set either limit to 0 to pause all runs. Runs started from `scripts/test-research.ts --full`
 or `--steer` count toward the same caps.
 
+Two more budgets work the same way (`le_quota_uses`):
+
+- **Imports**: 2,000 new leads in any rolling 24 hours (`IMPORT_LIMIT_PER_DAY`). An import that
+  would pass it adds nothing and says how many more fit.
+- **Hunter credits**: 10 in any rolling 24 hours (`HUNTER_CREDITS_PER_DAY`), shared by Find email
+  and research's email step. Each lookup reserves its worst case (1.5 credits: 1 when the
+  Email Finder finds an address, otherwise Domain Search 1 plus the verifier 0.5) and keeps
+  only what Hunter charged. When the budget is used up, Find email answers 429 and research
+  skips the email step. The free plan has 50 credits a month.
+
+On an open deploy (`ALLOW_OPEN_ACCESS=1`), HubSpot import is refused until `APP_PASSWORD` and
+`SESSION_SECRET` are set: otherwise anyone with the URL could list the CRM's contacts.
+
 Vercel's Hobby plan is for non-commercial use. It is fine for a prototype; move the
 project to a team on a paid plan for real company use.
 
@@ -125,9 +162,13 @@ runs a complete research pass for one lead and keeps it.
 
 ## Known limits
 
-- Sending is manual in this version: "Open in Gmail" opens a filled-in draft, and
-  "Mark as sent" sets the follow-up date. Sending from the app and reply watching come next.
-- HubSpot push is built against HubSpot's API docs but untested until a token is added.
+- Sending is manual in this version: "Open in Gmail" opens a filled-in draft (with the
+  recipient when the lead has an email), and "Mark as sent" sets the follow-up date. Sending
+  from the app and reply watching come next.
+- HubSpot push and import are built against HubSpot's API docs but untested until a token is
+  added. A push only writes to a contact found by its record id when that contact has the
+  lead's email or first and last name.
+- The Google Sheet import reads a sheet's first 5,000 rows.
 - Apollo's person match needs a paid plan; person data comes from LinkedIn and Hunter.
 - Abstract's checkpoint inspect is off until `ABSTRACT_API_KEY` is set.
 - Fill in Settings > Sender (name, email, booking link, signature). Until then drafts end

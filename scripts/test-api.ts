@@ -462,6 +462,40 @@ async function testRoutes(): Promise<void> {
     check("POST /steer when idle is 202 { ok: true }", steered.status === 202 && steered.data?.ok === true && afterTasks.length === 3, steered.data);
     await finishResearch(id, "done");
 
+    // A re-run with a reason: { focus } is checked before any run slot is taken, logged as
+    // "Re-run: <focus>", and the run is handed to after(). No body, {} or a blank focus is a plain re-run.
+    const reruns = async () => (await listEvents(id)).filter((e) => e.type === "steer" && e.message.startsWith("Re-run: "));
+    const rerunPost = (opts: { body?: unknown; rawBody?: string; headers?: Record<string, string> }) =>
+      callRoute(research, { method: "POST", path: `/api/leads/${id}/research`, id, ...opts });
+    let tasks = afterTasks.length;
+    const tooLong = await rerunPost({ body: { focus: "x".repeat(1201) } });
+    check("POST /research with a focus over 1,200 characters is 400", tooLong.status === 400 && /1,200/.test(String(tooLong.data?.error)) && afterTasks.length === tasks, tooLong.data);
+    const notText = await rerunPost({ body: { focus: 42 } });
+    check("POST /research with a focus that is not text is 400", notText.status === 400 && afterTasks.length === tasks, notText.data);
+    const plainBody = await rerunPost({ rawBody: JSON.stringify({ focus: "x" }), headers: { "content-type": "text/plain" } });
+    check("POST /research with a text/plain body is 415", plainBody.status === 415 && afterTasks.length === tasks, plainBody.data);
+    const focused = await rerunPost({ body: { focus: "  Dig into their GPU spend\nand who signs off  " } });
+    const logged = await reruns();
+    check("POST /research { focus } is 202 and hands the run to after()", focused.status === 202 && focused.data?.ok === true && afterTasks.length === tasks + 1, focused.data);
+    check(
+      'POST /research { focus } logs "Re-run: <focus>" (trimmed) with the focus as data',
+      logged.length === 1 && logged[0].message === "Re-run: Dig into their GPU spend\nand who signs off" && (logged[0].data as { focus?: string })?.focus === "Dig into their GPU spend\nand who signs off",
+      logged,
+    );
+    await finishResearch(id, "done");
+    for (const [label, opts] of [
+      ["no body", {}],
+      ["{}", { body: {} }],
+      ["a blank focus", { body: { focus: "   " } }],
+      ["a null focus", { body: { focus: null } }],
+      ["an empty body sent as JSON", { rawBody: "", headers: { "content-type": "application/json" } }],
+    ] as const) {
+      tasks = afterTasks.length;
+      const r = await rerunPost(opts);
+      check(`POST /research with ${label} is a plain re-run (202, nothing logged)`, r.status === 202 && afterTasks.length === tasks + 1 && (await reruns()).length === 1, r.data);
+      await finishResearch(id, "done");
+    }
+
     // PATCH
     const patch = asHandler(leadRoute.PATCH);
     const before = await getLead(id);
@@ -477,6 +511,34 @@ async function testRoutes(): Promise<void> {
     const p2 = await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { email: "jane@example.com", title: "", notes: null } });
     const p2lead = p2.data?.lead as Lead | undefined;
     check("PATCH email resets its confidence; '' and null clear", p2.status === 200 && p2lead?.email === "jane@example.com" && p2lead?.emailConfidence === null && p2lead?.title === null && p2lead?.notes === null, p2lead && { email: p2lead.email, conf: p2lead.emailConfidence });
+    check("PATCH email marks the address as added by hand", p2lead?.emailStatus === "manual", p2lead?.emailStatus);
+
+    // Email by hand: lower case, "manual"; the same address again keeps its kind; null clears all three.
+    await query("update le_leads set email = 'found@acme.com', email_status = 'found', email_confidence = 80 where id = $1", [id]);
+    const typed = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { email: " Jane.Doe@Example.COM " } })).data?.lead as Lead | undefined;
+    check("PATCH email: trimmed, lower case, manual, no confidence", typed?.email === "jane.doe@example.com" && typed?.emailStatus === "manual" && typed?.emailConfidence === null, typed && { e: typed.email, s: typed.emailStatus, c: typed.emailConfidence });
+    await query("update le_leads set email_status = 'found', email_confidence = 80 where id = $1", [id]);
+    const same = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { email: "JANE.DOE@example.com" } })).data?.lead as Lead | undefined;
+    check("PATCH email with the same address keeps its kind and confidence", same?.emailStatus === "found" && same?.emailConfidence === 80, same && { s: same.emailStatus, c: same.emailConfidence });
+    const noEmail = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { email: null } })).data?.lead as Lead | undefined;
+    check("PATCH email null clears the address, its kind and confidence", noEmail?.email === null && noEmail?.emailStatus === null && noEmail?.emailConfidence === null, noEmail);
+
+    // LinkedIn URL by hand: normalised; 400 when not a profile; 409 with existingId when another lead has it; "" clears.
+    const other = await createLead({ linkedinUrl: `https://www.linkedin.com/in/${slug}-other` });
+    try {
+      const notProfile = await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { linkedinUrl: "https://www.linkedin.com/company/acme" } });
+      check("PATCH linkedinUrl that is not a profile is 400", notProfile.status === 400 && /LinkedIn profile URL/.test(String(notProfile.data?.error)), notProfile.data);
+      const taken = await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { linkedinUrl: `LINKEDIN.COM/IN/${slug.toUpperCase()}-OTHER` } });
+      check("PATCH linkedinUrl another lead has is 409 with existingId", taken.status === 409 && taken.data?.existingId === other.id, taken.data);
+      const moved = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { linkedinUrl: `linkedin.com/in/${slug}-New/?trk=x`, owner: "Kim" } })).data?.lead as Lead | undefined;
+      check("PATCH linkedinUrl: normalised with its slug, other fields saved too", moved?.linkedinUrl === `https://www.linkedin.com/in/${slug}-new` && moved?.linkedinSlug === `${slug}-new` && moved?.owner === "Kim", moved && { u: moved.linkedinUrl, s: moved.linkedinSlug, o: moved.owner });
+      const cleared = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { linkedinUrl: "" } })).data?.lead as Lead | undefined;
+      check('PATCH linkedinUrl "" clears it (and its slug)', cleared?.linkedinUrl === null && cleared?.linkedinSlug === null, cleared && { u: cleared.linkedinUrl, s: cleared.linkedinSlug });
+      const back = (await callRoute(patch, { method: "PATCH", path: `/api/leads/${id}`, id, body: { linkedinUrl: `https://www.linkedin.com/in/${slug}` } })).data?.lead as Lead | undefined;
+      check("PATCH linkedinUrl sets it again", back?.linkedinUrl === `https://www.linkedin.com/in/${slug}`, back?.linkedinUrl);
+    } finally {
+      await deleteLead(other.id).catch(() => undefined);
+    }
 
     const angle: Angle & { recommended: boolean } = {
       id: "drop-onboard-gpu",
@@ -699,6 +761,9 @@ function sampleLead(over: Partial<Lead> = {}): Lead {
     companyLinkedinUrl: "https://www.linkedin.com/company/acme-robotics",
     email: "Jane@Acme-Robotics.com",
     emailConfidence: 91,
+    emailStatus: null,
+    source: null,
+    hubspotContactId: null,
     xHandle: null,
     location: null,
     notes: null,
@@ -893,6 +958,39 @@ async function testHubSpot(): Promise<void> {
       check("D: found by name + company after one 429 retry", r.ok && r.contactId === "p3" && search.length === 2, { r, n: search.length });
       check("D: name + company filters (linked company OR company text)", filtersOf(search[1]).join("|") === "firstname=Jane&lastname=Doe&associations.company=c3|firstname=Jane&lastname=Doe&company=Acme Robotics", filtersOf(search[1]));
       check("D: no email lookup without an email", !m.calls.some((c) => c.method === "GET" && c.path.includes("/contacts/")));
+    } finally {
+      m.restore();
+    }
+  }
+
+  // F: a lead imported from HubSpot goes back to its own contact, found by id; a deleted one falls back to the email.
+  {
+    const m = mockHubSpot(token, [
+      on("GET", "/crm/pipelines/2026-09/deals", () => reply(PIPELINES)),
+      on("POST", `${V}/companies/search`, () => reply({ results: [{ id: "c7", properties: { name: "Acme Robotics", domain: "acme-robotics.com" } }] })),
+      on("GET", `${V}/contacts/4242`, () => reply({ id: "4242", properties: { email: "", firstname: "Jane", lastname: "Doe" } })),
+      on("GET", `${V}/contacts/4343`, () => reply({ status: "error", message: "Object not found", category: "OBJECT_NOT_FOUND" }, 404)),
+      on("GET", `${V}/contacts/4444`, () => reply({ id: "4444", properties: { email: "someone@else.example", firstname: "Other", lastname: "Person" } })),
+      on("GET", /\/contacts\/jane%40/, () => reply({ id: "p8", properties: { email: "jane@acme-robotics.com" } })),
+      on("PATCH", /\/contacts\/(4242|p8)$/, (c) => reply({ id: c.path.split("/").pop(), properties: {} })),
+      on("PUT", /\/associations\/default\//, () => reply({ status: "COMPLETE" })),
+      on("POST", `${V}/deals/search`, () => reply({ results: [] })),
+      on("POST", `${V}/deals`, () => reply({ id: "d7" }, 201)),
+      on("POST", `${V}/notes`, () => reply({ id: "n7" }, 201)),
+    ]);
+    try {
+      const r = await pushLeadToHubSpot({ lead: sampleLead({ hubspotContactId: "4242", source: "hubspot" }), sentAngle: SENT });
+      const gets = m.calls.filter((c) => c.method === "GET" && c.path.includes("/contacts/")).map((c) => c.path);
+      check("F: an imported lead reuses its HubSpot contact by id, no email lookup", r.ok && r.contactId === "4242" && gets.join() === `${V}/contacts/4242` && !r.created.includes("contact"), { r, gets });
+      const patchCall = m.calls.find((c) => c.method === "PATCH" && c.path === `${V}/contacts/4242`);
+      check("F: only its empty fields are filled (the email)", (patchCall?.body?.properties as Record<string, string> | undefined)?.email === "jane@acme-robotics.com" && !("firstname" in ((patchCall?.body?.properties as object) ?? {})), patchCall?.body);
+      const r2 = await pushLeadToHubSpot({ lead: sampleLead({ hubspotContactId: "4343" }), sentAngle: SENT });
+      check("F: a contact deleted in HubSpot falls back to the email lookup", r2.ok && r2.contactId === "p8", r2);
+      // An import row can name any record id: a contact that is someone else is never written to.
+      const before = m.calls.length;
+      const r3 = await pushLeadToHubSpot({ lead: sampleLead({ hubspotContactId: "4444" }), sentAngle: SENT });
+      const touched = m.calls.slice(before).filter((c) => c.method !== "GET" && (c.path.includes("4444") || JSON.stringify(c.body ?? null).includes('"4444"')));
+      check("F: a contact id that is someone else is not written to; the email lookup is used", r3.ok && r3.contactId === "p8" && touched.length === 0, { r3, touched: touched.map((c) => `${c.method} ${c.path}`) });
     } finally {
       m.restore();
     }

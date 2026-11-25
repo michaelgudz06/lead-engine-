@@ -21,6 +21,7 @@
  *   reset on log out. The access password and keys are never part of an event.
  */
 import type { CaptureResult, PostHogConfig } from "posthog-js";
+import type { WarmSourceNetwork, WarmStrength } from "./paths/types";
 import type { ImportSource, Settings, Stage, UnqualifiedReasonKey } from "./types";
 
 // ------------------------------------------------------------------ events
@@ -37,13 +38,24 @@ export interface AngleRef {
 
 export type DraftField = "subject" | "body" | "linkedin";
 
-export const SETTINGS_FIELDS = ["senderName", "senderEmail", "calendlyUrl", "signature", "followUpDays", "criteria"] as const;
+export const SETTINGS_FIELDS = ["senderName", "senderEmail", "calendlyUrl", "signature", "followUpDays", "criteria", "xHandle", "instagramHandle", "linkedinUrl"] as const;
 export type SettingsField = (typeof SETTINGS_FIELDS)[number];
 
 type NoProps = Record<never, never>;
 
 /** Where leads were marked, restored or deleted: the Leads list, a lead's page or the pipeline board. */
 export type LeadSurface = "list" | "lead" | "pipeline";
+
+/** A warm path's strength for analytics; "none" for a person at the lead's company (no strength). */
+export type WarmPathStrengthProp = WarmStrength | "none";
+/** The best path a check found: its strength, "direct" for a confirmed direct tie, "none" when nothing was found. */
+export type WarmPathBestProp = WarmStrength | "direct" | "none";
+/**
+ * Which link was opened: "check_yourself" (LinkedIn's mutual connections, X's followers you know,
+ * the lead's Instagram), "connector" (the person in the middle, on LinkedIn or X), "lead" (the lead
+ * on X, from the direct box).
+ */
+export type WarmPathLinkKind = "check_yourself" | "connector" | "lead";
 
 /** Every client event and its properties. Only these (plus $pageview and $pageleave) are sent. */
 export interface ClientEventProps {
@@ -84,6 +96,24 @@ export interface ClientEventProps {
   email_edited: NoProps;
   login_succeeded: NoProps;
   logged_out: NoProps;
+  /**
+   * "Find warm paths" (trigger "find") or "Check again" ("again") came back. found: paths found;
+   * best: the best one's strength ("direct" for a confirmed direct tie, "none" when none or failed).
+   */
+  warm_paths_checked: { leadId: LeadId; found: number; best: WarmPathBestProp; trigger: "find" | "again" };
+  /** A path row was opened. rank: its place in the list (1 is best); company people rank among themselves. */
+  warm_path_opened: { leadId: LeadId; rank: number; strength: WarmPathStrengthProp; hops: 1 | 2 };
+  /** A link out of the panel was opened (it opens in your own browser; nothing is read). */
+  warm_path_link_opened: { leadId: LeadId; network: WarmSourceNetwork; kind: WarmPathLinkKind };
+  /** "Draft intro request" came back. ok: a draft was saved. */
+  warm_path_intro_drafted: { leadId: LeadId; rank: number; ok: boolean };
+  /** The intro request was copied. length: its characters, never the text. */
+  warm_path_intro_copied: { leadId: LeadId; rank: number; length: number };
+  warm_path_marked_asked: { leadId: LeadId; rank: number };
+  /** A Connections.csv upload finished. count: connections stored. */
+  network_connections_uploaded: { count: number };
+  /** "Refresh now" on your X lists came back with their sizes. */
+  network_x_synced: { following: number; followers: number };
 }
 
 export type ClientEvent = keyof ClientEventProps;
@@ -118,6 +148,14 @@ const EVENT_LIST: Record<ClientEvent, true> = {
   email_edited: true,
   login_succeeded: true,
   logged_out: true,
+  warm_paths_checked: true,
+  warm_path_opened: true,
+  warm_path_link_opened: true,
+  warm_path_intro_drafted: true,
+  warm_path_intro_copied: true,
+  warm_path_marked_asked: true,
+  network_connections_uploaded: true,
+  network_x_synced: true,
 };
 export const CLIENT_EVENTS = Object.keys(EVENT_LIST) as ClientEvent[];
 
@@ -131,8 +169,12 @@ export type SafeProps = Record<string, SafeValue>;
 
 /** camelCase or snake_case; no "$" (PostHog's own properties are not ours to set). */
 const KEY_RE = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
-/** Keys that name content. Their strings are never sent, whatever they look like (booleans and counts are fine). */
-const CONTENT_KEY_RE = /name|mail|note|text|body|subject|message|url|uri|href|link|instruction|draft|signature|password|secret|token|apikey|phone|address|company|title/i;
+/**
+ * Keys that name content. Their strings are never sent, whatever they look like (booleans and
+ * counts are fine). "handle": an X or Instagram handle is a token-shaped string, so only its key
+ * can keep it out.
+ */
+const CONTENT_KEY_RE = /name|mail|note|text|body|subject|message|url|uri|href|link|instruction|draft|signature|password|secret|token|apikey|phone|address|company|title|handle/i;
 /** An id, an enum value or a field name: no spaces, no "@", no "/", at most 64 characters. */
 const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 /** "linkedin.com", "abstract.inc", "mail.google": anything domain-like. */

@@ -28,7 +28,8 @@ function cleanAngles(angles: Angle[]): Angle[] {
     }));
 }
 
-async function copyText(text: string): Promise<boolean> {
+/** Copies text to the clipboard. False when the browser refuses. */
+export async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
@@ -156,7 +157,7 @@ export function AnglesSection({
 
   if (!active) {
     return (
-      <Panel title="Angles" id="angles">
+      <Panel title="Angles" id="angles" className="scroll-mt-28 sm:scroll-mt-20">
         <p className="text-quiet">No angles were written. Re-run research, or use Steer below to tell the agent what to try.</p>
       </Panel>
     );
@@ -208,6 +209,8 @@ export function AnglesSection({
     <Panel
       title="Angles"
       id="angles"
+      // Warm paths' "Go to Angles" jumps here: on phones the sticky header is two rows.
+      className="scroll-mt-28 sm:scroll-mt-20"
       aside={
         <span className={cx("text-[13px]", saveState === "error" ? "text-danger" : "text-quiet")} aria-live="polite">
           {status}
@@ -404,7 +407,7 @@ export function AnglesSection({
   );
 }
 
-function countWords(text: string): number {
+export function countWords(text: string): number {
   const t = text.trim();
   return t ? t.split(/\s+/).length : 0;
 }

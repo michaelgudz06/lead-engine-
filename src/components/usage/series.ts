@@ -19,6 +19,7 @@ export const SHORT_LABELS: Record<UsageProvider, string> = {
   huggingface: "Hugging Face",
   abstract: "Abstract",
   hubspot: "HubSpot",
+  twitterapi: "twitterapi.io",
 };
 
 export type SeriesId = "anthropic" | "exa" | "openrouter" | "apify" | "apollo" | "hunter" | "other";
@@ -33,6 +34,15 @@ export const SERIES: ReadonlyArray<{ id: SeriesId; label: string; color: string 
   { id: "hunter", label: "Hunter", color: "#008300" },
   { id: "other", label: "Other", color: "#898781" },
 ];
+
+/**
+ * The providers behind "Other" among those given, by their short names and in the app's provider
+ * order: twitterapi.io (X follows for warm paths) is folded in here, with no colour of its own.
+ */
+export function otherLabels(providers: Iterable<UsageProvider>): string[] {
+  const given = new Set(providers);
+  return (Object.keys(SHORT_LABELS) as UsageProvider[]).filter((p) => given.has(p) && seriesOf(p) === "other").map((p) => SHORT_LABELS[p]);
+}
 
 export function seriesOf(provider: UsageProvider): SeriesId {
   switch (provider) {

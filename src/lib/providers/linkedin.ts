@@ -1,9 +1,11 @@
 import "server-only";
 import { hasEnv, optionalEnv } from "../env";
 import { fetchJson, HttpError, normaliseLinkedinUrl } from "../http";
+import { sharedConnectionsSearchUrl } from "../paths/links";
 import { metered } from "../usage/ledger";
 import { apifyCostUsd, FREE, type ApifyOperation } from "../usage/prices";
 import type { ProviderStatus } from "../types";
+import { chooseResearchAccount, networkAccountState, unipileAccountsFrom, type NetworkAccountState } from "./unipile-accounts";
 
 /**
  * LinkedIn data. Primary: Unipile (a separate LinkedIn account connected in the
@@ -24,12 +26,23 @@ import type { ProviderStatus } from "../types";
  *
  * None of the exported functions throw: failures come back in `error`.
  * Keys only travel in headers, so they never appear in a URL, a log line or an error.
+ *
+ * Two Unipile accounts (src/lib/providers/unipile-accounts.ts decides which is which):
+ *  - research: the separate account every read above goes through (UNIPILE_ACCOUNT_ID, or the one
+ *    LinkedIn account that is not the owner's; never a guess between two).
+ *  - network: the owner's own LinkedIn (UNIPILE_NETWORK_ACCOUNT_ID), for warm paths only: the
+ *    lead's degree, the shared connections of a 2nd-degree lead, and the account's premium flags.
+ *    Ledger operations network-profile, network-search and network-me. Never an Apify fallback.
+ * Each account has its own cooldown, so a 429 on the owner's account never pushes research onto
+ * Apify, and the reverse.
  */
 
 export interface LinkedInExperience {
   title: string | null;
   company: string | null;
   companyLinkedinUrl: string | null;
+  /** LinkedIn's numeric company id, when the provider gives it (Unipile company_id). */
+  companyId?: string | null;
   location: string | null;
   startDate: string | null;
   endDate: string | null;
@@ -38,11 +51,17 @@ export interface LinkedInExperience {
 
 export interface LinkedInEducation {
   school: string | null;
+  /** LinkedIn's numeric school id, when the provider gives it (Unipile school_id). */
+  schoolId?: string | null;
   degree: string | null;
   field: string | null;
   startDate: string | null;
   endDate: string | null;
 }
+
+/** How far the profile is from the account that read it. Only meaningful from the owner's own account. */
+export type NetworkDistance = "FIRST_DEGREE" | "SECOND_DEGREE" | "THIRD_DEGREE" | "OUT_OF_NETWORK";
+export const NETWORK_DISTANCES: readonly NetworkDistance[] = ["FIRST_DEGREE", "SECOND_DEGREE", "THIRD_DEGREE", "OUT_OF_NETWORK"];
 
 export interface LinkedInProfile {
   url: string;
@@ -65,6 +84,13 @@ export interface LinkedInProfile {
   websites: string[];
   followers: number | null;
   connections: number | null;
+  /**
+   * Unipile only: the profile's distance from the account that read it, and the connections they
+   * share. Research reads through its own separate account, so on a research read these describe
+   * that account's network, not the owner's: never use them for warm paths.
+   */
+  networkDistance?: NetworkDistance | null;
+  sharedConnectionsCount?: number | null;
   via: "unipile" | "apify";
 }
 
@@ -204,11 +230,17 @@ export function linkedinStatus(): ProviderStatus {
   const unipile = unipileSettings();
   const unipilePartial = !unipile && (hasEnv("UNIPILE_API_KEY") || hasEnv("UNIPILE_DSN"));
   const apify = hasEnv("APIFY_TOKEN");
-  const account = optionalEnv("UNIPILE_ACCOUNT_ID")
-    ? "the account pinned in UNIPILE_ACCOUNT_ID"
-    : "the first connected LinkedIn account";
+  const account = optionalEnv("UNIPILE_ACCOUNT_ID") ? "the account pinned in UNIPILE_ACCOUNT_ID" : "the one connected LinkedIn account; pin UNIPILE_ACCOUNT_ID";
+  // With your own account set up, research reads through Unipile only once its account is pinned.
+  const unpinned = !optionalEnv("UNIPILE_ACCOUNT_ID") && Boolean(optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID"));
+  // Both variables naming one account: research refuses it and warm paths treat your account as off.
+  const sameAccount = Boolean(optionalEnv("UNIPILE_ACCOUNT_ID")) && optionalEnv("UNIPILE_ACCOUNT_ID") === optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID");
   let detail: string;
-  if (unipile && apify) {
+  if (unipile && sameAccount) {
+    detail = `UNIPILE_ACCOUNT_ID and UNIPILE_NETWORK_ACCOUNT_ID name the same account, so research does not read LinkedIn through Unipile and warm paths do not use your account. Set each to its own account. ${apify ? "Apify actors are used meanwhile." : "No fallback: set APIFY_TOKEN to add the Apify actors."}`;
+  } else if (unipile && unpinned) {
+    detail = `Research does not read LinkedIn through Unipile until UNIPILE_ACCOUNT_ID is pinned to the research account, since your own account is set up. ${apify ? "Apify actors are used meanwhile." : "No fallback: set APIFY_TOKEN to add the Apify actors."}`;
+  } else if (unipile && apify) {
     detail = `Unipile is primary (${account}); Apify actors are the fallback for profiles, posts and company pages.`;
   } else if (unipile) {
     detail = `Unipile is primary (${account}). No fallback: set APIFY_TOKEN to add the Apify actors.`;
@@ -237,8 +269,8 @@ async function withFallback<R extends { error?: string }>(
 ): Promise<R> {
   const errors: string[] = [];
   if (unipileSettings()) {
-    if (Date.now() < unipileCooldown.until) {
-      errors.push(`Unipile skipped after a recent failure (${unipileCooldown.reason})`);
+    if (Date.now() < cooldowns.research.until) {
+      errors.push(`Unipile skipped after a recent failure (${cooldowns.research.reason})`);
     } else {
       const r = await viaUnipile();
       if (ok(r)) return r;
@@ -305,44 +337,66 @@ function unipileUrl(route: UnipileRoute, path: string, query: Record<string, Que
 }
 
 const CONNECTION_TTL_MS = 10 * 60_000;
-let connectionPromise: Promise<UnipileConnection> | null = null;
-let connectionAt = 0;
-/** Which settings the cached connection belongs to (in memory only, never logged). */
-let connectionFor = "";
 
-/** Route + account, resolved once and shared by concurrent callers (profile, posts, company). */
-function unipileConnection(settings: { key: string; routes: UnipileRoute[] }): Promise<UnipileConnection> {
-  const forSettings = `${settings.routes[0]?.base}|${settings.key}|${optionalEnv("UNIPILE_ACCOUNT_ID") ?? ""}`;
-  if (connectionPromise && connectionFor === forSettings && Date.now() - connectionAt < CONNECTION_TTL_MS) {
-    return connectionPromise;
-  }
-  connectionFor = forSettings;
-  connectionAt = Date.now();
-  const p = resolveUnipileConnection(settings);
-  connectionPromise = p;
+/** research: the separate account research reads with. network: the owner's own account (warm paths). */
+export type UnipileAccountRole = "research" | "network";
+
+interface CachedConnection {
+  promise: Promise<UnipileConnection> | null;
+  at: number;
+  /** Which settings the cached connection belongs to (in memory only, never logged). */
+  for: string;
+}
+const connections: Record<UnipileAccountRole, CachedConnection> = {
+  research: { promise: null, at: 0, for: "" },
+  network: { promise: null, at: 0, for: "" },
+};
+
+/** Route + account for one role, resolved once and shared by concurrent callers for 10 minutes. */
+function unipileConnection(settings: { key: string; routes: UnipileRoute[] }, role: UnipileAccountRole): Promise<UnipileConnection> {
+  const c = connections[role];
+  const forSettings = `${settings.routes[0]?.base}|${settings.key}|${optionalEnv("UNIPILE_ACCOUNT_ID") ?? ""}|${optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID") ?? ""}`;
+  if (c.promise && c.for === forSettings && Date.now() - c.at < CONNECTION_TTL_MS) return c.promise;
+  c.for = forSettings;
+  c.at = Date.now();
+  const p = resolveUnipileConnection(settings, role);
+  c.promise = p;
   p.catch(() => {
-    if (connectionPromise === p) connectionPromise = null;
+    if (c.promise === p) c.promise = null;
   });
   return p;
 }
 
-function resetUnipileConnection(): void {
-  connectionPromise = null;
+function resetUnipileConnection(role: UnipileAccountRole): void {
+  connections[role].promise = null;
 }
 
 /**
  * After an outage-type failure the public functions skip Unipile for a while and go straight
  * to Apify: no 12-45 s wait per call while Unipile is down, and no repeated LinkedIn requests
- * on the owner's account while LinkedIn rate-limits it. Per-item errors (404, 422) do not count.
+ * on a LinkedIn account while LinkedIn rate-limits it. Per-item errors (404, 422) do not count.
+ * One cooldown per account: a 429 on the owner's account must not push research onto paid Apify.
  */
-const unipileCooldown = { until: 0, reason: "" };
+const cooldowns: Record<UnipileAccountRole, { until: number; reason: string }> = {
+  research: { until: 0, reason: "" },
+  network: { until: 0, reason: "" },
+};
 
-function noteUnipileFailure(err: unknown): void {
+function noteUnipileFailure(err: unknown, role: UnipileAccountRole): void {
   const status = err instanceof HttpError ? err.status : 0;
   const outage = !(err instanceof HttpError) || status === 401 || status === 429 || status >= 500;
   if (!outage) return;
-  unipileCooldown.until = Date.now() + (status === 429 ? 15 * 60_000 : 2 * 60_000);
-  unipileCooldown.reason = describeError(err, "Unipile");
+  cooldowns[role].until = Date.now() + (status === 429 ? 15 * 60_000 : 2 * 60_000);
+  cooldowns[role].reason = describeError(err, "Unipile");
+}
+
+/** Tests only: forget the cached accounts and both cooldowns. */
+export function resetUnipileState(): void {
+  for (const role of ["research", "network"] as const) {
+    resetUnipileConnection(role);
+    cooldowns[role] = { until: 0, reason: "" };
+  }
+  accountsCache = null;
 }
 
 /**
@@ -350,7 +404,7 @@ function noteUnipileFailure(err: unknown): void {
  * so it is a safe reachability probe. Only network failures move on to the next route: an
  * HTTP status means Unipile answered and another route would say the same.
  */
-async function resolveUnipileConnection(settings: { key: string; routes: UnipileRoute[] }): Promise<UnipileConnection> {
+async function listUnipileAccounts(settings: { key: string; routes: UnipileRoute[] }): Promise<{ route: UnipileRoute; list: unknown }> {
   let lastError: unknown = new LinkedInError("Unipile has no route to try");
   for (const route of settings.routes) {
     try {
@@ -361,7 +415,7 @@ async function resolveUnipileConnection(settings: { key: string; routes: Unipile
           retry: false,
         }),
       );
-      return { ...route, accountId: pickLinkedInAccount(list) };
+      return { route, list };
     } catch (err) {
       if (err instanceof HttpError || err instanceof LinkedInError) throw err;
       lastError = err;
@@ -370,31 +424,32 @@ async function resolveUnipileConnection(settings: { key: string; routes: Unipile
   throw lastError;
 }
 
-/** UNIPILE_ACCOUNT_ID when set, else the first LinkedIn account whose sources are all OK. */
+async function resolveUnipileConnection(settings: { key: string; routes: UnipileRoute[] }, role: UnipileAccountRole): Promise<UnipileConnection> {
+  const { route, list } = await listUnipileAccounts(settings);
+  return { ...route, accountId: role === "network" ? pickNetworkAccount(list) : pickLinkedInAccount(list) };
+}
+
+/** UNIPILE_ACCOUNT_ID when set, else the one LinkedIn account when the owner's own is not set up (src/lib/providers/unipile-accounts.ts). */
 function pickLinkedInAccount(list: unknown): string {
-  const items = arr(obj(list).items).filter(isObj);
-  const statuses = (a: Json) => arr(a.sources).filter(isObj).map((s) => String(s.status ?? "UNKNOWN").toUpperCase());
-  const isLinkedIn = (a: Json) => String(a.type ?? "").toUpperCase() === "LINKEDIN";
+  const choice = chooseResearchAccount(unipileAccountsFrom(list), {
+    pinned: optionalEnv("UNIPILE_ACCOUNT_ID"),
+    network: optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID"),
+  });
+  if (!choice.ok) throw new LinkedInError(choice.message);
+  return choice.id;
+}
+
+/** UNIPILE_NETWORK_ACCOUNT_ID, when it is a running LinkedIn account in this workspace. */
+function pickNetworkAccount(list: unknown): string {
+  const id = optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID");
+  if (!id) throw new LinkedInError("UNIPILE_NETWORK_ACCOUNT_ID is not set");
   const pinned = optionalEnv("UNIPILE_ACCOUNT_ID");
-  if (pinned) {
-    const acc = items.find((a) => a.id === pinned);
-    if (!acc) throw new LinkedInError("UNIPILE_ACCOUNT_ID does not match any account in this Unipile workspace");
-    if (!isLinkedIn(acc)) throw new LinkedInError("UNIPILE_ACCOUNT_ID is not a LinkedIn account");
-    if (!statuses(acc).includes("OK")) {
-      throw new LinkedInError(
-        `The pinned Unipile LinkedIn account is not running (status ${statuses(acc).join("/") || "unknown"}); reconnect it in the Unipile dashboard`,
-      );
-    }
-    return pinned;
-  }
-  const linkedin = items.filter(isLinkedIn);
-  if (!linkedin.length) throw new LinkedInError("No LinkedIn account is connected in Unipile");
-  const allOk = (a: Json) => statuses(a).length > 0 && statuses(a).every((s) => s === "OK");
-  const chosen = linkedin.find(allOk) ?? linkedin.find((a) => statuses(a).includes("OK"));
-  const id = chosen ? str(chosen.id) : null;
-  if (!id) {
-    const seen = [...new Set(linkedin.flatMap(statuses))].join("/") || "unknown";
-    throw new LinkedInError(`No connected LinkedIn account is running in Unipile (status ${seen}); reconnect it in the Unipile dashboard`);
+  if (pinned && pinned === id) throw new LinkedInError("UNIPILE_NETWORK_ACCOUNT_ID is the same account as UNIPILE_ACCOUNT_ID; it must be the owner's own account");
+  const { state, statuses } = networkAccountState(unipileAccountsFrom(list), id);
+  if (state === "missing") throw new LinkedInError("UNIPILE_NETWORK_ACCOUNT_ID does not match any account in this Unipile workspace");
+  if (state === "not_linkedin") throw new LinkedInError("UNIPILE_NETWORK_ACCOUNT_ID is not a LinkedIn account");
+  if (state === "needs_reconnect") {
+    throw new LinkedInError(`Your LinkedIn account is not running in Unipile (status ${[...new Set(statuses)].join("/") || "unknown"}); reconnect it in the Unipile dashboard`);
   }
   return id;
 }
@@ -404,8 +459,17 @@ function unipileUsed() {
   return { units: { requests: 1 }, ...FREE };
 }
 
-/** Ledger operation for a Unipile path, without the ids in it. */
-function unipileOperation(path: string): string {
+/**
+ * Ledger operation for a Unipile path, without the ids in it. The owner's own account books
+ * network-* operations, so the Usage tab counts them apart from research's ~100 a day.
+ */
+export function unipileOperation(path: string, role: UnipileAccountRole = "research"): string {
+  if (role === "network") {
+    if (path === "/users/me") return "network-me";
+    if (path.startsWith("/users/")) return "network-profile";
+    if (path === "/linkedin/search") return "network-search";
+    return "network-request";
+  }
   if (/^\/users\/[^/]+\/posts$/.test(path)) return "posts";
   if (path.startsWith("/users/")) return "profile";
   if (path === "/linkedin/search") return "company-search";
@@ -413,35 +477,40 @@ function unipileOperation(path: string): string {
   return "request";
 }
 
+/** Thrown before any request reached LinkedIn: Unipile is off, the account is not usable, or it is cooling down. */
+class UnipileNotSentError extends LinkedInError {}
+
 async function unipileRequest<T>(
   method: "GET" | "POST",
   path: string,
-  opts: { query?: Record<string, QueryValue>; body?: unknown; timeoutMs: number },
+  opts: { query?: Record<string, QueryValue>; body?: unknown; timeoutMs: number; account?: UnipileAccountRole },
 ): Promise<T> {
+  const role = opts.account ?? "research";
   const settings = unipileSettings();
-  if (!settings) throw new LinkedInError("Unipile is not configured");
+  if (!settings) throw new UnipileNotSentError("Unipile is not configured");
   let conn: UnipileConnection;
   try {
-    conn = await unipileConnection(settings);
+    conn = await unipileConnection(settings, role);
   } catch (err) {
-    noteUnipileFailure(err); // unreachable, bad key, or no running LinkedIn account
+    noteUnipileFailure(err, role); // unreachable, bad key, or no usable LinkedIn account
+    if (err instanceof LinkedInError) throw new UnipileNotSentError(err.message);
     throw err;
   }
   try {
-    return await metered({ provider: "unipile", operation: unipileOperation(path), onOk: unipileUsed, onFail: unipileUsed }, () =>
+    return await metered({ provider: "unipile", operation: unipileOperation(path, role), onOk: unipileUsed, onFail: unipileUsed }, () =>
       fetchJson<T>(unipileUrl(conn, path, { ...opts.query, account_id: conn.accountId }), {
         method,
         headers: { "X-API-KEY": settings.key },
         body: opts.body,
         timeoutMs: opts.timeoutMs,
-        // No blind retry: each call is a LinkedIn request on the owner's account, and Apify is the fallback.
+        // No blind retry: each call is a LinkedIn request on a LinkedIn account, and Apify is the fallback.
         retry: false,
       }),
     );
   } catch (err) {
     // The cached route or account may be stale (network change, reconnected account): re-resolve next time.
-    if (!(err instanceof HttpError) || err.status === 401 || err.status === 403) resetUnipileConnection();
-    noteUnipileFailure(err);
+    if (!(err instanceof HttpError) || err.status === 401 || err.status === 403) resetUnipileConnection(role);
+    noteUnipileFailure(err, role);
     throw err;
   }
 }
@@ -549,6 +618,260 @@ export async function getCompanyViaUnipile(companyUrlOrName: string, debug?: Lin
   } catch (err) {
     return { company: null, error: describeError(err, "Unipile company") };
   }
+}
+
+/**
+ * A profile read through Unipile only, on the research account, with no Apify fallback. For warm
+ * paths: capturing the roles, schools and member id of a lead researched before warm paths
+ * existed. Default sections: previews plus the full work history (about 2 LinkedIn requests).
+ * Skips at once while the research account is cooling down. `sent` is false when nothing reached
+ * LinkedIn (not a profile URL, Unipile off, a cooldown, no usable account), so a reserved read can
+ * be given back. Never throws.
+ */
+export async function getProfileUnipileOnly(
+  profileUrl: string,
+  opts: { sections?: readonly string[]; timeoutMs?: number } = {},
+): Promise<{ profile: LinkedInProfile | null; error?: string; sent: boolean }> {
+  try {
+    const ident = profileIdentifier(profileUrl);
+    if (!ident) return { profile: null, error: "Not a LinkedIn profile URL (expected linkedin.com/in/...)", sent: false };
+    if (!unipileSettings()) return { profile: null, error: "Unipile is not configured", sent: false };
+    if (Date.now() < cooldowns.research.until) return { profile: null, error: `Unipile skipped after a recent failure (${cooldowns.research.reason})`, sent: false };
+    const raw = await unipileRequest<unknown>("GET", `/users/${encodeURIComponent(ident)}`, {
+      query: { linkedin_sections: [...(opts.sections ?? WARM_PATH_PROFILE_SECTIONS)], notify: false },
+      timeoutMs: opts.timeoutMs ?? 15_000,
+    });
+    const profile = mapUnipileProfile(raw, profileUrl);
+    if (!profile) return { profile: null, error: "Unipile returned a profile in an unexpected shape", sent: true };
+    rememberProviderId([ident, profile.publicId], profile.providerId);
+    return { profile, sent: true };
+  } catch (err) {
+    return { profile: null, error: describeError(err, "Unipile profile"), sent: !(err instanceof UnipileNotSentError) };
+  }
+}
+
+/** Previews of every section plus the full work history: enough for warm paths, without About. */
+const WARM_PATH_PROFILE_SECTIONS = ["*_preview", "experience"] as const;
+
+// ---------------------------------------------------------------------------
+// The owner's own LinkedIn (warm paths, step 2). UNIPILE_NETWORK_ACCOUNT_ID only, never Apify.
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a call on the owner's account failed. `sent` is false when nothing reached LinkedIn (Unipile
+ * off, the account not usable, a cooldown), so a reserved check can be given back.
+ * - rate_limited: 429, LinkedIn asked to slow down. auth: 401. server: 5xx. not_found: 404.
+ *   refused: another 4xx. timeout, network: no answer. config: not set up or not usable.
+ */
+export type NetworkFailureKind = "rate_limited" | "auth" | "server" | "not_found" | "refused" | "timeout" | "network" | "config";
+
+export type NetworkResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string; status: number | null; kind: NetworkFailureKind; sent: boolean };
+
+/** True when Unipile is configured and UNIPILE_NETWORK_ACCOUNT_ID names an account. Makes no call. */
+export function networkAccountConfigured(): boolean {
+  const id = optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID");
+  // The research account is never your account, even when both variables name it.
+  return Boolean(unipileSettings() && id && id !== optionalEnv("UNIPILE_ACCOUNT_ID"));
+}
+
+/** The accounts list, cached in memory for 10 minutes. GET /api/v1/accounts never touches LinkedIn. */
+let accountsCache: { at: number; for: string; promise: Promise<unknown> } | null = null;
+
+async function cachedAccounts(settings: { key: string; routes: UnipileRoute[] }): Promise<unknown> {
+  const forSettings = `${settings.routes[0]?.base}|${settings.key}`;
+  if (accountsCache && accountsCache.for === forSettings && Date.now() - accountsCache.at < CONNECTION_TTL_MS) return accountsCache.promise;
+  const promise = listUnipileAccounts(settings).then((r) => r.list);
+  const entry = { at: Date.now(), for: forSettings, promise };
+  accountsCache = entry;
+  promise.catch(() => {
+    if (accountsCache === entry) accountsCache = null;
+  });
+  return promise;
+}
+
+/**
+ * The owner's account as Unipile sees it: not_set_up (no UNIPILE_NETWORK_ACCOUNT_ID or no
+ * Unipile), connected, needs_reconnect (missing, not LinkedIn, or not running), or unavailable
+ * (Unipile did not answer). One accounts-list call at most every 10 minutes. Never throws.
+ */
+export async function getNetworkAccountState(): Promise<{ state: "not_set_up" | "connected" | "needs_reconnect" | "unavailable"; detail: string | null }> {
+  const settings = unipileSettings();
+  const id = optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID");
+  if (!settings || !id) return { state: "not_set_up", detail: null };
+  try {
+    const { state, statuses } = networkAccountState(unipileAccountsFrom(await cachedAccounts(settings)), id);
+    const labels: Record<NetworkAccountState, string | null> = {
+      connected: null,
+      missing: "UNIPILE_NETWORK_ACCOUNT_ID does not match any account in this Unipile workspace.",
+      not_linkedin: "UNIPILE_NETWORK_ACCOUNT_ID is not a LinkedIn account.",
+      needs_reconnect: `Your LinkedIn account is not running in Unipile (status ${[...new Set(statuses)].join("/") || "unknown"}).`,
+    };
+    return { state: state === "connected" ? "connected" : "needs_reconnect", detail: labels[state] };
+  } catch (err) {
+    return { state: "unavailable", detail: describeError(err, "Unipile") };
+  }
+}
+
+function networkFailure<T>(err: unknown, label: string): NetworkResult<T> {
+  const error = describeError(err, label);
+  if (err instanceof UnipileNotSentError) return { ok: false, error, status: null, kind: "config", sent: false };
+  if (err instanceof HttpError) {
+    const s = err.status;
+    const kind: NetworkFailureKind = s === 429 ? "rate_limited" : s === 401 ? "auth" : s >= 500 ? "server" : s === 404 ? "not_found" : "refused";
+    return { ok: false, error, status: s, kind, sent: true };
+  }
+  if (err instanceof LinkedInError) return { ok: false, error, status: null, kind: "refused", sent: true };
+  const timeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+  return { ok: false, error, status: null, kind: timeout ? "timeout" : "network", sent: true };
+}
+
+/** Skips at once while the owner's account is cooling down in this server's memory. */
+function networkCooldown<T>(): NetworkResult<T> | null {
+  if (Date.now() >= cooldowns.network.until) return null;
+  return { ok: false, error: `Your LinkedIn account is cooling down after a recent failure (${cooldowns.network.reason})`, status: null, kind: "config", sent: false };
+}
+
+export interface NetworkDegree {
+  distance: NetworkDistance | null;
+  /** LinkedIn's count of the connections you share; null when LinkedIn leaves it out. */
+  sharedCount: number | null;
+  providerId: string | null;
+  publicId: string | null;
+}
+
+/**
+ * The lead's degree from the owner's account: GET /users/{id}?notify=false with no
+ * linkedin_sections, so one LinkedIn request. `identifier` is the member id (ACo...) or the slug.
+ * Ledger operation network-profile. Never throws.
+ */
+export async function getNetworkDegree(identifier: string, opts: { timeoutMs?: number } = {}): Promise<NetworkResult<NetworkDegree>> {
+  const ident = profileIdentifier(identifier);
+  if (!ident) return { ok: false, error: "Not a LinkedIn profile id", status: null, kind: "config", sent: false };
+  const cooling = networkCooldown<NetworkDegree>();
+  if (cooling) return cooling;
+  try {
+    const raw = obj(
+      await unipileRequest<unknown>("GET", `/users/${encodeURIComponent(ident)}`, {
+        query: { notify: false },
+        timeoutMs: opts.timeoutMs ?? 15_000,
+        account: "network",
+      }),
+    );
+    return {
+      ok: true,
+      value: {
+        distance: networkDistanceOf(raw.network_distance),
+        sharedCount: num(raw.shared_connections_count),
+        providerId: str(raw.provider_id, 200),
+        publicId: str(raw.public_identifier, 200),
+      },
+    };
+  } catch (err) {
+    return networkFailure(err, "Your LinkedIn account");
+  }
+}
+
+/** One person in the shared-connections search, as Unipile lists them. */
+export interface SharedConnection {
+  /** LinkedIn's member id (the search result's id). */
+  memberId: string | null;
+  slug: string | null;
+  name: string | null;
+  headline: string | null;
+  url: string | null;
+  /** "DISTANCE_1" for a 1st-degree connection of the owner. */
+  distance: string | null;
+  /** The first current position's company and role, when Unipile gives them. */
+  company: string | null;
+  role: string | null;
+}
+
+export interface SharedConnectionsPage {
+  items: SharedConnection[];
+  /** paging.total_count; null when Unipile leaves it out. */
+  total: number | null;
+  /** The search config Unipile echoes back, for the safety checks. */
+  config: unknown;
+}
+
+/**
+ * The owner's 1st-degree connections who are connected to the lead (a 2nd-degree lead): one page
+ * (10, LinkedIn's classic page) of POST /linkedin/search on the owner's account. form "classic":
+ * { api, category: "people", network_distance: [1], connections_of: [memberId] }; form "url":
+ * LinkedIn's own shared-connections search URL. Ledger operation network-search. Never throws.
+ * The caller checks the results (every item DISTANCE_1, the filter echoed, a sane total).
+ */
+export async function searchSharedConnections(
+  memberId: string,
+  opts: { form?: "classic" | "url"; timeoutMs?: number } = {},
+): Promise<NetworkResult<SharedConnectionsPage>> {
+  if (!isProviderId(memberId)) return { ok: false, error: "A LinkedIn member id (ACo...) is needed", status: null, kind: "config", sent: false };
+  const cooling = networkCooldown<SharedConnectionsPage>();
+  if (cooling) return cooling;
+  const body =
+    opts.form === "url"
+      ? { url: sharedConnectionsSearchUrl(memberId) }
+      : { api: "classic", category: "people", network_distance: [1], connections_of: [memberId] };
+  try {
+    const raw = obj(
+      await unipileRequest<unknown>("POST", "/linkedin/search", {
+        query: { limit: 10 },
+        body,
+        timeoutMs: opts.timeoutMs ?? 15_000,
+        account: "network",
+      }),
+    );
+    if (!Array.isArray(raw.items)) return { ok: false, error: "Your LinkedIn account: the search answered in an unexpected shape", status: null, kind: "refused", sent: true };
+    const items = arr(raw.items)
+      .filter(isObj)
+      .filter((i) => String(i.type ?? "PEOPLE").toUpperCase() === "PEOPLE")
+      .map((i): SharedConnection => {
+        const position = arr(i.current_positions).filter(isObj)[0] ?? {};
+        const slug = str(i.public_identifier, 200);
+        // Only a linkedin.com/in/ link, rebuilt on www.linkedin.com: the panel opens it as "LinkedIn".
+        const url = normaliseLinkedinUrl(str(i.public_profile_url, 500) ?? str(i.profile_url, 500) ?? "") ?? (slug ? `https://www.linkedin.com/in/${encodeURIComponent(slug)}` : null);
+        return {
+          memberId: str(i.id, 200),
+          slug,
+          name: str(i.name, 200) ?? ([str(i.first_name, 100), str(i.last_name, 100)].filter(Boolean).join(" ") || null),
+          headline: str(i.headline, 300),
+          url,
+          distance: str(i.network_distance, 40),
+          company: str(position.company, 200),
+          role: str(position.role, 200),
+        };
+      });
+    return { ok: true, value: { items, total: num(obj(raw.paging).total_count), config: raw.config ?? null } };
+  } catch (err) {
+    return networkFailure(err, "Your LinkedIn account");
+  }
+}
+
+/** The owner's account flags: GET /users/me on it (premium, Sales Navigator). Ledger operation network-me. Never throws. */
+export async function getNetworkOwnerFlags(opts: { timeoutMs?: number } = {}): Promise<NetworkResult<{ premium: boolean | null; salesNavigator: boolean | null }>> {
+  const cooling = networkCooldown<{ premium: boolean | null; salesNavigator: boolean | null }>();
+  if (cooling) return cooling;
+  try {
+    const raw = obj(await unipileRequest<unknown>("GET", "/users/me", { timeoutMs: opts.timeoutMs ?? 15_000, account: "network" }));
+    const sn = raw.sales_navigator;
+    return {
+      ok: true,
+      value: {
+        premium: typeof raw.premium === "boolean" ? raw.premium : null,
+        // An object with ids means a seat; an object with only an error, or null, means none.
+        salesNavigator: sn === null ? false : isObj(sn) ? !("error" in sn) : null,
+      },
+    };
+  } catch (err) {
+    return networkFailure(err, "Your LinkedIn account");
+  }
+}
+
+function networkDistanceOf(v: unknown): NetworkDistance | null {
+  const s = typeof v === "string" ? v.trim().toUpperCase() : "";
+  return (NETWORK_DISTANCES as readonly string[]).includes(s) ? (s as NetworkDistance) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +1049,7 @@ export function mapUnipileProfile(raw: unknown, requestedUrl: string): LinkedInP
     title: str(e.position, 300),
     company: str(e.company, 300),
     companyLinkedinUrl: companyUrl(e.company_url, e.company_id, null),
+    companyId: numericId(e.company_id),
     location: str(e.location, 200),
     startDate: normaliseLinkedInDate(e.start),
     endDate: normaliseLinkedInDate(e.end),
@@ -736,6 +1060,7 @@ export function mapUnipileProfile(raw: unknown, requestedUrl: string): LinkedInP
     .filter(isObj)
     .map((e) => ({
       school: str(e.school, 300),
+      schoolId: numericId(e.school_id),
       degree: str(e.degree, 300),
       field: str(e.field_of_study, 300),
       startDate: normaliseLinkedInDate(e.start),
@@ -757,6 +1082,8 @@ export function mapUnipileProfile(raw: unknown, requestedUrl: string): LinkedInP
     websites: urlList(o.websites, obj(o.creator_website).url),
     followers: num(o.follower_count),
     connections: num(o.connections_count),
+    networkDistance: networkDistanceOf(o.network_distance),
+    sharedConnectionsCount: num(o.shared_connections_count),
     via: "unipile",
   });
 }
@@ -777,6 +1104,7 @@ export function mapApifyProfile(raw: unknown, requestedUrl: string): LinkedInPro
     title: str(e.position ?? e.title, 300),
     company: str(e.companyName ?? e.company, 300),
     companyLinkedinUrl: companyUrl(e.companyLinkedinUrl ?? e.companyUrl, e.companyId, e.companyUniversalName),
+    companyId: numericId(e.companyId),
     location: str(e.location, 200),
     startDate: normaliseLinkedInDate(e.startDate),
     endDate: normaliseLinkedInDate(e.endDate),
@@ -965,6 +1293,8 @@ function buildProfile(p: {
   websites: string[];
   followers: number | null;
   connections: number | null;
+  networkDistance?: NetworkDistance | null;
+  sharedConnectionsCount?: number | null;
   via: "unipile" | "apify";
 }): LinkedInProfile {
   const cur = p.current >= 0 ? p.experience[p.current] : undefined;
@@ -994,6 +1324,8 @@ function buildProfile(p: {
     websites: p.websites,
     followers: p.followers,
     connections: p.connections,
+    networkDistance: p.networkDistance ?? null,
+    sharedConnectionsCount: p.sharedConnectionsCount ?? null,
     via: p.via,
   };
 }
@@ -1031,6 +1363,12 @@ function num(v: unknown): number | null {
     if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
   }
   return null;
+}
+
+/** A LinkedIn numeric id (company_id, school_id) as text, or null. */
+function numericId(v: unknown): string | null {
+  const s = str(v, 30);
+  return s && /^\d+$/.test(s) ? s : null;
 }
 
 function clip(s: string, n: number): string {

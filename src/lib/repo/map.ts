@@ -1,4 +1,5 @@
 import "server-only";
+import { cleanWarmPathSummary } from "../paths/summary";
 import { ACTIVE_STAGES, EMAIL_STATUSES, LEAD_SOURCES, type Finding, type Lead, type LeadEvent } from "../types";
 
 type Row = Record<string, unknown>;
@@ -45,6 +46,8 @@ export function toLead(r: Row): Lead {
     angles: (r.angles as Lead["angles"]) ?? [],
     approach: (r.approach as Lead["approach"]) ?? null,
     usage: (r.usage as Lead["usage"]) ?? {},
+    // Absent before migration 007 (select * then has no such column): null, as for a lead with no path.
+    warmPath: cleanWarmPathSummary(r.warm_path),
     createdAt: iso(r.created_at)!,
     updatedAt: iso(r.updated_at)!,
   };

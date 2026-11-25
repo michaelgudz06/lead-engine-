@@ -22,6 +22,17 @@
  *             and the SQL restore mapping against the pure one. The old deployed code cannot show
  *             an unqualified lead, so each block keeps its leads unqualified for as few queries
  *             as it can and deletes them in a finally; a count at the end confirms none is left.
+ * 7. warm paths  only against a LOCAL test database (it writes le_settings and le_network_*; it
+ *             refuses otherwise): the proxy on the new routes, GET /api/network, Settings handles,
+ *             Connections.csv parts (limits, bad rows, 409, 413, 415), POST /paths (every outcome
+ *             and status), the free recompute on GET (once, never during research or a check, never
+ *             over a newer write), invalidation (lead X handle, your X handle, a new upload, a
+ *             delete, a new LinkedIn URL), intro drafts (the Claude request, the 100-a-day cap,
+ *             refusals), "asked" notes, the Instagram handle, Read now, Refresh now, the step-2
+ *             budget, and the api-client helpers through the same handlers. twitterapi.io,
+ *             Unipile and Claude are mocked with fake keys (any other host fails the section), the
+ *             app runs open as the live deploy does, and no contact list or name may reach a
+ *             reply of /api/network, a server log line or more than 5 company people.
  *
  * Prints statuses and short snippets only: never a key, token, cookie value or header.
  */
@@ -45,6 +56,23 @@ import * as settingsRoute from "../src/app/api/settings/route";
 import * as statusRoute from "../src/app/api/status/route";
 import * as loginRoute from "../src/app/api/login/route";
 import * as logoutRoute from "../src/app/api/logout/route";
+import * as pathsRoute from "../src/app/api/leads/[id]/paths/route";
+import * as pathRoute from "../src/app/api/leads/[id]/paths/[pathId]/route";
+import * as introRoute from "../src/app/api/leads/[id]/paths/[pathId]/intro/route";
+import * as networkRoute from "../src/app/api/network/route";
+import * as connectionsRoute from "../src/app/api/network/linkedin/connections/route";
+import * as selfRoute from "../src/app/api/network/linkedin/self/route";
+import * as xSyncRoute from "../src/app/api/network/x/sync/route";
+import { isPathId } from "../src/app/api/_lib/paths";
+import * as client from "../src/lib/api-client";
+import { noPathsCopy } from "../src/lib/paths/copy";
+import { publicPathId } from "../src/lib/paths/ids";
+import { INTRO_SYSTEM, introPrompt } from "../src/lib/paths/intro";
+import type { WarmPath, WarmPaths } from "../src/lib/paths/types";
+import { resetUnipileState } from "../src/lib/providers/linkedin";
+import { insertFindings } from "../src/lib/repo/findings";
+import { claimNetworkSource, saveNetworkSource } from "../src/lib/repo/network";
+import { claimWarmPathCheck, getWarmPathRow, releaseWarmPathCheck, saveIntro, saveWarmPathResult } from "../src/lib/repo/paths";
 import {
   DEFAULT_RUNS_PER_DAY,
   DEFAULT_RUNS_PER_HOUR,
@@ -88,12 +116,13 @@ import {
   failStaleResearch,
   finishResearch,
   getLead,
+  setLeadLinkedin,
   setResearchStep,
   updateLead,
   type LeadPatch,
 } from "../src/lib/repo/leads";
 import { DELETE_LEADS_SQL, deleteLeads, restoreLeads, uniqueLeadIds, unqualifyLeads } from "../src/lib/repo/qualify";
-import { getSettings } from "../src/lib/repo/settings";
+import { getSettings, saveSettings } from "../src/lib/repo/settings";
 import {
   ACTIVE_STAGES,
   BULK_LEADS_MAX,
@@ -126,6 +155,13 @@ void (settingsRoute satisfies RouteHandlerConfig<NoParams>);
 void (statusRoute satisfies RouteHandlerConfig<NoParams>);
 void (loginRoute satisfies RouteHandlerConfig<NoParams>);
 void (logoutRoute satisfies RouteHandlerConfig<NoParams>);
+void (pathsRoute satisfies RouteHandlerConfig<{ id: string }>);
+void (pathRoute satisfies RouteHandlerConfig<{ id: string; pathId: string }>);
+void (introRoute satisfies RouteHandlerConfig<{ id: string; pathId: string }>);
+void (networkRoute satisfies RouteHandlerConfig<NoParams>);
+void (connectionsRoute satisfies RouteHandlerConfig<NoParams>);
+void (selfRoute satisfies RouteHandlerConfig<NoParams>);
+void (xSyncRoute satisfies RouteHandlerConfig<NoParams>);
 
 // ------------------------------------------------------------------ tiny harness
 
@@ -173,10 +209,30 @@ interface CallResult {
   headers: Headers;
 }
 
-/** Runs a route handler inside a minimal Next request scope (enough for after() and connection()). */
+/** Route calls in progress (section 7 records what the server logs meanwhile). */
+let routeDepth = 0;
+
+/** Runs fn inside a minimal Next request scope (enough for after() and connection()). after() tasks are recorded, never run. */
+async function inRequestScope<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const workStore = {
+    route: path,
+    forceStatic: false,
+    dynamicShouldError: false,
+    afterContext: { after: (task: unknown) => void afterTasks.push(task) },
+  };
+  const unitStore = { type: "request", phase: "action" };
+  routeDepth++;
+  try {
+    return await workAsyncStorage.run(workStore as never, () => workUnitAsyncStorage.run(unitStore as never, fn));
+  } finally {
+    routeDepth--;
+  }
+}
+
+/** Runs a route handler inside a minimal Next request scope. params defaults to { id }. */
 async function callRoute(
   handler: (request: NextRequest, ctx: { params: Promise<{ id: string }> }) => Promise<Response>,
-  opts: { method?: string; path: string; body?: unknown; rawBody?: string; id?: string; headers?: Record<string, string> },
+  opts: { method?: string; path: string; body?: unknown; rawBody?: string; id?: string; params?: Record<string, string>; headers?: Record<string, string> },
 ): Promise<CallResult> {
   const method = opts.method ?? "GET";
   const body = opts.rawBody ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined);
@@ -185,15 +241,8 @@ async function callRoute(
     headers: { ...(body !== undefined ? { "content-type": "application/json" } : {}), ...opts.headers },
     body: method === "GET" ? undefined : body,
   });
-  const ctx = { params: Promise.resolve({ id: opts.id ?? "" }) };
-  const workStore = {
-    route: opts.path,
-    forceStatic: false,
-    dynamicShouldError: false,
-    afterContext: { after: (task: unknown) => void afterTasks.push(task) },
-  };
-  const unitStore = { type: "request", phase: "action" };
-  const res = await workAsyncStorage.run(workStore as never, () => workUnitAsyncStorage.run(unitStore as never, () => handler(request, ctx)));
+  const ctx = { params: Promise.resolve((opts.params ?? { id: opts.id ?? "" }) as { id: string }) };
+  const res = await inRequestScope(opts.path, () => handler(request, ctx));
   const text = await res.text();
   let data: Record<string, unknown> | null = null;
   try {
@@ -441,7 +490,8 @@ async function testRoutes(): Promise<void> {
   const status = await callRoute(asHandler(statusRoute.GET), { path: "/api/status" });
   const providers = (status.data?.providers ?? []) as Array<{ id: string; configured: boolean }>;
   const model = status.data?.model as { name?: string; effort?: string } | undefined;
-  check("GET /api/status 200 with 8 providers", status.status === 200 && providers.length === 8, status.data);
+  check("GET /api/status 200 with 9 providers", status.status === 200 && providers.length === 9, status.data);
+  check("status: X follows (twitterapi.io) listed, from a status function", providers.some((p) => p.id === "twitterapi"));
   check("status: model is claude-haiku-5-5 at low effort", model?.name === "claude-haiku-5-5" && model?.effort === "low", model);
   check("status: authEnabled false with the gate off", status.data?.authEnabled === false);
   check("status: hubspot listed as not configured", providers.some((p) => p.id === "hubspot" && p.configured === false));
@@ -861,6 +911,7 @@ function sampleLead(over: Partial<Lead> = {}): Lead {
     angles: [],
     approach: null,
     usage: {},
+    warmPath: null,
     createdAt: at,
     updatedAt: at,
     ...over,
@@ -1978,6 +2029,1142 @@ async function testQualify(): Promise<void> {
   }
 }
 
+// ------------------------------------------------------------------ 7. warm paths (a LOCAL test database, every provider mocked)
+
+const W_HOSTS = { unipile: "api9.unipile.example", x: "api.twitterapi.io", claude: "api.anthropic.com" } as const;
+const W_KEYS = { unipile: "test-unipile-key-wpapi", x: "test-twitter-key-wpapi", claude: "test-anthropic-key-wpapi" } as const;
+/** Env this section changes; saved first and put back at the end. */
+const W_ENV = [
+  "UNIPILE_API_KEY",
+  "UNIPILE_DSN",
+  "UNIPILE_ACCOUNT_ID",
+  "UNIPILE_NETWORK_ACCOUNT_ID",
+  "TWITTERAPI_IO_KEY",
+  "ANTHROPIC_API_KEY",
+  "APIFY_TOKEN",
+  "WARM_PATH_LINKEDIN_CHECKS_PER_DAY",
+  "WARM_PATH_X_USD_PER_DAY",
+  "ALLOW_OPEN_ACCESS",
+  "VERCEL",
+  "APP_PASSWORD",
+  "SESSION_SECRET",
+] as const;
+function setWarmEnv(vars: Partial<Record<(typeof W_ENV)[number], string | undefined>>): void {
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
+
+interface WCall {
+  host: string;
+  path: string;
+  method: string;
+  query: Record<string, string>;
+  headers: Record<string, string>;
+  body: unknown;
+}
+
+/** [id, handle, name, followers, bio] */
+type XFixture = [string, string, string, number, string];
+
+const wx = {
+  users: {} as Record<string, { id: string; name: string; followers: number; following: number }>,
+  followings: {} as Record<string, XFixture[]>,
+  followerIds: {} as Record<string, string[]>,
+  /** "source>target" pairs (handles, lower case) for follow checks. */
+  follows: new Set<string>(),
+  fail: {} as Partial<Record<"user-info" | "followings" | "followers-ids" | "follow-check", number>>,
+  delayMs: 0,
+};
+const wu = { accounts: [] as Array<{ id: string; status: string }>, profiles: {} as Record<string, Record<string, unknown>>, profileStatus: 0 };
+const wc = { message: "", stop: "end_turn" as "end_turn" | "refusal", delayMs: 0, bodies: [] as Array<Record<string, unknown>> };
+const wcalls: WCall[] = [];
+const strayHosts: string[] = [];
+const wpause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** twitterapi.io, as its docs describe the four endpoints the app uses. */
+async function wxRoute(c: WCall): Promise<Response> {
+  if (wx.delayMs) await wpause(wx.delayMs);
+  const op = c.path.endsWith("/user/info")
+    ? "user-info"
+    : c.path.endsWith("/user/followings")
+      ? "followings"
+      : c.path.endsWith("/user/followers_ids")
+        ? "followers-ids"
+        : c.path.endsWith("/check_follow_relationship")
+          ? "follow-check"
+          : null;
+  if (!op) return reply({ error: 404, message: "no such endpoint" }, 404);
+  const failing = wx.fail[op];
+  if (failing) return reply({ error: failing, message: "upstream error" }, failing);
+  const handle = String(c.query.userName ?? "").toLowerCase();
+  if (op === "user-info") {
+    const u = wx.users[handle];
+    if (!u) return reply({ status: "error", msg: "user not found" });
+    return reply({ status: "success", msg: "success", data: { type: "user", userName: handle, id: u.id, name: u.name, followers: u.followers, following: u.following, protected: false, unavailable: false } });
+  }
+  if (op === "followings") {
+    const all = wx.followings[handle] ?? [];
+    return reply({
+      followings: all.map(([id, screen_name, name, followers_count, description]) => ({ id, screen_name, name, followers_count, description, url: null })),
+      has_next_page: false,
+      next_cursor: "",
+      status: "success",
+      msg: "success",
+      code: 0,
+    });
+  }
+  if (op === "followers-ids") return reply({ ids: wx.followerIds[handle] ?? [], has_next_page: false, next_cursor: "0", status: "success", msg: "success", code: 0 });
+  const source = String(c.query.source_user_name ?? "").toLowerCase();
+  const target = String(c.query.target_user_name ?? "").toLowerCase();
+  return reply({ status: "success", message: "success", data: { following: wx.follows.has(`${source}>${target}`), followed_by: wx.follows.has(`${target}>${source}`) } });
+}
+
+/** Unipile: the accounts list and profile reads on the research account. */
+function wuRoute(c: WCall): Response {
+  const p = c.path.replace(/^\/api\/v1/, "");
+  if (p === "/accounts") {
+    return reply({ object: "AccountList", items: wu.accounts.map((a) => ({ object: "Account", type: "LINKEDIN", id: a.id, name: "Someone", sources: [{ id: `${a.id}_MESSAGING`, status: a.status }] })) });
+  }
+  if (p.startsWith("/users/") && c.query.account_id === "acc_research") {
+    if (wu.profileStatus) return reply({ title: "Unipile error", type: "errors/error" }, wu.profileStatus);
+    const raw = wu.profiles[decodeURIComponent(p.slice("/users/".length)).toLowerCase()];
+    return raw ? reply(raw) : reply({ title: "Not found", type: "errors/resource_not_found" }, 404);
+  }
+  return reply({ title: "not mocked" }, 404);
+}
+
+/** The Claude Messages API: one structured answer { message }, or a refusal. */
+async function wcRoute(c: WCall): Promise<Response> {
+  wc.bodies.push((c.body ?? {}) as Record<string, unknown>);
+  if (wc.delayMs) await wpause(wc.delayMs);
+  const refusal = wc.stop === "refusal";
+  return reply({
+    id: "msg_test_wpapi",
+    type: "message",
+    role: "assistant",
+    model: "claude-haiku-5-5",
+    content: refusal ? [] : [{ type: "text", text: JSON.stringify({ message: wc.message }) }],
+    stop_reason: wc.stop,
+    stop_sequence: null,
+    usage: { input_tokens: 900, output_tokens: refusal ? 4 : 120 },
+  });
+}
+
+/** The api-client's relative fetches ("/api/..."), answered by the route handlers in this process. */
+const dec = decodeURIComponent;
+const BRIDGE: Array<{ re: RegExp; mod: Record<string, unknown>; params: (m: RegExpMatchArray) => Record<string, string> }> = [
+  { re: /^\/api\/network$/, mod: networkRoute, params: () => ({}) },
+  { re: /^\/api\/network\/linkedin\/connections$/, mod: connectionsRoute, params: () => ({}) },
+  { re: /^\/api\/network\/linkedin\/self$/, mod: selfRoute, params: () => ({}) },
+  { re: /^\/api\/network\/x\/sync$/, mod: xSyncRoute, params: () => ({}) },
+  { re: /^\/api\/leads\/([^/]+)\/paths\/([^/]+)\/intro$/, mod: introRoute, params: (m) => ({ id: dec(m[1]), pathId: dec(m[2]) }) },
+  { re: /^\/api\/leads\/([^/]+)\/paths\/([^/]+)$/, mod: pathRoute, params: (m) => ({ id: dec(m[1]), pathId: dec(m[2]) }) },
+  { re: /^\/api\/leads\/([^/]+)\/paths$/, mod: pathsRoute, params: (m) => ({ id: dec(m[1]) }) },
+  { re: /^\/api\/leads\/([^/]+)$/, mod: leadRoute, params: (m) => ({ id: dec(m[1]) }) },
+  { re: /^\/api\/status$/, mod: statusRoute, params: () => ({}) },
+];
+/** Bodies the client sent through the bridge, by path (to check the parts of an upload). */
+const bridged: Array<{ method: string; path: string; body: Record<string, unknown> | null }> = [];
+
+async function bridge(href: string, init?: RequestInit): Promise<Response> {
+  const url = new URL(href, "http://localhost:3000");
+  const method = init?.method ?? "GET";
+  for (const r of BRIDGE) {
+    const m = url.pathname.match(r.re);
+    if (!m) continue;
+    const handler = r.mod[method];
+    if (typeof handler !== "function") return reply({ error: "Method not allowed." }, 405);
+    const body = typeof init?.body === "string" ? init.body : undefined;
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = body ? (JSON.parse(body) as Record<string, unknown>) : null;
+    } catch {
+      parsed = null;
+    }
+    bridged.push({ method, path: url.pathname, body: parsed });
+    const request = new NextRequest(url, { method, headers: new Headers(init?.headers), body: method === "GET" ? undefined : body });
+    const ctx = { params: Promise.resolve(r.params(m)) };
+    return inRequestScope(url.pathname, () => (handler as (req: NextRequest, c: typeof ctx) => Promise<Response>)(request, ctx));
+  }
+  return reply({ error: "Not found." }, 404);
+}
+
+/** Every outside call is answered here; the database stand-in passes through, anything else is refused and noted. */
+function installWarmMock(): void {
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (href.startsWith("/")) return bridge(href, init);
+    const url = new URL(href);
+    if (url.hostname.endsWith(".fake-neon.test") || url.hostname === "localhost" || url.hostname === "127.0.0.1") return realFetch(input, init);
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers).forEach((v, k) => (headers[k] = v));
+    let body: unknown;
+    try {
+      body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+    } catch {
+      body = undefined;
+    }
+    const c: WCall = { host: url.hostname, path: url.pathname, method: init?.method ?? "GET", query: Object.fromEntries(url.searchParams), headers, body };
+    wcalls.push(c);
+    if (c.host === W_HOSTS.x) return wxRoute(c);
+    if (c.host === W_HOSTS.unipile) return wuRoute(c);
+    if (c.host === W_HOSTS.claude) return wcRoute(c);
+    strayHosts.push(c.host);
+    return reply({ error: `unexpected host ${c.host}` }, 599);
+  }) as typeof fetch;
+}
+
+/** Server log lines written while section 7 runs: route calls (console.log too) and everything on error/warn/info. */
+const serverLines: string[] = [];
+function captureServerLogs(): () => void {
+  const saved = { log: console.log, warn: console.warn, error: console.error, info: console.info };
+  const record = (args: unknown[]) => void serverLines.push(args.map((a) => (a instanceof Error ? (a.stack ?? a.message) : String(a))).join(" "));
+  console.warn = (...a: unknown[]) => record(a);
+  console.error = (...a: unknown[]) => record(a);
+  console.info = (...a: unknown[]) => record(a);
+  console.log = (...a: unknown[]) => (routeDepth > 0 ? record(a) : saved.log(...a));
+  return () => Object.assign(console, saved);
+}
+
+async function testWarmPaths(): Promise<void> {
+  section("7. warm paths (local database; LinkedIn, X, Unipile and Claude mocked)");
+  if (!/\.fake-neon\.test\b/.test(process.env.DATABASE_URL ?? "")) {
+    // These checks write global tables (le_settings, le_network_*): never against a shared database.
+    check("7: warm-path route tests need a LOCAL test database (run through the local runner)", false);
+    return;
+  }
+
+  const W = randomBytes(3).toString("hex");
+  const ADA_SLUG = `ada-kim-wp-${W}`;
+  const SAM_SLUG = `sam-okafor-wp-${W}`;
+  const SAM_URL = `https://www.linkedin.com/in/${SAM_SLUG}`;
+  const X_OWNER = `sam_wp_${W}`;
+  const X_LEAD = `ada_wp_${W}`;
+  const PRIYA = `priya-wp-${W}`;
+  const LEAD_MEMBER = "ACoAAAwpApiLead0001";
+  const QUILLS = Array.from({ length: 30 }, (_, i) => ({ slug: `quill-${i}-wp-${W}`, name: `Quill Varga${String(i).padStart(2, "0")}` }));
+  const CONTACT_NAMES = ["Priya Shah", "Omar Haddad", "Lena Berg", "Tomas Ruiz", "Zed Mora", ...QUILLS.map((q) => q.name)];
+  const CONNECTIONS: Array<[string, string, string, string, string, string | null]> = [
+    [PRIYA, "Priya", "Shah", "Nimbus Robotics", "Head of Operations", "2021-11-02"],
+    [`omar-wp-${W}`, "Omar", "Haddad", "Acme Robotics", "Staff Engineer", "2020-02-14"],
+    [`lena-wp-${W}`, "Lena", "Berg", "Acme Robotics Inc.", "Designer", "2024-01-10"],
+    [`tomas-wp-${W}`, "Tomas", "Ruiz", "Northwind Labs", "CTO", "2018-06-01"],
+    [ADA_SLUG, "Ada", "Kim", "Acme Robotics", "CTO", "2021-03-14"],
+    ...QUILLS.map((q): [string, string, string, string, string, string | null] => [q.slug, "Quill", q.name.split(" ")[1], "Acme Robotics", "Engineer", "2019-01-01"]),
+  ];
+  const withoutOmar = CONNECTIONS.filter((r) => r[1] !== "Omar");
+
+  const savedEnv = Object.fromEntries(W_ENV.map((k) => [k, process.env[k]]));
+  const settingsRow = await query<{ value: unknown }>("select value from le_settings where key = 'app'");
+  const made: string[] = [];
+  /** Every reply in this section, with the route it came from. */
+  const responses: Array<{ path: string; text: string }> = [];
+  const restoreConsole = captureServerLogs();
+  installWarmMock();
+  // The live deploy runs open (ALLOW_OPEN_ACCESS=1, no APP_PASSWORD): every route here must work so.
+  setWarmEnv({
+    UNIPILE_API_KEY: W_KEYS.unipile,
+    UNIPILE_DSN: `https://${W_HOSTS.unipile}:14914`,
+    UNIPILE_ACCOUNT_ID: "acc_research",
+    UNIPILE_NETWORK_ACCOUNT_ID: undefined,
+    TWITTERAPI_IO_KEY: undefined,
+    ANTHROPIC_API_KEY: W_KEYS.claude,
+    APIFY_TOKEN: undefined,
+    WARM_PATH_LINKEDIN_CHECKS_PER_DAY: undefined,
+    WARM_PATH_X_USD_PER_DAY: undefined,
+    ALLOW_OPEN_ACCESS: "1",
+    VERCEL: "1",
+    APP_PASSWORD: undefined,
+    SESSION_SECRET: undefined,
+  });
+  resetUnipileState();
+  wu.accounts = [{ id: "acc_research", status: "OK" }];
+  wu.profiles = {
+    [ADA_SLUG]: {
+      object: "UserProfile",
+      provider: "LINKEDIN",
+      provider_id: LEAD_MEMBER,
+      public_identifier: ADA_SLUG,
+      first_name: "Ada",
+      last_name: "Kim",
+      headline: "CTO at Acme Robotics",
+      websites: [],
+      network_distance: "OUT_OF_NETWORK",
+      work_experience: [
+        { position: "CTO", company: "Acme Robotics", company_id: "4242", start: "8/1/2022", end: null },
+        { position: "Engineer", company: "Northwind Labs", company_id: "777", start: "1/1/2017", end: "5/1/2022" },
+      ],
+      education: [{ school: "KTH Royal Institute of Technology", school_id: "9001", start: "1/1/2013", end: "1/1/2017" }],
+    },
+    [SAM_SLUG]: {
+      object: "UserProfile",
+      provider: "LINKEDIN",
+      provider_id: "ACoAAAwpApiSam00001",
+      public_identifier: SAM_SLUG,
+      first_name: "Sam",
+      last_name: "Okafor",
+      headline: "COO at Nimbus Robotics",
+      websites: [],
+      work_experience: [
+        { position: "COO", company: "Nimbus Robotics", company_id: "5150", start: "2/1/2023", end: null },
+        { position: "PM", company: "Northwind Labs", company_id: "777", start: "3/1/2018", end: "6/1/2022" },
+      ],
+      education: [{ school: "KTH Royal Institute of Technology", school_id: "9001", start: "1/1/2012", end: "1/1/2016" }],
+    },
+  };
+  wu.profileStatus = 0;
+  wx.users = {
+    [X_OWNER]: { id: "500", name: "Sam Okafor", followers: 2, following: 2 },
+    [X_LEAD]: { id: "800", name: "Ada Kim", followers: 150, following: 3 },
+  };
+  wx.followings = {
+    [X_OWNER]: [
+      ["1001", `priya_x_${W}`, "Priya Shah", 900, "Ops lead at Nimbus Robotics"],
+      ["1002", `zed_x_${W}`, "Zed Mora", 400, "robots"],
+    ],
+    [X_LEAD]: [
+      ["1001", `priya_x_${W}`, "Priya Shah", 900, "Ops lead at Nimbus Robotics"],
+      ["1002", `zed_x_${W}`, "Zed Mora", 400, "robots"],
+      ["500", X_OWNER, "Sam Okafor", 2, ""],
+    ],
+  };
+  wx.followerIds = { [X_OWNER]: ["1001", "1002"], [X_LEAD]: ["1001"] };
+  // Priya follows the lead back; Zed does not (the lead has few followers, so follow checks are cheaper than its follower ids).
+  wx.follows = new Set([`priya_x_${W}>${X_LEAD}`]);
+  wx.fail = {};
+  wc.message = "Hi Priya,\n\nWould you introduce me to Ada Kim at Acme Robotics?\n\nNo worries if it's not a fit.\n\nSam Okafor";
+  wc.stop = "end_turn";
+
+  const call = (handler: unknown, opts: Parameters<typeof callRoute>[1]) =>
+    callRoute(asHandler(handler), opts).then((r) => {
+      responses.push({ path: opts.path, text: JSON.stringify(r.data ?? null) });
+      return r;
+    });
+  const pathsOf = (r: CallResult) => (r.data?.paths ?? null) as WarmPaths | null;
+  const named = (text: string) => CONTACT_NAMES.filter((n) => text.includes(n));
+  const quillsIn = (text: string) => QUILLS.filter((q) => text.includes(q.name)).length;
+
+  try {
+    // ---------------------------------------------- 7a. the proxy covers the new routes like every other write
+    const matches = (url: string) => unstable_doesMiddlewareMatch({ config: proxyConfig, url });
+    const leadPath = "/api/leads/3f1c2b9e-8d7a-4c6b-9e5f-1a2b3c4d5e6f";
+    const SAMPLE_LI = "li-0a1b2c3d4e5f";
+    const SAMPLE_X = "x-9f8e7d6c5b4a";
+    const newRoutes = ["/api/network", "/api/network/linkedin/connections", "/api/network/linkedin/self", "/api/network/x/sync", `${leadPath}/paths`, `${leadPath}/paths/${SAMPLE_LI}`, `${leadPath}/paths/${SAMPLE_LI}/intro`, `${leadPath}/paths/${SAMPLE_X}`];
+    check("7a: the proxy runs on every new route", newRoutes.every(matches), newRoutes.filter((u) => !matches(u)));
+    check(
+      "7a: path ids are opaque (the network and 12 hex characters): a slug, a name or a handle is refused, and so is anything that could end like a static file (the proxy skips those)",
+      !matches(`${leadPath}/paths/li%3Aada.png`) &&
+        isPathId("direct") &&
+        isPathId(SAMPLE_LI) &&
+        isPathId(SAMPLE_X) &&
+        !isPathId("li:ada-kim") &&
+        !isPathId("x:1001") &&
+        !isPathId("li-ada-kim") &&
+        !isPathId("li:ada.png") &&
+        !isPathId(`${SAMPLE_LI}.png`) &&
+        !isPathId("li-0A1B2C3D4E5F") &&
+        !isPathId("li-0a1b2c3d4e5") &&
+        !isPathId("foo") &&
+        !isPathId("li-"),
+    );
+    const viaProxy = (method: string, path: string, headers: Record<string, string> = {}) => proxy(new NextRequest(new URL(path, "http://localhost:3000"), { method, headers }));
+    const writes: Array<[string, string]> = [
+      ["PUT", "/api/network/linkedin/connections"],
+      ["DELETE", "/api/network/linkedin/connections"],
+      ["POST", "/api/network/linkedin/self"],
+      ["POST", "/api/network/x/sync"],
+      ["POST", `${leadPath}/paths`],
+      ["PATCH", `${leadPath}/paths`],
+      ["POST", `${leadPath}/paths/${SAMPLE_LI}/intro`],
+      ["PATCH", `${leadPath}/paths/${SAMPLE_LI}`],
+      ["PUT", "/api/settings"],
+    ];
+    const notRefused: string[] = [];
+    for (const [method, path] of writes) if ((await viaProxy(method, path, { "sec-fetch-site": "cross-site" })).status !== 403) notRefused.push(`${method} ${path}`);
+    check("7a: a cross-site write to any new route is 403 (proxy rule 1)", notRefused.length === 0, notRefused);
+    const open: string[] = [];
+    for (const [method, path] of [...writes, ["GET", "/api/network"]] as Array<[string, string]>) {
+      if ((await viaProxy(method, path, { "sec-fetch-site": "same-origin" })).headers.get("x-middleware-next") !== "1") open.push(`${method} ${path}`);
+    }
+    check("7a: on the open deploy (VERCEL=1, ALLOW_OPEN_ACCESS=1, no APP_PASSWORD) every new route passes the proxy", open.length === 0, open);
+    setWarmEnv({ APP_PASSWORD: PASSWORD, SESSION_SECRET: SECRET });
+    const gated = [(await viaProxy("GET", "/api/network")).status, (await viaProxy("POST", `${leadPath}/paths`, { "sec-fetch-site": "same-origin" })).status];
+    check("7a: with the team password set, the new routes need a session (401)", gated.every((s) => s === 401), gated);
+    setWarmEnv({ APP_PASSWORD: undefined, SESSION_SECRET: undefined });
+
+    // ---------------------------------------------- fixtures: a researched lead, and one with nothing to check
+    const ada = await createLead({ linkedinUrl: `https://www.linkedin.com/in/${ADA_SLUG}`, name: "Ada Kim", companyName: "Acme Robotics" });
+    made.push(ada.id);
+    const A = ada.id;
+    const angle: Angle = {
+      id: "no-cold-starts",
+      name: "No cold starts",
+      reasoning: "They serve pi0.5 on shared GPUs and fight cold starts before demos.",
+      findingIds: [],
+      email: { subject: "Cold starts", body: "Hi Ada" },
+      linkedinMessage: "Hi Ada",
+    };
+    const brief: Brief = { summary: "Ada runs robot learning at Acme Robotics and is moving pi0.5 policies into pilots.", bullets: [], pains: [], objections: [], questions: [] };
+    await updateLead(A, {
+      title: "CTO",
+      brief,
+      angles: [angle],
+      approach: { leadAngleId: angle.id, channel: "email", why: "Cold starts", firstCallQuestions: [], dealBreakers: [] },
+      researchStatus: "done",
+      researchFinishedAt: new Date().toISOString(),
+    });
+    await insertFindings(A, [
+      { source: "exa", kind: "news", title: "Pilot with a carmaker", text: "FINDING-ONE Acme started a pilot with a carmaker in October.", relevance: 0.9, publishedAt: "2026-10" },
+      { source: "exa", kind: "hiring", title: "Hiring ML infra", text: "FINDING-TWO Acme is hiring two ML infrastructure engineers.", relevance: 0.8 },
+      { source: "exa", kind: "model", title: "Runs pi0.5", text: "FINDING-THREE Acme fine-tunes pi0.5 for bin picking.", relevance: 0.7 },
+      { source: "exa", kind: "talk", title: "A talk", text: "FINDING-FOUR Ada spoke at a robotics meetup.", relevance: 0.6 },
+      { source: "exa", kind: "personal", title: "Family", text: "FINDING-FILTERED a personal fact the criteria leave out.", relevance: 0.95, passesCriteria: false, excludedReason: "personal" },
+    ]);
+    const bare = await createLead({ linkedinUrl: `https://www.linkedin.com/in/bare-wp-${W}`, name: "Bare Lead" });
+    made.push(bare.id);
+    // A lead never researched, who is one of your connections (the upload gives it a chip).
+    const tomas = await createLead({ linkedinUrl: `https://www.linkedin.com/in/tomas-wp-${W}`, name: "Tomas Ruiz" });
+    made.push(tomas.id);
+    await setLeadLinkedin(bare.id, null);
+    await updateLead(bare.id, { researchStatus: "done", researchFinishedAt: new Date().toISOString() });
+    await saveSettings({ senderName: "Sam Okafor", xHandle: "", instagramHandle: "", linkedinUrl: "" });
+
+    const getDetail = (id = A) => call(leadRoute.GET, { path: `/api/leads/${id}`, id });
+    const postPaths = (id = A) => call(pathsRoute.POST, { method: "POST", path: `/api/leads/${id}/paths`, id });
+    const patchInstagram = (body: unknown, id = A, extra: { rawBody?: string; headers?: Record<string, string> } = {}) =>
+      call(pathsRoute.PATCH, { method: "PATCH", path: `/api/leads/${id}/paths`, id, body, ...extra });
+    const postIntro = (pathId: string, id = A) => call(introRoute.POST, { method: "POST", path: `/api/leads/${id}/paths/${encodeURIComponent(pathId)}/intro`, params: { id, pathId } });
+    const patchPath = (pathId: string, body: unknown, extra: { rawBody?: string; headers?: Record<string, string> } = {}) =>
+      call(pathRoute.PATCH, { method: "PATCH", path: `/api/leads/${A}/paths/${encodeURIComponent(pathId)}`, params: { id: A, pathId }, body, ...extra });
+    const getNet = () => call(networkRoute.GET, { path: "/api/network" });
+    const putPart = (body: unknown, extra: { rawBody?: string; headers?: Record<string, string> } = {}) =>
+      call(connectionsRoute.PUT, { method: "PUT", path: "/api/network/linkedin/connections", body, ...extra });
+    const putSettings = (body: unknown) => call(settingsRoute.PUT, { method: "PUT", path: "/api/settings", body });
+    const postSelf = () => call(selfRoute.POST, { method: "POST", path: "/api/network/linkedin/self" });
+    const postSync = () => call(xSyncRoute.POST, { method: "POST", path: "/api/network/x/sync" });
+    const patchLead = (body: unknown) => call(leadRoute.PATCH, { method: "PATCH", path: `/api/leads/${A}`, id: A, body });
+    const uploadAll = async (rows: typeof CONNECTIONS) => putPart({ importId: randomUUID(), part: 1, parts: 1, rows, exportedAt: "2026-11-02T09:00:00.000Z" });
+    const computedAt = async () => (await getWarmPathRow(A))?.computedAt ?? null;
+    const outside = () => wcalls.length;
+
+    // ---------------------------------------------- 7b. nothing set up yet
+    const net0 = await getNet();
+    const n0 = net0.data as Record<string, Record<string, unknown>> | null;
+    check(
+      "7b: GET /api/network before any setup: no connections, no profile, account not set up, X off",
+      net0.status === 200 && n0?.linkedin?.connections === null && n0?.linkedin?.self === null && (n0?.linkedin?.account as Record<string, unknown>)?.state === "not_set_up" && n0?.x?.configured === false && n0?.x?.handle === null && n0?.instagram?.handle === null,
+      n0,
+    );
+    const st0 = await call(statusRoute.GET, { path: "/api/status" });
+    check(
+      "7b: GET /api/status: the twitterapi.io row (off) and your LinkedIn account not set up, with no call made",
+      ((st0.data?.providers ?? []) as Array<{ id: string; configured: boolean }>).some((p) => p.id === "twitterapi" && !p.configured) &&
+        (st0.data?.linkedinAccount as { state?: string } | undefined)?.state === "not_set_up" &&
+        outside() === 0,
+      st0.data?.linkedinAccount,
+    );
+    const d0 = await getDetail();
+    const p0 = pathsOf(d0);
+    check(
+      "7b: GET /api/leads/[id] carries paths: idle, nothing set up, and the check-yourself LinkedIn link",
+      d0.status === 200 && p0?.status === "idle" && p0.setup.any === false && p0.links.linkedinMutuals === `https://www.linkedin.com/in/${ADA_SLUG}/` && p0.paths.length === 0 && p0.leadFirstName === "Ada",
+      p0,
+    );
+    const notSetUp = await postPaths();
+    check("7b: POST /paths with nothing set up is 400 not_set_up, with the paths", notSetUp.status === 400 && notSetUp.data?.code === "not_set_up" && pathsOf(notSetUp) !== null, notSetUp.data);
+    check(
+      "7b: ... and with X off on this server it does not ask for an X handle",
+      String(notSetUp.data?.error) === "Nothing is set up yet. Upload your LinkedIn connections or add your profile link in Settings." && pathsOf(notSetUp)?.setup.xAvailable === false,
+      notSetUp.data?.error,
+    );
+    check("7b: ... and the lead's side is kept for later (a row with its target)", (await getWarmPathRow(A))?.target?.linkedinSlug === ADA_SLUG);
+    const nothing = await postPaths(bare.id);
+    check("7b: POST /paths for a lead with no LinkedIn and no X handle is 400 nothing_to_check", nothing.status === 400 && nothing.data?.code === "nothing_to_check", nothing.data);
+    check("7b: POST /paths with a malformed id is 404", (await postPaths("nope")).status === 404);
+    const ghost = "00000000-0000-4000-8000-00000000beef";
+    check("7b: POST /paths for an unknown lead is 404", (await postPaths(ghost)).status === 404);
+    // Checks from the lead page are counted across the app: a loop cannot test profiles against your network.
+    await query("insert into le_quota_uses (kind, units) select 'warm_path_check', 1 from generate_series(1, 100)");
+    const checkCapped = await postPaths();
+    check(
+      "7b: POST /paths past 100 checks a day is 429 warm_path_check_limit",
+      checkCapped.status === 429 && checkCapped.data?.code === "warm_path_check_limit" && /100 warm-path checks a day/.test(String(checkCapped.data?.error)),
+      checkCapped.data,
+    );
+    await query("delete from le_quota_uses where kind = 'warm_path_check'");
+    const notCounted = await query<{ n: number }>("select count(*)::int as n from le_quota_uses where kind = 'warm_path_check'");
+    await postPaths();
+    const afterNotSetUp = await query<{ n: number }>("select count(*)::int as n from le_quota_uses where kind = 'warm_path_check'");
+    check("7b: a check that compared nothing (not set up) does not count", afterNotSetUp[0]?.n === notCounted[0]?.n, afterNotSetUp);
+    const notConfigured = await postSync();
+    check("7b: POST /api/network/x/sync without TWITTERAPI_IO_KEY is 400 not_configured", notConfigured.status === 400 && notConfigured.data?.code === "not_configured", notConfigured.data);
+    const noUrl = await postSelf();
+    check("7b: POST /api/network/linkedin/self without your LinkedIn URL is 400 no_url", noUrl.status === 400 && noUrl.data?.code === "no_url", noUrl.data);
+    check("7b: nothing reached an outside service so far", outside() === 0, wcalls.map((c) => c.host));
+
+    // ---------------------------------------------- 7c. Settings: your handles and profile URL
+    for (const [label, body, field] of [
+      ["an X handle with a space", { xHandle: "not a handle" }, "xHandle"],
+      ["an X handle of 16 characters", { xHandle: "x".repeat(16) }, "xHandle"],
+      ['the Instagram page "explore"', { instagramHandle: "explore" }, "instagramHandle"],
+      ["an Instagram post link", { instagramHandle: "https://www.instagram.com/p/Cabc123/" }, "instagramHandle"],
+      ["an Instagram handle with two dots", { instagramHandle: "ada..kim" }, "instagramHandle"],
+      ["a LinkedIn company page", { linkedinUrl: "https://www.linkedin.com/company/acme" }, "linkedinUrl"],
+      ["another site", { linkedinUrl: "https://example.com/in/sam" }, "linkedinUrl"],
+      ["an X handle that is not text", { xHandle: 42 }, null],
+    ] as const) {
+      const r = await putSettings(body);
+      check(`7c: PUT /api/settings with ${label} is 400${field ? ` (field ${field})` : ""}`, r.status === 400 && typeof r.data?.error === "string" && (field === null || r.data?.field === field), r.data);
+    }
+    const saved = await putSettings({ xHandle: `@${X_OWNER}`, instagramHandle: "https://www.instagram.com/Sam.WP/?hl=en", linkedinUrl: `linkedin.com/in/${SAM_SLUG.toUpperCase()}/?trk=x` });
+    const s1 = saved.data?.settings as Record<string, unknown> | undefined;
+    check(
+      "7c: PUT /api/settings saves the three cleaned: X handle without @, Instagram from a link (lower case), LinkedIn URL normalised",
+      saved.status === 200 && s1?.xHandle === X_OWNER && s1?.instagramHandle === "sam.wp" && s1?.linkedinUrl === SAM_URL && s1?.senderName === "Sam Okafor",
+      s1,
+    );
+    const net1 = (await getNet()).data as Record<string, Record<string, unknown>> | null;
+    check(
+      "7c: GET /api/network shows your handles and profile URL (not read yet)",
+      net1?.x?.handle === X_OWNER && net1?.instagram?.handle === "sam.wp" && (net1?.linkedin?.self as Record<string, unknown>)?.url === SAM_URL && (net1?.linkedin?.self as Record<string, unknown>)?.readAt === null,
+      net1,
+    );
+
+    // ---------------------------------------------- 7d. PUT /api/network/linkedin/connections
+    const id1 = randomUUID();
+    const plain = await putPart(undefined, { rawBody: JSON.stringify({ importId: id1, part: 1, parts: 1, rows: [] }), headers: { "content-type": "text/plain" } });
+    check("7d: a part sent as text/plain is 415", plain.status === 415, plain.data);
+    const big = await putPart(undefined, { rawBody: JSON.stringify({ importId: id1, part: 1, parts: 1, rows: [], pad: "x".repeat(4 * 1024 * 1024 + 10) }) });
+    check("7d: a part over 4 MB is 413", big.status === 413 && /4 MB/.test(String(big.data?.error)), big.data);
+    const good = CONNECTIONS.slice(0, 2);
+    for (const [label, body, pattern] of [
+      ["a bad importId", { importId: "not-a-uuid", part: 1, parts: 1, rows: good }, /importId/],
+      ["part 0", { importId: id1, part: 0, parts: 1, rows: good }, /part/],
+      ["7 parts", { importId: id1, part: 1, parts: 7, rows: good }, /parts/],
+      ["part 3 of 2", { importId: id1, part: 3, parts: 2, rows: good }, /part/],
+      ["rows that are not a list", { importId: id1, part: 1, parts: 1, rows: "Priya Shah" }, /rows/],
+      ["5,001 rows", { importId: id1, part: 1, parts: 1, rows: Array.from({ length: 5001 }, (_, i) => [`x-${i}`, "A", "B", "", "", null]) }, /5,000/],
+      ["a row that is not a profile slug", { importId: id1, part: 1, parts: 1, rows: [good[0], ["Priya Shah", "Priya", "Shah", "", "", null]] }, /^Row 2: not a LinkedIn profile slug\.$/],
+      ["a row with 7 fields", { importId: id1, part: 1, parts: 1, rows: [[...good[0], "extra"]] }, /^Row 1: expected/],
+      ["a bad Connected On date", { importId: id1, part: 1, parts: 1, rows: [[good[0][0], "Priya", "Shah", "", "", "2026-13-45"]] }, /^Row 1: connectedOn/],
+      ["a company over 200 characters", { importId: id1, part: 1, parts: 1, rows: [[good[0][0], "Priya", "Shah", "c".repeat(201), "", null]] }, /^Row 1: a field/],
+    ] as const) {
+      const r = await putPart(body);
+      const error = String(r.data?.error ?? "");
+      check(`7d: a part with ${label} is 400, and the message names no one`, r.status === 400 && (pattern as RegExp).test(error) && named(error).length === 0, r.data);
+    }
+    check("7d: the refused parts stored nothing", (await query<{ n: number }>("select count(*)::int as n from le_network_contacts where network = 'linkedin'"))[0]?.n === 0);
+
+    const upload = randomUUID();
+    const tasks0 = afterTasks.length;
+    const part1 = await putPart({ importId: upload, part: 1, parts: 2, rows: CONNECTIONS.slice(0, 20), exportedAt: "2026-11-02T09:00:00.000Z" });
+    check("7d: part 1 of 2: { received, total, done: false }", part1.status === 200 && part1.data?.received === 20 && part1.data?.total === 20 && part1.data?.done === false, part1.data);
+    const stale = await putPart({ importId: randomUUID(), part: 2, parts: 2, rows: CONNECTIONS.slice(20) });
+    check("7d: a later part of an upload that is not the one in progress is 409 replaced", stale.status === 409 && stale.data?.code === "replaced", stale.data);
+    const part2 = await putPart({ importId: upload, part: 2, parts: 2, rows: CONNECTIONS.slice(20), exportedAt: "2026-11-02T09:00:00.000Z" });
+    check(
+      "7d: the last part: done, every row stored, the Connected chip set on the lead, the free recompute handed to after()",
+      part2.status === 200 && part2.data?.done === true && part2.data?.total === CONNECTIONS.length && Number(part2.data?.connectedLeads) >= 1 && afterTasks.length === tasks0 + 1,
+      part2.data,
+    );
+    const listed = (await call(leadsRoute.GET, { path: "/api/leads" })).data?.leads as Lead[] | undefined;
+    const chip = listed?.find((l) => l.id === A)?.warmPath;
+    check("7d: GET /api/leads: the lead carries warmPath, connected, labelled with the tie", chip?.connected === true && chip.hops === 1 && chip.label === "LinkedIn 1st degree since 2021", chip);
+    const tomasChip = listed?.find((l) => l.id === tomas.id)?.warmPath;
+    const beforeTomas = outside();
+    const tomasDetail = await getDetail(tomas.id);
+    const tp = pathsOf(tomasDetail);
+    check(
+      "7d: a lead never researched with a Connected chip: GET /api/leads/[id] computes its free part, so the page shows the direct box too (no outside call)",
+      tomasChip?.connected === true &&
+        (tomasDetail.data?.lead as Lead | undefined)?.researchFinishedAt === null &&
+        Boolean(tp?.checkedAt) &&
+        tp?.paths[0]?.id === "direct" &&
+        tp.paths[0].links[0].evidence.some((e) => e.kind === "linkedin_1st") &&
+        (tomasDetail.data?.lead as Lead | undefined)?.warmPath?.connected === true &&
+        outside() === beforeTomas,
+      tp && { checkedAt: tp.checkedAt, ids: tp.paths.map((p) => p.id) },
+    );
+    const net2 = await getNet();
+    const conn2 = (net2.data?.linkedin as Record<string, unknown> | undefined)?.connections as Record<string, unknown> | undefined;
+    check(
+      "7d: GET /api/network: the count and the export date, and not one contact's name",
+      conn2?.count === CONNECTIONS.length && conn2?.exportedAt === "2026-11-02T09:00:00.000Z" && named(JSON.stringify(net2.data)).length === 0,
+      conn2,
+    );
+
+    // ---------------------------------------------- 7e. POST /paths: the free part (your connections and profile)
+    const before5 = outside();
+    const found = await postPaths();
+    const fp = pathsOf(found);
+    const direct = fp?.paths[0];
+    check("7e: POST /paths is 200 { paths, message, outcome: found }", found.status === 200 && found.data?.outcome === "found" && typeof found.data?.message === "string", found.data && { status: found.status, outcome: found.data.outcome, message: found.data.message });
+    check(
+      "7e: the direct path first: Strong, LinkedIn 1st degree, worked together at Northwind Labs, same school",
+      direct?.id === "direct" && direct.strength === "strong" && ["linkedin_1st", "worked_together", "same_school"].every((k) => direct.links[0].evidence.some((e) => e.kind === k)),
+      direct,
+    );
+    const uniReads = wcalls.slice(before5).filter((c) => c.host === W_HOSTS.unipile && c.path.startsWith("/api/v1/users/"));
+    check(
+      "7e: the lead's profile and yours were read once each, on the research account, with notify=false",
+      uniReads.length === 2 && uniReads.every((c) => c.query.account_id === "acc_research" && c.query.notify === "false" && c.headers["x-api-key"] === W_KEYS.unipile && !c.path.includes(W_KEYS.unipile)),
+      uniReads.map((c) => ({ p: c.path, a: c.query.account_id })),
+    );
+    check(
+      "7e: at most 10 paths and 5 company people; of 32 people at Acme Robotics, at most 5 reach the reply",
+      Boolean(fp) && fp!.paths.length <= 10 && fp!.companyPaths.length === 5 && quillsIn(JSON.stringify(found.data)) <= 5 && !JSON.stringify(found.data).includes("Tomas Ruiz"),
+      fp && { paths: fp.paths.length, company: fp.companyPaths.length, quills: quillsIn(JSON.stringify(found.data)) },
+    );
+    const events5 = await listEvents(A);
+    const toolEvent = events5.find((e) => e.type === "tool" && e.message.startsWith("Warm paths:"));
+    check("7e: one 'tool' event with the outcome (Activity)", toolEvent?.message === found.data?.message && (toolEvent?.data as { trigger?: string })?.trigger === "button", toolEvent);
+    const d5 = pathsOf(await getDetail());
+    check("7e: GET /api/leads/[id]: paths done, checked now, the direct path first", d5?.status === "done" && Boolean(d5.checkedAt) && d5.paths[0]?.id === "direct" && d5.setup.linkedinConnections && d5.setup.linkedinProfile, d5 && { status: d5.status, setup: d5.setup });
+    // A lead you are not connected to, in the launch setup (no X check, no check on your own LinkedIn
+    // account): nothing says that nobody links you, since mutual connections were not checked.
+    const cy = await createLead({ linkedinUrl: `https://www.linkedin.com/in/cy-wp-${W}`, name: "Cy Lund" });
+    made.push(cy.id);
+    await updateLead(cy.id, { researchStatus: "done", researchFinishedAt: new Date().toISOString() });
+    const cyCheck = await postPaths(cy.id);
+    const cyPaths = pathsOf(cyCheck);
+    const cyEvent = (await listEvents(cy.id)).find((e) => e.type === "tool")?.message ?? "";
+    check(
+      "7e: not connected, no source of mutual connections: the message and the Activity line say 'no direct link ... mutual connections not checked', never 'none found'",
+      cyCheck.status === 200 &&
+        cyCheck.data?.outcome === "none" &&
+        /^Warm paths: no direct link \(checked \d+ LinkedIn connections; mutual connections not checked\)$/.test(String(cyCheck.data?.message)) &&
+        cyEvent === cyCheck.data?.message,
+      { message: cyCheck.data?.message, event: cyEvent },
+    );
+    const cyWords = cyPaths ? noPathsCopy(cyPaths) : null;
+    check(
+      "7e: ... and the panel's words, from that reply: no direct link, what was compared, and that mutual connections are not checked here",
+      cyWords?.title === "No direct link to Cy yet." &&
+        /^Cy is not one of your \d+ LinkedIn connections\. Re-run research to compare employers and schools\.$/.test(cyWords.detail) &&
+        cyWords.mutuals === "Mutual connections are not checked here." &&
+        cyWords.setUp === "To check them here, set up X or your LinkedIn account in Settings.",
+      cyWords,
+    );
+
+    // ---------------------------------------------- 7f. the free recompute on GET
+    const c0 = await computedAt();
+    await getDetail();
+    check("7f: nothing changed: GET does not recompute (computed_at stays)", (await computedAt()) === c0);
+    const before6 = outside();
+    const reup = await uploadAll(withoutOmar);
+    const afterUpload = await getDetail();
+    const c1 = await computedAt();
+    check(
+      "7f: a new upload without Omar: the next GET recomputes for free, with no outside call, and Omar is gone",
+      reup.data?.done === true && c1 !== c0 && outside() === before6 && !JSON.stringify(afterUpload.data).includes("Omar Haddad") && (pathsOf(afterUpload)?.companyPaths.length ?? 0) === 5,
+      { c0, c1, calls: outside() - before6 },
+    );
+    await getDetail();
+    check("7f: ... at most once: the GET after it does not recompute again", (await computedAt()) === c1);
+    await claimResearch(A);
+    await uploadAll(CONNECTIONS);
+    const during = await getDetail();
+    check("7f: never while research runs: the network changed, the paths stay as they were", (await computedAt()) === c1 && !JSON.stringify(pathsOf(during)).includes("Omar Haddad"));
+    await finishResearch(A, "done");
+    const backAgain = await getDetail();
+    check("7f: research done: the next GET recomputes (Omar is back)", (await computedAt()) !== c1 && JSON.stringify(pathsOf(backAgain)).includes("Omar Haddad"));
+    const c2 = await computedAt();
+    check("7f: (the claim of a check)", await claimWarmPathCheck(A));
+    await uploadAll(withoutOmar);
+    const checking = pathsOf(await getDetail());
+    check("7f: never while a check runs: status running, the paths untouched", checking?.status === "running" && (await computedAt()) === c2);
+    await releaseWarmPathCheck(A);
+    await getDetail();
+    const c3 = await computedAt();
+    check("7f: the check released: the GET recomputes", c3 !== c2);
+    // Race safety: the recompute saves only over the row it read.
+    const read = await getWarmPathRow(A);
+    await saveIntro(A, "li:race-wp", { askedAt: null });
+    const lost = await saveWarmPathResult(A, { status: "done", target: null, linkedinLive: null, xLive: null, paths: [], companyPaths: [], sources: [], error: null, summary: null }, { onlyIfIdle: true, ifVersion: read?.version ?? "x" });
+    const kept = await getWarmPathRow(A);
+    check("7f: a recompute computed from an older row writes nothing (a newer write is never overwritten)", Boolean(read?.version) && lost === false && (kept?.paths.length ?? 0) > 0 && kept?.target !== null);
+    const other = await createLead({ linkedinUrl: `https://www.linkedin.com/in/other-wp-${W}` });
+    made.push(other.id);
+    const noRow = await saveWarmPathResult(other.id, { status: "done", target: null, linkedinLive: null, xLive: null, paths: [], companyPaths: [], sources: [], error: null, summary: null }, { updateOnly: true });
+    check("7f: an update-only save never creates a row (a row deleted meanwhile stays deleted)", noRow === false && (await getWarmPathRow(other.id)) === null);
+
+    // ---------------------------------------------- 7g. X through twitterapi.io
+    const xOffLine = pathsOf(await getDetail())?.sources.find((s) => s.network === "x");
+    check("7g: X off on this server comes first: the lead without an X handle is not asked for one", xOffLine?.detail === "off on this server." && xOffLine.reason === "not_configured", xOffLine);
+    const cBeforeKey = await computedAt();
+    const callsBeforeKey = outside();
+    setWarmEnv({ TWITTERAPI_IO_KEY: W_KEYS.x });
+    const keyOnLine = pathsOf(await getDetail())?.sources.find((s) => s.network === "x");
+    check(
+      "7g: the key added on the server: the next GET redoes the free part (no outside call), and the footer follows what is set up now",
+      keyOnLine?.detail === "not checked, their X account is not known. Add it under Details." && (await computedAt()) !== cBeforeKey && outside() === callsBeforeKey,
+      keyOnLine,
+    );
+    const badX = await patchLead({ xHandle: "not a handle!" });
+    check("7g: PATCH /api/leads/[id] xHandle that is not a handle is 400 bad_handle", badX.status === 400 && badX.data?.code === "bad_handle", badX.data);
+    const setX = await patchLead({ xHandle: `@${X_LEAD.toUpperCase()}` });
+    check("7g: PATCH xHandle saves it cleaned (no @)", setX.status === 200 && (setX.data?.lead as Lead | undefined)?.xHandle === X_LEAD.toUpperCase(), setX.data?.lead && (setX.data.lead as Lead).xHandle);
+    const linkX = await patchLead({ xHandle: `https://x.com/${X_LEAD}` });
+    check("7g: PATCH xHandle accepts an x.com link", (linkX.data?.lead as Lead | undefined)?.xHandle === X_LEAD);
+    const sync = await postSync();
+    check(
+      "7g: POST /api/network/x/sync: your lists refreshed, counts and credits only",
+      sync.status === 200 && sync.data?.following === 2 && sync.data?.followers === 2 && Number(sync.data?.creditsUsed) > 0 && sync.data?.refreshed === true && named(JSON.stringify(sync.data)).length === 0,
+      sync.data,
+    );
+    const xCheck = await postPaths();
+    const xp = pathsOf(xCheck);
+    const priyaPath = xp?.paths.find((p) => p.id === publicPathId(A, `li:${PRIYA}`));
+    const zedPath = xp?.paths.find((p) => p.id === publicPathId(A, "x:1002"));
+    check(
+      "7g: POST /paths with X: Priya (your connection, mutual follows) is a Medium two-hop path; Zed (X only) is Weak",
+      xCheck.status === 200 && priyaPath?.hops === 2 && priyaPath.strength === "medium" && zedPath?.strength === "weak" && xp?.sources.find((s) => s.network === "x")?.state === "checked",
+      xp && xp.paths.map((p) => [p.id, p.strength]),
+    );
+    const xCalls = wcalls.filter((c) => c.host === W_HOSTS.x);
+    check("7g: the twitterapi.io key travels only in the X-API-Key header", xCalls.length > 0 && xCalls.every((c) => c.headers["x-api-key"] === W_KEYS.x && !JSON.stringify(c.query).includes(W_KEYS.x)));
+    check("7g: the lead's own lists are never stored (only your own X lists are)", (await query<{ n: number }>("select count(*)::int as n from le_network_contacts where network = 'x' and external_id = '800'"))[0]?.n === 0);
+    if (!priyaPath) throw new Error("no two-hop path; stopping the warm-path checks");
+    const PID = priyaPath.id;
+    const replyIds = [...(xp?.paths ?? []), ...(xp?.companyPaths ?? [])].map((p) => p.id);
+    check(
+      "7g: every path id in the reply is opaque: 'direct' or the network and 12 hex characters, never a slug, name or handle",
+      replyIds.length > 3 && replyIds.every((id) => /^(?:direct|li-[0-9a-f]{12}|x-[0-9a-f]{12})$/.test(id)) && !replyIds.some((id) => id.includes(PRIYA) || id.includes("1002") || named(id).length > 0),
+      replyIds,
+    );
+
+    // ---------------------------------------------- 7h. intro requests
+    const quota0 = (await query<{ n: number }>("select count(*)::int as n from le_quota_uses where kind = 'intro_draft'"))[0]?.n ?? 0;
+    const bodies0 = wc.bodies.length;
+    const drafted = await postIntro(PID);
+    const dpath = drafted.data?.path as WarmPath | undefined;
+    check("7h: POST .../intro is 200 { path } with the draft", drafted.status === 200 && dpath?.id === PID && dpath.introDraft?.message === wc.message, drafted.data);
+    const sent = wc.bodies[bodies0] ?? {};
+    const outputConfig = sent.output_config as { effort?: string; format?: { type?: string } } | undefined;
+    check(
+      "7h: one Claude call: claude-haiku-5-5 at effort low, max_tokens 1000, structured output, no sampling parameters",
+      wc.bodies.length === bodies0 + 1 &&
+        sent.model === "claude-haiku-5-5" &&
+        outputConfig?.effort === "low" &&
+        outputConfig?.format?.type === "json_schema" &&
+        sent.max_tokens === 1000 &&
+        !("temperature" in sent) &&
+        !("top_p" in sent) &&
+        !("top_k" in sent) &&
+        !("thinking" in sent),
+      { model: sent.model, effort: outputConfig?.effort, max: sent.max_tokens, keys: Object.keys(sent) },
+    );
+    const prompt = String(((sent.messages as Array<{ content?: unknown }> | undefined)?.[0]?.content as string | undefined) ?? "");
+    const blocks = ["sender", "connector", "your_link", "their_link", "lead", "brief", "angle", "findings"];
+    check("7h: every input is in its own data block", blocks.every((b) => prompt.includes(`<${b}>`) && prompt.includes(`</${b}>`)), blocks.filter((b) => !prompt.includes(`<${b}>`)));
+    check(
+      "7h: the inputs: your name, the connector's first name, both links' evidence, the lead, the brief and the recommended angle",
+      prompt.includes("Name: Sam Okafor") && prompt.includes("First name: Priya") && prompt.includes("Mutual follow with Ada on X") && prompt.includes("LinkedIn 1st degree since 2021") && prompt.includes("Title: CTO") && prompt.includes(brief.summary) && prompt.includes(angle.reasoning),
+      prompt.slice(0, 1200),
+    );
+    check(
+      "7h: the 3 most relevant findings that pass your criteria, not a 4th, not one the criteria leave out",
+      ["FINDING-ONE", "FINDING-TWO", "FINDING-THREE"].every((f) => prompt.includes(f)) && !prompt.includes("FINDING-FOUR") && !prompt.includes("FINDING-FILTERED"),
+    );
+    const system = String(sent.system ?? "");
+    check(
+      "7h: the system prompt carries the rules (under 90 words, the ask first, forwardable, no follows, no link, no closeness beyond the evidence)",
+      system === INTRO_SYSTEM && /Under 90 words/.test(system) && /No worries if it's not a fit/.test(system) && /Never mention follows/.test(system) && /No booking link/.test(system) && /Claim no more closeness/.test(system),
+    );
+    check("7h: introPrompt is pure: the same inputs give the same prompt", introPrompt({ senderName: "", path: priyaPath, lead: { name: "Ada Kim", title: null, companyName: null }, briefSummary: null, angleReasoning: null, findings: [] }).includes("Name: [your name]"));
+    const quota1 = (await query<{ n: number }>("select count(*)::int as n from le_quota_uses where kind = 'intro_draft'"))[0]?.n ?? 0;
+    check("7h: the draft is counted in le_quota_uses (intro_draft)", quota1 === quota0 + 1, { quota0, quota1 });
+    const directIntro = await postIntro("direct");
+    check("7h: no intro on the direct path: 400 direct, no Claude call", directIntro.status === 400 && directIntro.data?.code === "direct" && wc.bodies.length === bodies0 + 1, directIntro.data);
+    for (const [label, pid] of [
+      ["an unknown path", publicPathId(A, `li:nobody-wp-${W}`)],
+      ["a malformed path id", "foo"],
+      ["a path id that ends like a static file", "li:ada.png"],
+      ["the person's slug instead of the opaque id", `li:${PRIYA}`],
+    ] as const) {
+      const r = await postIntro(pid);
+      check(`7h: intro for ${label} is 404`, r.status === 404, r.data);
+    }
+    check("7h: intro for an unknown lead is 404", (await postIntro(PID, ghost)).status === 404);
+    wc.delayMs = 250;
+    const [i1, i2] = await Promise.all([
+      postIntro(PID),
+      (async () => {
+        await wpause(40);
+        return postIntro(PID);
+      })(),
+    ]);
+    wc.delayMs = 0;
+    check("7h: a second draft for the lead while one runs is 409 drafting", [i1.status, i2.status].sort().join(",") === "200,409" && [i1, i2].some((r) => r.data?.code === "drafting"), [i1.status, i2.status]);
+    const room = 100 - ((await query<{ n: number }>("select count(*)::int as n from le_quota_uses where kind = 'intro_draft' and created_at > now() - interval '24 hours'"))[0]?.n ?? 0);
+    if (room > 0) await query("insert into le_quota_uses (kind, units, lead_id) select 'intro_draft', 1, $1::uuid from generate_series(1, $2::int)", [A, room]);
+    const bodies2 = wc.bodies.length;
+    const capped = await postIntro(PID);
+    check("7h: the 101st draft in 24 hours is 429 intro_budget, and Claude is not called", capped.status === 429 && capped.data?.code === "intro_budget" && /100 intro drafts a day/.test(String(capped.data?.error)) && wc.bodies.length === bodies2, capped.data);
+    await query("delete from le_quota_uses where kind = 'intro_draft'");
+    wc.stop = "refusal";
+    const refused = await postIntro(PID);
+    wc.stop = "end_turn";
+    check("7h: Claude declines: 502 claude, \"Could not draft the request: ...\"", refused.status === 502 && refused.data?.code === "claude" && String(refused.data?.error).startsWith("Could not draft the request:"), refused.data);
+    check("7h: ... the earlier draft stays", (await getWarmPathRow(A))?.intros[PID]?.introDraft?.message === wc.message);
+    // A draft that followed something in the data (a link or an address the prompt forbids) is not saved.
+    const goodMessage = wc.message;
+    for (const [label, message] of [
+      ["a link", "Hi Priya,\n\nWould you introduce me to Ada? Book here: https://evil.example/book\n\nSam"],
+      ["an email address", "Hi Priya,\n\nWould you introduce me to Ada? Write to sam@evil.example\n\nSam"],
+    ] as const) {
+      wc.message = message;
+      const tainted = await postIntro(PID);
+      check(
+        `7h: a draft with ${label} in it: 502 claude, nothing saved (the earlier draft stays)`,
+        tainted.status === 502 && tainted.data?.code === "claude" && String(tainted.data?.error).includes(`had ${label} in it`) && (await getWarmPathRow(A))?.intros[PID]?.introDraft?.message === goodMessage,
+        tainted.data,
+      );
+    }
+    wc.message = goodMessage;
+
+    // ---------------------------------------------- 7i. PATCH /paths/[pathId]: edits and "asked"
+    const createdAt = (await getWarmPathRow(A))?.intros[PID]?.introDraft?.createdAt;
+    const edited = await patchPath(PID, { introDraft: "  Hi Priya, edited by hand.\r\n\r\nSam  " });
+    const ep = edited.data?.path as WarmPath | undefined;
+    check("7i: introDraft saves the edit (trimmed, line breaks kept) and keeps the draft's time", edited.status === 200 && ep?.introDraft?.message === "Hi Priya, edited by hand.\n\nSam" && ep.introDraft.createdAt === createdAt, ep?.introDraft);
+    check("7i: introDraft over 2,000 characters is 400", (await patchPath(PID, { introDraft: "x".repeat(2001) })).status === 400);
+    check("7i: an empty body is 400", (await patchPath(PID, {})).status === 400);
+    check("7i: asked that is not a boolean is 400", (await patchPath(PID, { asked: "yes" })).status === 400);
+    check("7i: a body sent as text/plain is 415", (await patchPath(PID, undefined, { rawBody: '{"asked":true}', headers: { "content-type": "text/plain" } })).status === 415);
+    check("7i: the direct path is 400 direct", (await patchPath("direct", { asked: true })).data?.code === "direct");
+    check("7i: an unknown path is 404", (await patchPath(publicPathId(A, `li:nobody-wp-${W}`), { asked: true })).status === 404);
+    check("7i: a path id that ends like a static file is 404", (await patchPath("li:ada.png", { asked: true })).status === 404);
+    check("7i: the person's slug instead of the opaque id is 404 (no name ever goes in a URL)", (await patchPath(`li:${PRIYA}`, { asked: true })).status === 404);
+    const asked = await patchPath(PID, { asked: true });
+    const askedAt = (asked.data?.path as WarmPath | undefined)?.askedAt;
+    const notes = async () => (await listEvents(A)).filter((e) => e.type === "note" && e.message === "Asked Priya Shah for an intro");
+    check("7i: asked: true sets askedAt and logs one note \"Asked Priya Shah for an intro\"", asked.status === 200 && Boolean(askedAt) && (await notes()).length === 1, asked.data);
+    const again = await patchPath(PID, { asked: true });
+    check("7i: asked again keeps the first date and logs no second note", (again.data?.path as WarmPath | undefined)?.askedAt === askedAt && (await notes()).length === 1);
+    const unasked = await patchPath(PID, { asked: false });
+    check("7i: asked: false clears it", (unasked.data?.path as WarmPath | undefined)?.askedAt === null);
+    await saveNetworkSource("linkedin_csv", { syncedAt: "now" });
+    const kept2 = pathsOf(await getDetail())?.paths.find((p) => p.id === PID);
+    check("7i: a recompute keeps the draft (drafts are kept by path id)", kept2?.introDraft?.message === "Hi Priya, edited by hand.\n\nSam");
+    const cleared = await patchPath(PID, { introDraft: "" });
+    check('7i: introDraft "" clears the draft', (cleared.data?.path as WarmPath | undefined)?.introDraft === null);
+
+    // ---------------------------------------------- 7j. PATCH /paths: the lead's Instagram handle (a link only)
+    const ig = await patchInstagram({ instagramHandle: "@Ada.Kim" });
+    const igp = pathsOf(ig);
+    check(
+      "7j: PATCH /paths { instagramHandle } saves it (lower case, manual) and returns the paths with the link",
+      ig.status === 200 && igp?.instagram?.handle === "ada.kim" && igp.instagram.source === "manual" && igp.links.instagram === "https://www.instagram.com/ada.kim/",
+      igp && { instagram: igp.instagram, link: igp.links.instagram },
+    );
+    check("7j: ... and the footer's Instagram line follows (a link, nothing read)", igp?.sources.find((s) => s.network === "instagram")?.reason === "link_only");
+    for (const [label, value, pattern] of [
+      ['"explore"', "explore", /Instagram page/],
+      ["a reel link", "https://www.instagram.com/reel/Cabc/", /Instagram page/],
+      ["a handle with a space", "ada kim", /letters, digits, dots and _/],
+      ["31 characters", "a".repeat(31), /letters, digits, dots and _/],
+      ["another site", "https://example.com/ada", /letters, digits, dots and _/],
+    ] as const) {
+      const r = await patchInstagram({ instagramHandle: value });
+      check(`7j: instagramHandle ${label} is 400 bad_handle`, r.status === 400 && r.data?.code === "bad_handle" && pattern.test(String(r.data?.error)), r.data);
+    }
+    check("7j: instagramHandle that is not text is 400", (await patchInstagram({ instagramHandle: 5 })).status === 400);
+    check("7j: a missing instagramHandle is 400", (await patchInstagram({})).status === 400);
+    check("7j: a body sent as text/plain is 415", (await patchInstagram(undefined, A, { rawBody: '{"instagramHandle":null}', headers: { "content-type": "text/plain" } })).status === 415);
+    check("7j: an unknown lead is 404", (await patchInstagram({ instagramHandle: "ada" }, ghost)).status === 404);
+    await claimWarmPathCheck(A);
+    const busyIg = await patchInstagram({ instagramHandle: "someone.else" });
+    await releaseWarmPathCheck(A);
+    check("7j: while a check runs: 409 checking, and the handle is kept", busyIg.status === 409 && busyIg.data?.code === "checking" && (await getWarmPathRow(A))?.target?.instagramHandle === "ada.kim", busyIg.data);
+    const igClear = await patchInstagram({ instagramHandle: null });
+    check("7j: null clears it", pathsOf(igClear)?.instagram === null && pathsOf(igClear)?.links.instagram === null);
+
+    // ---------------------------------------------- 7k. busy, research running, budgets and failures
+    await claimResearch(A);
+    const before11 = outside();
+    const researching = await postPaths();
+    await finishResearch(A, "done");
+    check("7k: POST /paths while research runs is 409 research_running, and nothing is called", researching.status === 409 && researching.data?.code === "research_running" && outside() === before11, researching.data);
+    await claimWarmPathCheck(A);
+    const busy = await postPaths();
+    await releaseWarmPathCheck(A);
+    check("7k: POST /paths while another check runs (another server) is 409 checking", busy.status === 409 && busy.data?.code === "checking", busy.data);
+    wx.delayMs = 200;
+    const [k1, k2] = await Promise.all([
+      postPaths(),
+      (async () => {
+        await wpause(40);
+        return postPaths();
+      })(),
+    ]);
+    wx.delayMs = 0;
+    check("7k: a second click while a check runs on this server is 409 checking", [k1.status, k2.status].sort().join(",") === "200,409", [k1.status, k2.status]);
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: "0" });
+    const overX = await postPaths();
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: undefined });
+    check(
+      "7k: every live source over budget (X paused): 429 warm_path_budget, and the free part is still saved",
+      overX.status === 429 && overX.data?.code === "warm_path_budget" && /X checks are paused/.test(String(overX.data?.error)) && pathsOf(overX)?.paths[0]?.id === "direct",
+      overX.data && { status: overX.status, error: overX.data.error },
+    );
+    wx.fail = { "user-info": 502 };
+    const upstream = await postPaths();
+    const upstreamRow = await getWarmPathRow(A);
+    // A lead with only an X handle: nothing else can be checked, so the whole check failed.
+    await updateLead(bare.id, { xHandle: `bare_wp_${W}` });
+    const allFailed = await postPaths(bare.id);
+    await updateLead(bare.id, { xHandle: null });
+    wx.fail = {};
+    check(
+      "7k: X answered 502 but your connections were still matched: 200, the X line says it failed (as after a reload), and the free part is saved",
+      upstream.status === 200 &&
+        pathsOf(upstream)?.status === "done" &&
+        pathsOf(upstream)?.sources.find((s) => s.network === "x")?.state === "failed" &&
+        pathsOf(upstream)?.sources.find((s) => s.network === "x")?.detail.startsWith("did not answer (") === true &&
+        pathsOf(upstream)?.paths[0]?.id === "direct" &&
+        upstreamRow?.status === "done",
+      upstream.data && { status: upstream.status, error: upstream.data.error },
+    );
+    check(
+      "7k: every source that could run failed (X answered 502, no LinkedIn profile): 502 upstream, each line named once",
+      allFailed.status === 502 &&
+        allFailed.data?.code === "upstream" &&
+        /^Could not check for warm paths\. X: did not answer \(.*502.*\)\. Try again in a few minutes\.$/.test(String(allFailed.data?.error)) &&
+        pathsOf(allFailed)?.status === "error" &&
+        pathsOf(allFailed)?.error?.startsWith("X: did not answer") === true,
+      allFailed.data && { status: allFailed.status, error: allFailed.data.error, stored: pathsOf(allFailed)?.error },
+    );
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: "0" });
+    const keptLists = await postSync();
+    check("7k: Refresh now with the X budget paused and your lists stored: 200, refreshed false, with a note", keptLists.status === 200 && keptLists.data?.refreshed === false && typeof keptLists.data?.note === "string", keptLists.data);
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: undefined });
+
+    // A different X handle on the lead: the cached X check goes, the paths drop the old X evidence.
+    check("7k: (the X check is cached)", (await getWarmPathRow(A))?.xLive !== null);
+    const changedX = await patchLead({ xHandle: `someone_${W}` });
+    const xGone = await getWarmPathRow(A);
+    const hasX = (paths: WarmPath[] | undefined) => (paths ?? []).some((p) => p.links.some((l) => l.evidence.some((e) => e.kind === "mutual_follow" || e.kind === "follows")));
+    check(
+      "7k: PATCH a different xHandle: the cached X check is cleared and the paths lose their X evidence at once (the list chip too)",
+      changedX.status === 200 && xGone?.xLive === null && !hasX(xGone?.paths) && !xGone?.paths.some((p) => p.id === publicPathId(A, "x:1002")),
+      xGone && xGone.paths.map((p) => p.id),
+    );
+    await patchLead({ xHandle: X_LEAD });
+    const xBack = await postPaths();
+    check("7k: (the X paths are back after a new check)", hasX(pathsOf(xBack)?.paths));
+    // Your own X handle in Settings: your lists and every X-derived path go, and the chips are rebuilt after.
+    const tasksX = afterTasks.length;
+    const newOwn = await putSettings({ xHandle: `sam_new_${W}` });
+    const ownGone = await getWarmPathRow(A);
+    check(
+      "7k: a new X handle in Settings drops your X lists and every path from them, and hands the free recompute to after()",
+      newOwn.status === 200 &&
+        (await query<{ n: number }>("select count(*)::int as n from le_network_contacts where network = 'x'"))[0]?.n === 0 &&
+        ownGone?.xLive === null &&
+        !ownGone?.paths.some((p) => p.id.startsWith("x-")) &&
+        afterTasks.length === tasksX + 1,
+    );
+    const sameSettings = await putSettings({ senderName: "Sam Okafor" });
+    check("7k: a Settings save that changes neither handle nor URL schedules nothing", sameSettings.status === 200 && afterTasks.length === tasksX + 1);
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: "0" });
+    const noLists = await postSync();
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: undefined });
+    check("7k: Refresh now with the X budget paused and no lists stored: 429 warm_path_budget", noLists.status === 429 && noLists.data?.code === "warm_path_budget", noLists.data);
+    wx.fail = { "user-info": 502 };
+    const syncDown = await postSync();
+    wx.fail = {};
+    check("7k: Refresh now when X does not answer: 502 upstream", syncDown.status === 502 && syncDown.data?.code === "upstream", syncDown.data);
+    const noHandle = await putSettings({ xHandle: "" });
+    const syncNoHandle = await postSync();
+    check("7k: Refresh now with no X handle in Settings: 400 no_handle", noHandle.status === 200 && syncNoHandle.status === 400 && syncNoHandle.data?.code === "no_handle", syncNoHandle.data);
+    await putSettings({ xHandle: X_OWNER });
+
+    // LinkedIn on your own account (step 2): its budget, and the account state in /api/status.
+    setWarmEnv({ TWITTERAPI_IO_KEY: undefined, UNIPILE_NETWORK_ACCOUNT_ID: "acc_owner", WARM_PATH_LINKEDIN_CHECKS_PER_DAY: "0" });
+    wu.accounts = [
+      { id: "acc_research", status: "OK" },
+      { id: "acc_owner", status: "OK" },
+    ];
+    resetUnipileState();
+    const before12 = wcalls.length;
+    const st1 = await call(statusRoute.GET, { path: "/api/status" });
+    const st2 = await call(statusRoute.GET, { path: "/api/status" });
+    const statusCalls = wcalls.slice(before12);
+    check(
+      "7k: GET /api/status: your LinkedIn account connected, from one cached accounts call that never touches LinkedIn",
+      (st1.data?.linkedinAccount as { state?: string } | undefined)?.state === "connected" && (st2.data?.linkedinAccount as { state?: string } | undefined)?.state === "connected" && statusCalls.length === 1 && statusCalls[0].path === "/api/v1/accounts",
+      statusCalls.map((c) => c.path),
+    );
+    const overLi = await postPaths();
+    check(
+      "7k: LinkedIn checks paused and X not set up: 429 warm_path_budget naming LinkedIn, and no LinkedIn request on your account",
+      overLi.status === 429 && overLi.data?.code === "warm_path_budget" && /LinkedIn checks are paused/.test(String(overLi.data?.error)) && !wcalls.slice(before12).some((c) => c.query.account_id === "acc_owner"),
+      overLi.data && { status: overLi.status, error: overLi.data.error },
+    );
+    const net3 = (await getNet()).data?.linkedin as Record<string, Record<string, unknown>> | undefined;
+    check("7k: GET /api/network: your account connected, 0 checks allowed today", net3?.account?.state === "connected" && net3?.account?.checksLimit === 0, net3?.account);
+    setWarmEnv({ UNIPILE_NETWORK_ACCOUNT_ID: undefined, WARM_PATH_LINKEDIN_CHECKS_PER_DAY: undefined, TWITTERAPI_IO_KEY: W_KEYS.x });
+    wu.accounts = [{ id: "acc_research", status: "OK" }];
+    resetUnipileState();
+
+    // ---------------------------------------------- 7l. your own profile: Read now
+    const soon = await postSelf();
+    check("7l: Read now right after a read (the check read it): 429 too_soon", soon.status === 429 && soon.data?.code === "too_soon", soon.data);
+    const backdate = () => query("update le_network_sources set data = jsonb_set(data, '{readAt}', '\"2026-01-01T00:00:00.000Z\"'::jsonb) where key = 'linkedin_self'");
+    await backdate();
+    const tasks1 = afterTasks.length;
+    const self = await postSelf();
+    check(
+      "7l: POST /api/network/linkedin/self: counts only (2 roles, 1 school), and every lead's paths are recomputed after",
+      self.status === 200 && self.data?.roles === 2 && self.data?.schools === 1 && typeof self.data?.readAt === "string" && !/Nimbus|Northwind|KTH/.test(JSON.stringify(self.data)) && afterTasks.length === tasks1 + 1,
+      self.data,
+    );
+    await backdate();
+    check("7l: (claimed elsewhere)", await claimNetworkSource("linkedin_self", 120_000));
+    const busySelf = await postSelf();
+    check("7l: a read already running is 409 busy", busySelf.status === 409 && busySelf.data?.code === "busy", busySelf.data);
+    await saveNetworkSource("linkedin_self", { status: "ok" });
+    wu.profileStatus = 500;
+    const failedSelf = await postSelf();
+    wu.profileStatus = 0;
+    resetUnipileState();
+    check("7l: LinkedIn does not answer (and the Apify fallback is off): 502 failed", failedSelf.status === 502 && failedSelf.data?.code === "failed", failedSelf.data);
+    const retry = await postSelf();
+    check("7l: a retry right after a failed read: 429 too_soon", retry.status === 429 && retry.data?.code === "too_soon", retry.data);
+    // A new URL in Settings resets the gaps above, not the 10 profile reads a day (7 are taken here, so 3 are left).
+    await query("delete from le_quota_uses where kind = 'profile_read'");
+    await query("insert into le_quota_uses (kind, units) select 'profile_read', 1 from generate_series(1, 7)");
+    const readsBefore = wcalls.filter((c) => c.host === W_HOSTS.unipile && c.path.includes("/users/")).length;
+    const toggled: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      await putSettings({ linkedinUrl: i % 2 ? SAM_URL : `https://www.linkedin.com/in/other-wp-${W}` });
+      toggled.push((await postSelf()).status);
+    }
+    const readsAfter = wcalls.filter((c) => c.host === W_HOSTS.unipile && c.path.includes("/users/")).length;
+    const lastToggle = await postSelf();
+    check(
+      "7l: alternating the LinkedIn URL in Settings gets 3 more reads, then 429 too_soon with the day's limit",
+      toggled.filter((s) => s !== 429).length === 3 && toggled.slice(3).every((s) => s === 429) && readsAfter - readsBefore === 3 && /10 LinkedIn profile reads a day/.test(String(lastToggle.data?.error)),
+      { toggled, reads: readsAfter - readsBefore, error: lastToggle.data?.error },
+    );
+    await putSettings({ linkedinUrl: SAM_URL });
+    await query("delete from le_quota_uses where kind = 'profile_read'");
+
+    // ---------------------------------------------- 7m. the api-client against these routes
+    const cDetail = await client.getLead(A);
+    check("7m: client getLead: paths normalised (lists filled, setup booleans)", Array.isArray(cDetail.paths?.paths) && Array.isArray(cDetail.paths?.companyPaths) && typeof cDetail.paths?.setup.any === "boolean");
+    check("7m: client warmPathsFrom fills a partial object and refuses junk", client.warmPathsFrom({ status: "weird", paths: [{ id: "x:1", hops: 3 }, { id: "x:2", hops: 2, links: "no" }] })?.paths.length === 1 && client.warmPathsFrom("nope") === null && client.warmPathsFrom({})?.status === "idle");
+    const cCheck = await client.findWarmPaths(A);
+    check("7m: client findWarmPaths: { paths, message, outcome }", cCheck.outcome === "found" && cCheck.paths?.paths[0]?.id === "direct" && cCheck.message.startsWith("Warm paths:"));
+    const cDraft = await client.draftIntro(A, PID);
+    check("7m: client draftIntro (the opaque path id in the URL): the path with its draft", cDraft.id === PID && cDraft.introDraft?.message === wc.message);
+    const draftUrl = bridged.filter((b) => b.method === "POST" && b.path.endsWith("/intro")).at(-1)?.path ?? "";
+    check("7m: ... and that URL holds no name, slug or handle", draftUrl.endsWith(`/paths/${PID}/intro`) && !draftUrl.includes(PRIYA) && named(decodeURIComponent(draftUrl)).length === 0, draftUrl);
+    const cAsk = await client.saveIntro(A, PID, { asked: true });
+    check("7m: client saveIntro: the path, asked", Boolean(cAsk.askedAt));
+    let codeSeen: string | null = null;
+    try {
+      await client.draftIntro(A, "direct");
+    } catch (err) {
+      codeSeen = err instanceof client.ApiError ? `${err.status}:${err.code}:${err.message}` : "other";
+    }
+    check("7m: client errors keep the server's status, code and message", codeSeen === "400:direct:You are connected directly: no intro is needed.", codeSeen);
+    const cIg = await client.setInstagramHandle(A, "ada.k");
+    check("7m: client setInstagramHandle: the paths", cIg?.instagram?.handle === "ada.k");
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: "0" });
+    let budgetPaths: WarmPaths | null = null;
+    try {
+      await client.findWarmPaths(A);
+    } catch (err) {
+      budgetPaths = client.warmPathsFromError(err);
+    }
+    setWarmEnv({ WARM_PATH_X_USD_PER_DAY: undefined });
+    check("7m: client warmPathsFromError: the paths a 429 still carries", budgetPaths?.paths[0]?.id === "direct");
+    const cNet = await client.getNetwork();
+    check("7m: client getNetwork: counts and states", cNet.linkedin.connections?.count === withoutOmar.length && cNet.x.handle === X_OWNER && cNet.instagram.handle === "sam.wp");
+    // 7,000 connections: two parts, one PUT each, the second one done.
+    const many = Array.from({ length: 7000 }, (_, i): [string, string, string, string, string, string | null] => [`many-${i}-wp-${W}`, "Many", `Person${i}`, "Elsewhere Inc", "Engineer", null]);
+    const progress: number[] = [];
+    bridged.length = 0;
+    const uploaded = await client.uploadConnections([...CONNECTIONS, ...many], { exportedAt: Date.parse("2026-11-02T09:00:00Z"), onProgress: (p) => progress.push(p.part) });
+    const puts = bridged.filter((b) => b.method === "PUT");
+    check(
+      "7m: client uploadConnections: 2 parts of at most 5,000 rows, one PUT each, one upload id, the export date from the file",
+      uploaded.parts === 2 && uploaded.total === CONNECTIONS.length + 7000 && puts.length === 2 && puts.every((p) => (p.body?.rows as unknown[]).length <= 5000 && p.body?.importId === puts[0].body?.importId && p.body?.exportedAt === "2026-11-02T09:00:00.000Z") && progress.join(",") === "1,2",
+      { parts: uploaded.parts, total: uploaded.total, puts: puts.length, progress },
+    );
+    let uploadErr: unknown = null;
+    try {
+      await client.uploadConnections([["Not A Slug", "A", "B", "", "", null]]);
+    } catch (err) {
+      uploadErr = err;
+    }
+    check("7m: client uploadConnections: a refused part rejects with ConnectionsUploadError (part 1 of 1, 400)", uploadErr instanceof client.ConnectionsUploadError && uploadErr.part === 1 && uploadErr.parts === 1 && uploadErr.status === 400);
+    const cSync = await client.syncX();
+    check("7m: client syncX: counts", cSync.following === 2 && cSync.followers === 2 && cSync.refreshed === true);
+    const cStatus = await client.getStatus();
+    check("7m: client getStatus: linkedinAccount", cStatus.linkedinAccount.state === "not_set_up" && cStatus.providers.some((p) => p.id === "twitterapi" && p.configured));
+    const removed = await client.deleteConnections();
+    check("7m: client deleteConnections: { removed }", removed.removed === CONNECTIONS.length + 7000);
+
+    // ---------------------------------------------- 7n. removing your connections; a new LinkedIn URL for the lead
+    const afterDelete = await getWarmPathRow(A);
+    const leadNow = await getLead(A);
+    check(
+      "7n: DELETE connections: no stored path or company person names one, the chip is cleared, and the free recompute is handed to after()",
+      !afterDelete?.paths.some((p) => p.id.startsWith("li-") || p.id === "direct") && afterDelete?.companyPaths.length === 0 && leadNow?.warmPath?.connected !== true,
+      afterDelete && afterDelete.paths.map((p) => p.id),
+    );
+    const net4 = (await getNet()).data?.linkedin as Record<string, unknown> | undefined;
+    check("7n: GET /api/network: no connections", net4?.connections === null);
+    const runTask = afterTasks.at(-1);
+    const beforeTask = outside();
+    const ranTask = typeof runTask === "function";
+    if (ranTask) await inRequestScope("/after", () => (runTask as () => Promise<void>)());
+    check("7n: the recorded after() task (recompute everyone) runs, SQL only: no outside call", ranTask && outside() === beforeTask);
+    await uploadAll(CONNECTIONS);
+    await postPaths();
+    const moved = await patchLead({ linkedinUrl: `https://www.linkedin.com/in/someone-else-wp-${W}` });
+    const movedPaths = pathsOf(await getDetail());
+    check(
+      "7n: PATCH a new LinkedIn URL: the lead's warm paths and chip are gone (a different person)",
+      moved.status === 200 && (moved.data?.lead as Lead | undefined)?.warmPath === null && (await getWarmPathRow(A)) === null && movedPaths?.status === "idle" && movedPaths.paths.length === 0,
+      movedPaths && { status: movedPaths.status, n: movedPaths.paths.length },
+    );
+
+    // ---------------------------------------------- 7o. exposure: no contact lists in replies, no names in logs
+    const network = responses.filter((r) => r.path.startsWith("/api/network") || r.path === "/api/settings" || r.path === "/api/status");
+    check(
+      `7o: no reply of /api/network/*, /api/settings or /api/status (${network.length}) names a contact`,
+      network.length > 20 && network.every((r) => named(r.text).length === 0),
+      network.filter((r) => named(r.text).length).slice(0, 2),
+    );
+    check("7o: no reply ever held more than 5 of the 32 people at Acme Robotics", responses.every((r) => quillsIn(r.text) <= 5));
+    const leaked = serverLines.filter((l) => named(l).length > 0 || l.includes("Ada Kim"));
+    check(`7o: no name in the ${serverLines.length} server log lines written meanwhile`, leaked.length === 0, leaked.slice(0, 3));
+    const keys = [W_KEYS.unipile, W_KEYS.x, W_KEYS.claude];
+    check("7o: no key in a log line or a reply", !serverLines.some((l) => keys.some((k) => l.includes(k))) && !responses.some((r) => keys.some((k) => r.text.includes(k))));
+    check("7o: no call to any other outside host", strayHosts.length === 0, strayHosts);
+  } finally {
+    globalThis.fetch = realFetch;
+    restoreConsole();
+    setWarmEnv(savedEnv as Partial<Record<(typeof W_ENV)[number], string | undefined>>);
+    resetUnipileState();
+    for (const id of made) await deleteLead(id).catch(() => undefined);
+    await query("delete from le_network_contacts");
+    await query("delete from le_network_sources");
+    await query("delete from le_quota_uses where kind in ('warm_path_linkedin', 'warm_path_x', 'intro_draft', 'profile_read', 'warm_path_check') or lead_id = any($1::uuid[])", [made]);
+    if (settingsRow[0]) await query("update le_settings set value = $1::jsonb where key = 'app'", [JSON.stringify(settingsRow[0].value)]);
+    else await query("delete from le_settings where key = 'app'");
+    const left = await query<{ n: number }>("select count(*)::int as n from le_leads where id = any($1::uuid[])", [made]);
+    check("7: cleanup: no test lead, contact, source or budget row left", left[0]?.n === 0, left[0]);
+  }
+}
+
 async function main(): Promise<void> {
   const started = Date.now();
   // Every provider call in this harness is mocked: keep those fake calls out of the usage ledger.
@@ -1989,6 +3176,7 @@ async function main(): Promise<void> {
     await testHubSpot();
     await testRunGuards();
     await testQualify();
+    await testWarmPaths();
   } finally {
     restoreEnv();
     globalThis.fetch = realFetch;

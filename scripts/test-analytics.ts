@@ -341,7 +341,30 @@ async function testClient(): Promise<void> {
     );
     check("beforeSend drops every other event (autocapture, rage clicks, web vitals, exceptions...)", dropped.length === 0, dropped.join(","));
     const ours = [...CLIENT_EVENTS, "$pageleave"].filter((event) => beforeSend({ uuid: "u", event, properties: {} } as unknown as CaptureResult) === null);
-    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 28, ours.join(","));
+    check(`beforeSend keeps all ${CLIENT_EVENTS.length} client events and $pageleave`, ours.length === 0 && CLIENT_EVENTS.length === 36, ours.join(","));
+    const warmEvents = [
+      "warm_paths_checked",
+      "warm_path_opened",
+      "warm_path_link_opened",
+      "warm_path_intro_drafted",
+      "warm_path_intro_copied",
+      "warm_path_marked_asked",
+      "network_connections_uploaded",
+      "network_x_synced",
+    ];
+    check("the warm-path and network events are on the list", warmEvents.every((e) => (CLIENT_EVENTS as string[]).includes(e)), warmEvents.filter((e) => !(CLIENT_EVENTS as string[]).includes(e)).join(","));
+    const warmProps = sanitizeProps({ leadId: PIETER, found: 3, best: "medium", trigger: "again", rank: 2, strength: "none", hops: 2, network: "instagram", kind: "check_yourself", ok: true, length: 412 });
+    check(
+      "warm-path properties are ids, counts and enums: they all pass",
+      JSON.stringify(warmProps) === JSON.stringify({ leadId: PIETER, found: 3, best: "medium", trigger: "again", rank: 2, strength: "none", hops: 2, network: "instagram", kind: "check_yourself", ok: true, length: 412 }),
+      JSON.stringify(warmProps),
+    );
+    const handleProps = sanitizeProps({ count: 1, handle: "ada_kim", xHandle: "ada_kim", instagramHandle: "ada.kim", connector: "Priya Shah", via: "Priya Shah", following: 380, followers: 1500 });
+    check(
+      'a handle never rides along: "handle" keys are content, and a name is free text',
+      JSON.stringify(handleProps) === JSON.stringify({ count: 1, following: 380, followers: 1500 }),
+      JSON.stringify(handleProps),
+    );
     const added = ["import_source_loaded", "import_completed", "linkedin_url_added", "research_rerun_requested", "email_lookup_requested", "email_edited"];
     check("the import, re-run and email events are on the list", added.every((e) => (CLIENT_EVENTS as string[]).includes(e)), added.filter((e) => !(CLIENT_EVENTS as string[]).includes(e)).join(","));
     const qualifyEvents = ["leads_unqualified", "leads_restored", "leads_deleted"];
@@ -423,6 +446,13 @@ async function testClient(): Promise<void> {
     );
     const after = { ...DEFAULT_SETTINGS, senderName: "Someone", criteria: [...DEFAULT_SETTINGS.criteria, "One more"] };
     check("changedSettingsFields names the changed fields only", sameSet(changedSettingsFields(DEFAULT_SETTINGS, after), ["senderName", "criteria"]));
+    const network = { ...DEFAULT_SETTINGS, xHandle: "sam_okafor", instagramHandle: "sam.okafor", linkedinUrl: "https://www.linkedin.com/in/sam-okafor" };
+    const networkFields = changedSettingsFields(DEFAULT_SETTINGS, network);
+    check(
+      "changedSettingsFields names your network fields, never their values",
+      sameSet(networkFields, ["xHandle", "instagramHandle", "linkedinUrl"]) && JSON.stringify(sanitizeProps({ fields: networkFields }).fields) === JSON.stringify(networkFields),
+      JSON.stringify(networkFields),
+    );
     check("daysFromNow", daysFromNow(new Date(Date.now() + 3 * 86_400_000).toISOString()) === 3 && daysFromNow(null) === undefined && daysFromNow("nope") === undefined);
 
     // --- with a key: events tracked before posthog-js is up wait, then go out with their time

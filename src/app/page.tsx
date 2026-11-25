@@ -10,6 +10,7 @@ import { justMarked } from "@/lib/qualify";
 import type { Lead, LeadCounts, LeadView, UnqualifiedReasonKey } from "@/lib/types";
 import { isRunning, leadName, settleLostRun, timeAgo, titleAtCompany } from "@/components/format";
 import { NoLinkedinChip } from "@/components/lead/contact";
+import { WarmPathChip } from "@/components/lead/warm-chip";
 import { leadAction, notResearched } from "@/components/lead/status";
 import { UnqualifyDialog, leadCount, reasonLabel, unqualifiedSummary } from "@/components/lead/unqualify";
 import { Button, ButtonLink, ConfirmDialog, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageChip, cx } from "@/components/ui";
@@ -160,7 +161,7 @@ function LeadsList({ view, onCounts }: { view: LeadView; onCounts: (counts: Lead
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sorted;
-    return sorted.filter((l) => [l.name, l.title, l.companyName, l.linkedinSlug, l.email, l.owner, l.unqualifiedReason].some((v) => v?.toLowerCase().includes(q)));
+    return sorted.filter((l) => [l.name, l.title, l.companyName, l.linkedinSlug, l.email, l.owner, l.unqualifiedReason, l.warmPath?.via].some((v) => v?.toLowerCase().includes(q)));
   }, [sorted, query]);
 
   /** The ticked leads still in the list, in list order. */
@@ -566,6 +567,7 @@ function LeadRow({ lead, view, selected, disabled, onToggle }: { lead: Lead; vie
           <div className="flex min-w-0 items-center gap-2">
             <span className="truncate font-medium">{name}</span>
             {!lead.linkedinUrl && <NoLinkedinChip className="shrink-0" />}
+            {view === "active" && <WarmPathChip lead={lead} className="shrink-0" />}
           </div>
           <div className="truncate text-[13.5px] text-quiet">{sub || (notResearched(lead) ? "Details appear after research" : "Details appear once research finishes")}</div>
         </div>

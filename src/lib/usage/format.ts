@@ -114,6 +114,7 @@ const KEY_UNITS: Record<Exclude<UsageProvider, "anthropic">, string[]> = {
   huggingface: ["requests"],
   abstract: ["requests"],
   hubspot: ["requests"],
+  twitterapi: ["requests", "credits"],
 };
 
 /** The units that matter for a provider over a window: "590K in · 84.5K out tokens", "27 searches · 3 pages read". */
@@ -154,6 +155,10 @@ export function mainUnit(provider: UsageProvider, units: UsageUnits): string {
       return n(units, "lookups") > 0 ? plural(n(units, "lookups"), "lookup") : "";
     case "openrouter":
       return n(units, "requests") > 0 ? plural(n(units, "requests"), "X search", "X searches") : "";
+    case "twitterapi":
+      // Credits are what twitterapi.io bills; a failed call has none, so fall back to requests.
+      if (n(units, "credits") > 0) return `${compactCount(n(units, "credits"))} ${n(units, "credits") === 1 ? "credit" : "credits"}`;
+      return n(units, "requests") > 0 ? plural(n(units, "requests"), "request") : "";
     default:
       return n(units, "requests") > 0 ? plural(n(units, "requests"), "request") : "";
   }

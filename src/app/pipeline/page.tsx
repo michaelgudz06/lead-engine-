@@ -9,6 +9,7 @@ import { justMarked } from "@/lib/qualify";
 import { ACTIVE_STAGES, STAGE_LABELS, type Lead, type Stage, type UnqualifiedReasonKey } from "@/lib/types";
 import { isRunning, leadName, settleLostRun, titleAtCompany } from "@/components/format";
 import { NoLinkedinChip } from "@/components/lead/contact";
+import { WarmPathChip } from "@/components/lead/warm-chip";
 import { leadAction } from "@/components/lead/status";
 import { UnqualifyDialog, reasonLabel } from "@/components/lead/unqualify";
 import { Button, ButtonLink, EmptyState, ErrorState, Notice, PageTitle, Skeleton, StageSelect, cx } from "@/components/ui";
@@ -236,7 +237,12 @@ function PipelineCard({ lead, busy, onMove }: { lead: Lead; busy: boolean; onMov
       <Link href={`/leads/${lead.id}`} className="block rounded">
         <div className="truncate font-medium hover:underline hover:underline-offset-2">{leadName(lead)}</div>
         {sub && <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug text-quiet">{sub}</div>}
-        {!lead.linkedinUrl && <NoLinkedinChip className="mt-1.5" />}
+        {(!lead.linkedinUrl || lead.warmPath) && (
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {!lead.linkedinUrl && <NoLinkedinChip />}
+            <WarmPathChip lead={lead} />
+          </div>
+        )}
       </Link>
       <div className={cx("mt-2 text-[12.5px]", action.tone === "urgent" ? "font-medium text-danger" : action.tone === "normal" ? "text-ink" : "text-quiet")}>{action.label}</div>
       <div className="mt-2.5">

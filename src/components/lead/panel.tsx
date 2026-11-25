@@ -22,10 +22,10 @@ function sourceLabel(f: Finding, url: string | null): string {
   return SITE_NAMES.find(([site]) => host === site || host.endsWith(`.${site}`))?.[1] ?? host;
 }
 
-/** A titled card: the building block of the lead page. */
+/** A titled card: the building block of the lead page. A className with its own scroll margin replaces the default one. */
 export function Panel({ title, aside, children, id, className }: { title: string; aside?: React.ReactNode; children: React.ReactNode; id?: string; className?: string }) {
   return (
-    <section id={id} className={cx("card scroll-mt-20", className)} aria-label={title}>
+    <section id={id} className={cx("card", !className?.includes("scroll-mt-") && "scroll-mt-20", className)} aria-label={title}>
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-hairline px-4 py-3 sm:px-5">
         <h2 className="font-serif text-[20px] leading-snug">{title}</h2>
         {aside}

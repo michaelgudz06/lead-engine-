@@ -18,10 +18,13 @@ export interface LedgerProviderStats {
   monthEstimated: boolean;
   monthUnits: UsageUnits;
   /**
-   * Unipile only: requests today that reach LinkedIn on the connected account (profiles,
-   * posts, company pages, searches). The accounts list never touches LinkedIn and is left out.
+   * Unipile only: requests today that reach LinkedIn on the research account (profiles, posts,
+   * company pages, searches). The accounts list never touches LinkedIn and is left out, and so
+   * are the owner's own account's network-* operations (counted in networkRequestsToday).
    */
   linkedinRequestsToday: number;
+  /** Unipile only: requests today on the owner's own LinkedIn account (warm paths: network-profile, network-search, network-me). */
+  networkRequestsToday: number;
 }
 
 export type LedgerStats = Map<UsageProvider, LedgerProviderStats>;
@@ -41,7 +44,7 @@ const num = (v: unknown): number => {
 const usd = (v: unknown): number => Math.round(num(v) * 1e6) / 1e6;
 
 export function emptyStats(provider: UsageProvider): LedgerProviderStats {
-  return { provider, todayCalls: 0, todayUsd: 0, monthCalls: 0, monthUsd: 0, monthEstimated: false, monthUnits: {}, linkedinRequestsToday: 0 };
+  return { provider, todayCalls: 0, todayUsd: 0, monthCalls: 0, monthUsd: 0, monthEstimated: false, monthUnits: {}, linkedinRequestsToday: 0, networkRequestsToday: 0 };
 }
 
 export async function ledgerStats(now: Date = new Date()): Promise<LedgerStats> {
@@ -57,6 +60,7 @@ export async function ledgerStats(now: Date = new Date()): Promise<LedgerStats> 
       month_cost: string | null;
       month_estimated: boolean | null;
       linkedin_today: string | null;
+      network_today: string | null;
     }>(
       `select provider,
               count(*) filter (where created_at >= $1::timestamptz) as today_calls,
@@ -65,7 +69,9 @@ export async function ledgerStats(now: Date = new Date()): Promise<LedgerStats> 
               sum(cost_usd) filter (where created_at >= $2::timestamptz) as month_cost,
               bool_or(cost_basis = 'estimated' and coalesce(cost_usd, 0) > 0 and created_at >= $2::timestamptz) as month_estimated,
               sum(case when jsonb_typeof(units -> 'requests') = 'number' then (units ->> 'requests')::numeric else 1 end)
-                filter (where created_at >= $1::timestamptz and operation <> 'accounts') as linkedin_today
+                filter (where created_at >= $1::timestamptz and operation <> 'accounts' and operation not like 'network-%') as linkedin_today,
+              sum(case when jsonb_typeof(units -> 'requests') = 'number' then (units ->> 'requests')::numeric else 1 end)
+                filter (where created_at >= $1::timestamptz and operation like 'network-%') as network_today
          from le_usage
         where created_at >= $2::timestamptz
         group by provider`,
@@ -92,6 +98,7 @@ export async function ledgerStats(now: Date = new Date()): Promise<LedgerStats> 
     s.monthUsd = usd(r.month_cost);
     s.monthEstimated = r.month_estimated === true;
     s.linkedinRequestsToday = s.provider === "unipile" ? num(r.linkedin_today) : 0;
+    s.networkRequestsToday = s.provider === "unipile" ? num(r.network_today) : 0;
   }
   for (const r of unitRows) {
     const s = out.get(r.provider as UsageProvider);

@@ -4,7 +4,7 @@ import { useRef } from "react";
 import { formatUsd } from "@/lib/usage/format";
 import type { DailySpend, UsageProvider } from "@/lib/usage/types";
 import { CHART, roundedTop, usdScale, useWidth } from "./chart-kit";
-import { SERIES, seriesOf, type SeriesId } from "./series";
+import { SERIES, otherLabels, seriesOf, type SeriesId } from "./series";
 
 /**
  * Daily spend as a stacked bar chart in plain SVG: one bar per UTC day, one segment per
@@ -58,6 +58,8 @@ export function SpendChart({ daily, windowFrom, estimated }: { daily: DailySpend
   const width = useWidth(ref);
   const days = toDays(daily);
   const present = SERIES.filter((s) => days.some((d) => d.segments.some((x) => x.id === s.id)));
+  // Which providers the neutral "Other" stands for in these days (twitterapi.io, for one).
+  const others = otherLabels(daily.flatMap((d) => (Object.keys(d.byProvider) as UsageProvider[]).filter((p) => (d.byProvider[p] ?? 0) > 0)));
   const max = Math.max(0, ...days.map((d) => d.total));
   const fromDay = windowFrom ? windowFrom.slice(0, 10) : null;
   const peak = days.reduce<Day | null>((best, d) => (d.total > (best?.total ?? 0) ? d : best), null);
@@ -72,7 +74,10 @@ export function SpendChart({ daily, windowFrom, estimated }: { daily: DailySpend
           {present.map((s) => (
             <li key={s.id} className="flex items-center gap-1.5">
               <span aria-hidden className="inline-block h-2.5 w-2.5 rounded-[2px]" style={{ background: s.color }} />
-              <span>{s.label}</span>
+              <span>
+                {s.label}
+                {s.id === "other" && others.length > 0 && <span className="text-quiet"> ({others.join(", ")})</span>}
+              </span>
               {estimated.has(s.id) && <span className="text-quiet">est.</span>}
             </li>
           ))}

@@ -69,6 +69,10 @@ export async function createLead(input: CreateLeadInput): Promise<Lead> {
  * that is not a LinkedIn profile. `onlyIfMissing` changes nothing when the lead got a URL in
  * the meantime (research saving a profile it found). Null when the lead does not exist, or
  * (with onlyIfMissing) already had a URL.
+ * A different profile is a different person to reach: the lead's warm paths (le_warm_paths) are
+ * deleted and its list summary cleared, in the same statement (clearing the URL counts as a
+ * change). A first profile for a lead that had none is the same person: its paths, intro drafts,
+ * typed Instagram handle and X check are kept, and the next view redoes the free part.
  */
 export async function setLeadLinkedin(id: string, linkedinUrl: string | null, opts: { onlyIfMissing?: boolean } = {}): Promise<Lead | null> {
   const url = linkedinUrl === null ? null : normaliseLinkedinUrl(linkedinUrl);
@@ -78,9 +82,20 @@ export async function setLeadLinkedin(id: string, linkedinUrl: string | null, op
   if (other) throw new DuplicateLeadError(other.id, other.stage);
   try {
     const rows = await query(
-      `update le_leads set linkedin_url = $2, linkedin_slug = $3, updated_at = now()
-        where id = $1 ${opts.onlyIfMissing ? "and linkedin_url is null" : ""}
-        returning *`,
+      `with prev as materialized (
+         select id as prev_id, linkedin_slug as prev_slug from le_leads where id = $1::uuid for update
+       ), updated as (
+         update le_leads l
+            set linkedin_url = $2, linkedin_slug = $3::text,
+                warm_path = case when prev.prev_slug is not null and prev.prev_slug is distinct from $3::text then null else l.warm_path end,
+                updated_at = now()
+           from prev
+          where l.id = prev.prev_id ${opts.onlyIfMissing ? "and l.linkedin_url is null" : ""}
+         returning l.*, prev.prev_slug
+       ), gone as (
+         delete from le_warm_paths w using updated u where w.lead_id = u.id and u.prev_slug is not null and u.prev_slug is distinct from $3::text
+       )
+       select * from updated`,
       [id, url, slug],
     );
     return rows[0] ? toLead(rows[0]) : null;
@@ -175,6 +190,7 @@ const PATCHABLE: Record<string, { col: string; json?: boolean }> = {
   angles: { col: "angles", json: true },
   approach: { col: "approach", json: true },
   usage: { col: "usage", json: true },
+  warmPath: { col: "warm_path", json: true },
 };
 
 /**

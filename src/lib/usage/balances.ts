@@ -1,6 +1,8 @@
 import "server-only";
 import { optionalEnv, type EnvKey } from "../env";
 import { fetchJson, HttpError } from "../http";
+import { chooseResearchAccount, unipileAccountsFrom } from "../providers/unipile-accounts";
+import { quotaLimit, quotaUsed, X_CREDITS_PER_USD } from "../repo/quota";
 import { formatCount, formatUsd, plural } from "./format";
 import { emptyStats, ledgerStats, type LedgerProviderStats, type LedgerStats } from "./ledger-stats";
 import { USAGE_PROVIDERS, type ProviderBalance, type UsageProvider } from "./types";
@@ -18,11 +20,14 @@ import { BALANCE_CACHE_MS, BALANCE_MIN_REFRESH_MS } from "./view";
  *                 (0 credits; needs a master key or one scoped to that endpoint, else 403 ->
  *                 "unavailable" with the reason)
  *   - Unipile     GET  {UNIPILE_DSN}/api/v1/accounts                     the LinkedIn account's status,
- *                 plus LinkedIn requests today from the ledger against Unipile's ~100 a day
+ *                 plus LinkedIn requests today from the ledger against Unipile's ~100 a day (the
+ *                 research account; the owner's own account and its warm-path checks apart)
  * From the ledger (no balance API this app's keys can read):
  *   - Anthropic   usage and cost reports need an Admin API key
  *   - Exa         the team credits endpoint needs a Team Management service key
  *   - Hugging Face, Abstract, HubSpot: free to call; requests counted
+ *   - twitterapi.io: today's X budget from le_quota_uses and this month's estimated spend (no call:
+ *                 whether its balance endpoint is charged is not documented)
  *
  * Rules: at most one call per provider per refresh, all in parallel with an 8 s timeout and no
  * retry; results cached in this server's memory for 60 s (BALANCE_CACHE_MS), and a forced
@@ -46,6 +51,7 @@ const KEY_NAMES: Partial<Record<UsageProvider, EnvKey>> = {
   apify: "APIFY_TOKEN",
   apollo: "APOLLO_API_KEY",
   unipile: "UNIPILE_API_KEY",
+  twitterapi: "TWITTERAPI_IO_KEY",
 };
 
 /** Values that must never appear in anything this module returns. */
@@ -60,6 +66,7 @@ const SECRET_KEYS: EnvKey[] = [
   "ABSTRACT_API_KEY",
   "HUBSPOT_ACCESS_TOKEN",
   "HF_TOKEN",
+  "TWITTERAPI_IO_KEY",
   "DATABASE_URL",
   "APP_PASSWORD",
   "SESSION_SECRET",
@@ -150,6 +157,7 @@ const LOADERS: Record<UsageProvider, Loader> = {
       requiredKey: "HUBSPOT_ACCESS_TOKEN",
       note: "Free to call. CRM requests are counted in the ledger.",
     }),
+  twitterapi: twitterapiBalance,
 };
 
 async function loadAll(): Promise<ProviderBalance[]> {
@@ -418,19 +426,43 @@ async function unipileBalance(stats: StatsPromise): Promise<ProviderBalance> {
   } catch (err) {
     failure = describeFailure(err, "UNIPILE_API_KEY");
   }
-  return unipileBalanceFrom(accounts, s?.linkedinRequestsToday ?? null, failure);
+  let warmPathChecks: { used: number; limit: number } | null = null;
+  if (optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID")) {
+    warmPathChecks = await quotaUsed("warm_path_linkedin")
+      .then((used) => ({ used, limit: quotaLimit("warm_path_linkedin") }))
+      .catch(() => null);
+  }
+  return unipileBalanceFrom(accounts, s?.linkedinRequestsToday ?? null, failure, { networkRequestsToday: s?.networkRequestsToday ?? null, warmPathChecks });
 }
 
 /**
- * The connected LinkedIn account's status from Unipile's accounts list (UNIPILE_ACCOUNT_ID when
- * pinned, else the first LinkedIn account, as linkedin.ts picks it), plus today's LinkedIn
- * requests from the ledger against Unipile's guidance of roughly 100 a day.
+ * The research LinkedIn account's status from Unipile's accounts list (picked by the same rule as
+ * linkedin.ts: UNIPILE_ACCOUNT_ID when pinned, else the one LinkedIn account that is not the
+ * owner's own, never a guess between two), plus today's LinkedIn requests from the ledger against
+ * Unipile's guidance of roughly 100 a day. With the owner's own account set up
+ * (UNIPILE_NETWORK_ACCOUNT_ID), its requests and warm-path checks today are counted apart:
+ * "12 of ~100 LinkedIn requests today (research account) · 4 on your account · 3 of 10 warm-path checks".
  */
-export function unipileBalanceFrom(accounts: unknown, requestsToday: number | null, failure: string | null): ProviderBalance {
+export function unipileBalanceFrom(
+  accounts: unknown,
+  requestsToday: number | null,
+  failure: string | null,
+  extra: { networkRequestsToday?: number | null; warmPathChecks?: { used: number; limit: number } | null } = {},
+): ProviderBalance {
   const guidance = LINKEDIN_DAILY_GUIDANCE;
-  const summary = requestsToday === null ? "LinkedIn requests today unknown" : `${formatCount(requestsToday)} of ~${guidance} LinkedIn requests today`;
+  const network = Boolean(optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID"));
+  const base = requestsToday === null ? "LinkedIn requests today unknown" : `${formatCount(requestsToday)} of ~${guidance} LinkedIn requests today`;
+  const own = network
+    ? [
+        typeof extra.networkRequestsToday === "number" ? `${formatCount(extra.networkRequestsToday)} on your account` : null,
+        extra.warmPathChecks ? `${formatCount(extra.warmPathChecks.used)} of ${formatCount(extra.warmPathChecks.limit)} warm-path checks` : null,
+      ].filter(Boolean)
+    : [];
+  const summary = network ? [`${base} (research account)`, ...own].join(" · ") : base;
   const usedShare = requestsToday === null ? null : clamp01(requestsToday / guidance);
   const numbers: Record<string, number> = requestsToday === null ? { dailyGuidance: guidance } : { linkedinRequestsToday: requestsToday, dailyGuidance: guidance };
+  if (network && typeof extra.networkRequestsToday === "number") numbers.networkRequestsToday = extra.networkRequestsToday;
+  if (network && extra.warmPathChecks) Object.assign(numbers, { warmPathChecksToday: extra.warmPathChecks.used, warmPathChecksLimit: extra.warmPathChecks.limit });
   const pace = `Unipile is a flat monthly fee; LinkedIn watches the connected account, so stay near ${guidance} profile and post requests a day.`;
 
   if (failure !== null || accounts === null) {
@@ -445,26 +477,60 @@ export function unipileBalanceFrom(accounts: unknown, requestsToday: number | nu
     };
   }
 
-  const items = arr(rec(accounts).items).map(rec);
-  const linkedin = items.filter((a) => String(a.type ?? "").toUpperCase() === "LINKEDIN");
-  const statuses = (a: Record<string, unknown>) => arr(a.sources).map((x) => safeStatus(rec(x).status));
-  const running = linkedin.filter((a) => statuses(a).length > 0 && statuses(a).every((st) => st === "OK"));
-  const pinned = optionalEnv("UNIPILE_ACCOUNT_ID");
-  const chosen = pinned ? linkedin.find((a) => a.id === pinned) : (running[0] ?? linkedin[0]);
+  const all = unipileAccountsFrom(accounts);
+  const linkedin = all.filter((a) => a.type === "LINKEDIN");
+  const running = linkedin.filter((a) => a.statuses.length > 0 && a.statuses.every((st) => st === "OK"));
   numbers.linkedinAccounts = linkedin.length;
   numbers.runningAccounts = running.length;
 
+  const choice = chooseResearchAccount(all, { pinned: optionalEnv("UNIPILE_ACCOUNT_ID"), network: optionalEnv("UNIPILE_NETWORK_ACCOUNT_ID") });
   let state: string;
-  if (!linkedin.length) state = "No LinkedIn account is connected in Unipile.";
-  else if (pinned && !chosen) state = "UNIPILE_ACCOUNT_ID does not match a LinkedIn account in this Unipile workspace.";
+  if (!choice.ok) state = `${choice.message}.`;
   else {
-    const st = chosen ? statuses(chosen) : [];
+    const st = all.find((a) => a.id === choice.id)?.statuses ?? [];
     const ok = st.length > 0 && st.every((x) => x === "OK");
     state = ok
       ? `The LinkedIn account is connected and running.`
       : `The LinkedIn account needs attention in the Unipile dashboard (status ${[...new Set(st)].join("/") || "unknown"}).`;
   }
   return { provider: "unipile", source: "live", summary, usedShare, numbers, note: `${state} ${pace}`, checkedAt: nowIso() };
+}
+
+// ------------------------------------------------------------------ twitterapi.io
+
+async function twitterapiBalance(stats: StatsPromise): Promise<ProviderBalance> {
+  if (!optionalEnv("TWITTERAPI_IO_KEY")) return notConfigured("twitterapi", "TWITTERAPI_IO_KEY is not set, so warm paths do not read X follows.");
+  const [s, usedCredits] = await Promise.all([statsFor(stats, "twitterapi"), quotaUsed("warm_path_x").catch(() => null)]);
+  return twitterapiBalanceFrom({ usedCredits, limitCredits: quotaLimit("warm_path_x"), monthUsd: s?.monthUsd ?? null, monthCalls: s?.monthCalls ?? null });
+}
+
+/**
+ * twitterapi.io from what the app knows itself: today's X budget (le_quota_uses, credits) and this
+ * month's estimated spend (the ledger). "$0.18 of $1.00 X budget used today".
+ */
+export function twitterapiBalanceFrom(input: { usedCredits: number | null; limitCredits: number; monthUsd: number | null; monthCalls: number | null }): ProviderBalance {
+  const limitUsd = input.limitCredits / X_CREDITS_PER_USD;
+  const usedUsd = input.usedCredits === null ? null : input.usedCredits / X_CREDITS_PER_USD;
+  const summary =
+    input.limitCredits === 0
+      ? "X checks are paused (WARM_PATH_X_USD_PER_DAY is 0)"
+      : usedUsd === null
+        ? `X budget of ${formatUsd(limitUsd)} a day`
+        : `${formatUsd(usedUsd)} of ${formatUsd(limitUsd)} X budget used today`;
+  const numbers: Record<string, number> = { limitCredits: input.limitCredits };
+  if (input.usedCredits !== null) numbers.usedCreditsToday = input.usedCredits;
+  if (input.monthUsd !== null) numbers.monthUsd = input.monthUsd;
+  if (input.monthCalls !== null) numbers.monthCalls = input.monthCalls;
+  const month = input.monthUsd !== null ? `This month: ${formatUsd(input.monthUsd)} (est.) over ${plural(input.monthCalls ?? 0, "call")}. ` : "";
+  return {
+    provider: "twitterapi",
+    source: "ledger",
+    summary,
+    usedShare: input.limitCredits > 0 && usedUsd !== null ? clamp01(usedUsd / limitUsd) : null,
+    numbers,
+    note: `${month}Costs are estimated from twitterapi.io's credit table ($1 is 100,000 credits); the API does not return what each call was charged.`,
+    checkedAt: nowIso(),
+  };
 }
 
 // ------------------------------------------------------------------ ledger-only providers
@@ -547,10 +613,6 @@ function rec(v: unknown): Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
 
-function arr(v: unknown): unknown[] {
-  return Array.isArray(v) ? v : [];
-}
-
 function num(v: unknown): number | null {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
   if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) return Number(v);
@@ -570,11 +632,6 @@ function clamp01(v: number): number {
 /** A plan name or reset word as the provider sent it, if it looks like one ("Free", "monthly"). */
 function safeLabel(v: unknown): string | null {
   return typeof v === "string" && /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/.test(v.trim()) ? v.trim() : null;
-}
-
-function safeStatus(v: unknown): string {
-  const s = String(v ?? "").toUpperCase();
-  return /^[A-Z_]{2,30}$/.test(s) ? s : "UNKNOWN";
 }
 
 /** "2026-12-01" or an ISO timestamp -> "Dec 1" (UTC); null when not a date. */

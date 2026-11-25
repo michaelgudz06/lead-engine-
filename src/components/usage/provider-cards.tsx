@@ -2,15 +2,17 @@
 
 import { formatCount, formatShare, formatUsd, keyUnitsLine, plural } from "@/lib/usage/format";
 import { WINDOW_PHRASES } from "@/lib/usage/view";
-import { USAGE_PROVIDER_LABELS, USAGE_PROVIDERS, type ProviderBalance, type ProviderTotals, type UsageWindow } from "@/lib/usage/types";
+import { USAGE_PROVIDER_LABELS, USAGE_PROVIDERS, type OperationStats, type ProviderBalance, type ProviderTotals, type UsageWindow } from "@/lib/usage/types";
 import { timeAgo } from "@/components/format";
 import { Skeleton, cx } from "@/components/ui";
 import { Est } from "./bits";
+import { ownAccountCalls, unipileSplit } from "./unipile";
 
 /** One card per provider (key): spend in the window, calls, failures, key units, and its balance. */
 export function ProviderCards({
   window,
   totals,
+  operations,
   balances,
   balancesLoading,
   balancesError,
@@ -18,6 +20,8 @@ export function ProviderCards({
 }: {
   window: UsageWindow;
   totals: ProviderTotals[];
+  /** The window's operations: tells the calls on your own LinkedIn account apart. */
+  operations: OperationStats[];
   balances: ProviderBalance[] | null;
   balancesLoading: boolean;
   balancesError: string | null;
@@ -25,6 +29,7 @@ export function ProviderCards({
 }) {
   const byProvider = new Map(totals.map((t) => [t.provider, t]));
   const balanceOf = new Map((balances ?? []).map((b) => [b.provider, b]));
+  const ownCalls = ownAccountCalls(operations);
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {USAGE_PROVIDERS.map((provider) => (
@@ -34,6 +39,7 @@ export function ProviderCards({
           window={window}
           totals={byProvider.get(provider) ?? null}
           provider={provider}
+          ownCalls={provider === "unipile" ? ownCalls : 0}
           balance={balanceOf.get(provider) ?? null}
           balanceLoading={balancesLoading && !balances}
           balanceError={balancesError}
@@ -49,12 +55,14 @@ function ProviderCard({
   label,
   window,
   totals,
+  ownCalls,
   balance,
   balanceLoading,
   balanceError,
   now,
 }: {
   provider: (typeof USAGE_PROVIDERS)[number];
+  ownCalls: number;
   label: string;
   window: UsageWindow;
   totals: ProviderTotals | null;
@@ -88,7 +96,12 @@ function ProviderCard({
           <span className="text-quiet"> · none failed</span>
         ) : null}
       </p>
-      {units && <p className="mt-0.5 text-[13px] text-quiet">{units}</p>}
+      {units && (
+        <p className="mt-0.5 text-[13px] text-quiet">
+          {units}
+          {ownCalls > 0 && ` · ${formatCount(ownCalls)} on your account`}
+        </p>
+      )}
 
       <div className="mt-auto pt-4">
         <div className="border-t border-hairline pt-3">
@@ -123,15 +136,27 @@ function SourceChip({ source }: { source: ProviderBalance["source"] }) {
 function BalanceBlock({ balance, now }: { balance: ProviderBalance; now: number }) {
   const share = balance.usedShare;
   const high = typeof share === "number" && share >= 0.9;
+  const split = unipileSplit(balance);
   return (
     <div>
-      <p className={cx("text-[13.5px] font-medium leading-snug", balance.source === "unavailable" && "text-quiet")}>{balance.summary}</p>
+      {split ? (
+        <dl className="space-y-0.5 text-[13px] leading-snug" aria-label="LinkedIn requests today">
+          {split.map((row) => (
+            <div key={row.label} className="flex flex-wrap justify-between gap-x-3">
+              <dt className="text-quiet">{row.label}</dt>
+              <dd className="font-medium tabular-nums">{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <p className={cx("text-[13.5px] font-medium leading-snug", balance.source === "unavailable" && "text-quiet")}>{balance.summary}</p>
+      )}
       {typeof share === "number" && (
         <div className="mt-2 flex items-center gap-2">
           <div
             className="h-1 flex-1 overflow-hidden rounded-full bg-hairline"
             role="meter"
-            aria-label="Share used"
+            aria-label={split ? "Share of the research account's daily guidance used" : "Share used"}
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={Math.round(share * 100)}

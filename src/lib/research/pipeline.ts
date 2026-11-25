@@ -1,6 +1,7 @@
 import "server-only";
 import { clearFindings } from "../repo/findings";
 import { finishResearch, getLead } from "../repo/leads";
+import { startWarmPaths, type WarmPathsTask } from "../paths/research";
 import { getSettings } from "../repo/settings";
 import { DEFAULT_SETTINGS, type Settings } from "../types";
 import { withUsageContext } from "../usage/ledger";
@@ -21,7 +22,9 @@ import { Deadline, errorMessage, runBudget, truncate } from "./util";
  *
  * Flow: identify -> gather (providers, in parallel) -> extract (Haiku)
  *       -> gap-fill agent (Haiku + tools) -> write (Haiku) -> verify (Haiku) -> save.
- * Each step lives in its own module in this folder.
+ * Each step lives in its own module in this folder. Warm paths (src/lib/paths/research.ts) start
+ * right after gather and run alongside the rest; the run awaits them, capped, before it ends.
+ * Steer runs do not check warm paths.
  */
 
 /**
@@ -78,6 +81,7 @@ export function runResearch(leadId: string, opts: ResearchOptions = {}): Promise
 
 async function research(leadId: string, focus: string | null): Promise<void> {
   const started = Date.now();
+  let warm: WarmPathsTask | null = null;
   try {
     const lead = await getLead(leadId);
     // Nothing to record against: the lead was deleted (or the id is wrong) between the claim and this call.
@@ -91,6 +95,8 @@ async function research(leadId: string, focus: string | null): Promise<void> {
     const ctx = await identify(leadId, lead, settings, deadline);
     ctx.focus = focus;
     const gathered = await gather(ctx);
+    // Who can introduce the team: alongside extract, the agent and writing (capped, never throws).
+    warm = startWarmPaths(ctx);
 
     // A re-run starts from a clean slate so findings are not duplicated. Done only
     // now, after the slow network steps, so the old findings stay visible meanwhile.
@@ -105,6 +111,7 @@ async function research(leadId: string, focus: string | null): Promise<void> {
     const agent = await runGapFill(ctx, findings, focus ? { priority: focus } : {});
     const result = await writeVerifySave(ctx, { scope: "all" });
 
+    await warm.settle();
     await finish(leadId, started);
     await note(
       leadId,
@@ -120,6 +127,8 @@ async function research(leadId: string, focus: string | null): Promise<void> {
       },
     );
   } catch (err) {
+    // The warm-path check ends (or hits its cap) before the run does, whatever happened.
+    if (warm) await warm.settle();
     // Deleted mid-run: stop quietly, there is no row to record the outcome on.
     if (err instanceof LeadGoneError) return;
     await finish(leadId, started, err);

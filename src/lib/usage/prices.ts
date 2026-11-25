@@ -8,7 +8,7 @@ import type { CostBasis, UsageUnits } from "./types";
  * stored as "reported" and nothing here is used; the table only fills in what is missing,
  * and those rows are stored as "estimated".
  */
-export const PRICES_AS_OF = "2026-11-23";
+export const PRICES_AS_OF = "2026-11-25";
 
 const PER_MILLION = 1_000_000;
 
@@ -144,6 +144,34 @@ export const FREE: { costUsd: number; costBasis: CostBasis } = { costUsd: 0, cos
 // real billed cost.
 
 export const OPENROUTER_X_SEARCH_BACKFILL_USD = 0.03;
+
+// ---------------------------------------------------------------------------------------------
+// twitterapi.io (X follow lists for warm paths). ESTIMATED: the API does not return what a call
+// was charged, so each call is booked from the published credit table (twitterapi.io/pricing and
+// the endpoint pages, read 2026-11-25). $1 = 100,000 credits.
+// - user/info: one profile, about 18 credits
+// - followings: 1 credit per account at 200 a page, 2 at 100-199, 3 below 100; at least 60 a call
+//   (the endpoint page; the pricing page says 15, the higher is used)
+// - followers_ids: 0.45 credits per id at 4,000-5,000 a call, 1 at 200-3,999, 2 below; at least
+//   100 a call. The tier is taken from the ids returned, which never undercounts.
+// - check_follow_relationship: 100 credits
+
+export const TWITTERAPI_CREDITS_PER_USD = 100_000;
+
+export const TWITTERAPI_CREDITS = {
+  userInfo: 18,
+  followingsMinCall: 60,
+  followerIdsMinCall: 100,
+  followCheck: 100,
+  /** The most one followings call can cost (199 accounts at 2 credits each). */
+  followingsMaxCall: 398,
+  /** The most one follower-ids call can cost (3,999 ids at 1 credit each). */
+  followerIdsMaxCall: 3999,
+} as const;
+
+export function twitterapiCostUsd(credits: number): number {
+  return roundUsd(nonNeg(credits) / TWITTERAPI_CREDITS_PER_USD);
+}
 
 // ---------------------------------------------------------------------------------------------
 

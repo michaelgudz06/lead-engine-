@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { changedSettingsFields, track } from "@/lib/analytics";
-import { errorMessage, getSettings, getStatus, saveSettings, type StatusResponse } from "@/lib/api-client";
+import { ApiError, errorMessage, getSettings, getStatus, saveSettings, type StatusResponse } from "@/lib/api-client";
 import type { Settings } from "@/lib/types";
 import { AutoTextarea } from "@/components/auto-textarea";
 import { modelLabel } from "@/components/format";
+import { NetworkSettings, networkFieldErrors, type NetworkField } from "@/components/settings/network";
 import { Button, Chip, ErrorState, Label, Notice, PageTitle, Skeleton } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
 
@@ -22,7 +23,12 @@ export default function SettingsPage() {
         ) : !settings.data ? (
           <ErrorState title="Settings did not load" message={settings.error ?? "Please try again."} onRetry={settings.reload} />
         ) : (
-          <SettingsForm initial={settings.data} onSaved={settings.setData} />
+          <SettingsForm
+            initial={settings.data}
+            onSaved={settings.setData}
+            open={status.data ? !status.data.authEnabled : null}
+            accountUnknown={status.data?.linkedinAccount.state === "unavailable"}
+          />
         )}
         <Integrations state={status} />
       </div>
@@ -42,12 +48,16 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Settings) => void }) {
+const NETWORK_FIELDS: readonly NetworkField[] = ["linkedinUrl", "xHandle", "instagramHandle"];
+
+function SettingsForm({ initial, onSaved, open, accountUnknown }: { initial: Settings; onSaved: (s: Settings) => void; open: boolean | null; accountUnknown: boolean }) {
   const [form, setForm] = useState<Settings>(initial);
   const [saved, setSaved] = useState<Settings>(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
+  // The field PUT /api/settings refused, shown under it until it is edited.
+  const [refused, setRefused] = useState<{ field: NetworkField; message: string } | null>(null);
 
   const dirty = JSON.stringify(form) !== JSON.stringify(saved);
 
@@ -62,19 +72,22 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
   function set<K extends keyof Settings>(key: K, value: Settings[K]) {
     setForm((f) => ({ ...f, [key]: value }));
     setJustSaved(false);
+    if (refused?.field === key) setRefused(null);
   }
 
   const emailOk = !form.senderEmail.trim() || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.senderEmail.trim());
   const calendlyOk = !form.calendlyUrl.trim() || /^https?:\/\/\S+\.\S+/i.test(form.calendlyUrl.trim());
   // Same range as PUT /api/settings.
   const daysOk = Number.isInteger(form.followUpDays) && form.followUpDays >= 1 && form.followUpDays <= 30;
-  const valid = emailOk && calendlyOk && daysOk;
+  const networkErrors = networkFieldErrors(form);
+  const valid = emailOk && calendlyOk && daysOk && Object.keys(networkErrors).length === 0;
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (busy || !valid) return;
     setBusy(true);
     setError(null);
+    setRefused(null);
     try {
       const next = await saveSettings({
         senderName: form.senderName.trim(),
@@ -84,6 +97,10 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
         followUpDays: form.followUpDays,
         // Empty rows are just unfinished edits, not rules.
         criteria: form.criteria.map((c) => c.trim()).filter(Boolean),
+        // Your public usernames for warm paths. The server saves them cleaned ("@" and links removed).
+        linkedinUrl: form.linkedinUrl.trim(),
+        xHandle: form.xHandle.trim(),
+        instagramHandle: form.instagramHandle.trim(),
       });
       const fields = changedSettingsFields(saved, next);
       track("settings_saved", { fields, fieldCount: fields.length, criteriaCount: next.criteria.length });
@@ -92,7 +109,14 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
       onSaved(next);
       setJustSaved(true);
     } catch (err) {
-      setError(errorMessage(err));
+      const field = err instanceof ApiError ? err.details?.field : null;
+      const network = NETWORK_FIELDS.find((f) => f === field);
+      if (network) {
+        setRefused({ field: network, message: errorMessage(err) });
+        setError("One field was not accepted. See Your network.");
+      } else {
+        setError(errorMessage(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -145,6 +169,8 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
         </div>
       </Section>
 
+      <NetworkSettings form={form} saved={saved} set={set} errors={networkErrors} serverError={refused} open={open} accountUnknown={accountUnknown} />
+
       <Section title="Criteria" description="Plain-English rules. A finding that breaks one stays out of the brief and the drafts.">
         <ul className="space-y-2">
           {form.criteria.map((rule, i) => (
@@ -175,7 +201,7 @@ function SettingsForm({ initial, onSaved }: { initial: Settings; onSaved: (s: Se
         <div className="mr-auto min-w-0 text-[13.5px]" aria-live="polite">
           {error ? <span className="text-danger">{error}</span> : justSaved && !dirty ? <span className="text-success">Saved.</span> : dirty ? <span className="text-quiet">Unsaved changes</span> : null}
         </div>
-        <Button onClick={() => { setForm(saved); setError(null); }} disabled={!dirty || busy}>
+        <Button onClick={() => { setForm(saved); setError(null); setRefused(null); }} disabled={!dirty || busy}>
           Discard
         </Button>
         <Button type="submit" variant="primary" busy={busy} disabledReason={!valid ? "Fix the highlighted fields first." : !dirty ? "Nothing to save yet." : null} tipEnd>

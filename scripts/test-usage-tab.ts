@@ -16,6 +16,9 @@
  *              forced refresh every 30 s (clock and fetch mocked: no provider is called)
  * 5. export    the spreadsheet formula guard, on its own and through the route
  * 6. format    money, counts, durations and units; chart scales; the nav; the npm scripts
+ * 7. warm paths the twitterapi.io card and the Unipile card's two accounts; twitterapi.io folded into
+ *              "Other" on the chart; warm-path rows in the per-request tables, a run's cost and the
+ *              per-lead table (temporary rows, deleted at the end)
  *
  * Prints statuses only: never a key, token, cookie value, DSN or header.
  */
@@ -34,6 +37,8 @@ import * as balancesRoute from "../src/app/api/usage/balances/route";
 import * as exportRoute from "../src/app/api/usage/export/route";
 import { STALE_RUN_MS } from "../src/app/api/_lib/api";
 import { durationScale, usdScale } from "../src/components/usage/chart-kit";
+import { otherLabels, SERIES, seriesOf, SHORT_LABELS } from "../src/components/usage/series";
+import { ownAccountCalls, unipileSplit } from "../src/components/usage/unipile";
 import { query } from "../src/lib/db";
 import { HttpError } from "../src/lib/http";
 import {
@@ -44,6 +49,7 @@ import {
   hunterBalanceFrom,
   openrouterBalanceFrom,
   resetBalanceCache,
+  twitterapiBalanceFrom,
   unipileBalanceFrom,
   unipileRoutes,
 } from "../src/lib/usage/balances";
@@ -51,7 +57,7 @@ import { CSV_COLUMNS, csvCell, unitsCell } from "../src/lib/usage/export";
 import { compactCount, formatCount, formatMs, formatShare, formatUsd, keyUnitsLine, mainUnit, plural, unitsLine } from "../src/lib/usage/format";
 import { PRICES_AS_OF } from "../src/lib/usage/prices";
 import { DELETED_LEAD_NAME, getOperationStats, listCalls, listRuns, RUN_END_GRACE_MS, RUN_MAX_MS, windowStart } from "../src/lib/usage/queries";
-import { BACKFILL_OPERATION, USAGE_PROVIDERS, type ProviderBalance, type UsageRecord } from "../src/lib/usage/types";
+import { BACKFILL_OPERATION, USAGE_PROVIDER_LABELS, USAGE_PROVIDERS, type ProviderBalance, type UsageRecord } from "../src/lib/usage/types";
 import {
   BALANCE_CACHE_MS,
   BALANCE_MIN_REFRESH_MS,
@@ -748,7 +754,7 @@ async function testBalances(): Promise<void> {
   try {
     const first = await getBalances();
     const round = seen.length;
-    check("round: 10 balances in USAGE_PROVIDERS order, fresh", first.balances.map((b) => b.provider).join() === USAGE_PROVIDERS.join() && first.cached === false);
+    check("round: 11 balances in USAGE_PROVIDERS order, fresh", first.balances.map((b) => b.provider).join() === USAGE_PROVIDERS.join() && first.cached === false);
     check("round: every entry has the contract fields", first.balances.every(validBalance), first.balances.filter((b) => !validBalance(b)).map((b) => b.provider));
     check("round: refreshableAt is 30 s after the checks", Date.parse(first.refreshableAt) - Date.parse(first.checkedAt) === 30_000);
     check("round: no key in any URL, keys only in headers", seen.every((x) => !leaks(x.url)) && seen.every((x) => Boolean(x.headers["x-api-key"] || /^Bearer /.test(x.headers.authorization ?? ""))));
@@ -783,7 +789,7 @@ async function testBalances(): Promise<void> {
     const afterStorm = seen.length;
     const routeAnswers = await Promise.all(Array.from({ length: 20 }, () => balancesRoute.GET(request("/api/usage/balances?refresh=1"))));
     const bodies = await Promise.all(routeAnswers.map((r) => jsonOf<BalancesResponse>(r)));
-    check("20 reloads with ?refresh=1 within 30 s: all 200 from the cache, no provider called", routeAnswers.every((r) => r.status === 200) && bodies.every((b) => b?.cached === true && b.balances.length === 10) && seen.length === afterStorm);
+    check("20 reloads with ?refresh=1 within 30 s: all 200 from the cache, no provider called", routeAnswers.every((r) => r.status === 200) && bodies.every((b) => b?.cached === true && b.balances.length === 11) && seen.length === afterStorm);
     check("GET /api/usage/balances: no-store, refreshableAt in the answer", routeAnswers[0].headers.get("cache-control") === "no-store" && Number.isFinite(Date.parse(bodies[0]?.refreshableAt ?? "")));
   } finally {
     Date.now = realNow;
@@ -802,7 +808,7 @@ async function testBalances(): Promise<void> {
   });
   try {
     const bad = await getBalances();
-    check("failures: still 10 balances, no exception, every entry valid", bad.balances.length === 10 && bad.balances.every(validBalance));
+    check("failures: still 11 balances, no exception, every entry valid", bad.balances.length === 11 && bad.balances.every(validBalance));
     check("failures: no key value anywhere in the output (an echoed key is hidden)", !leaks(JSON.stringify(bad)));
   } finally {
     globalThis.fetch = realFetch;
@@ -862,6 +868,145 @@ function testFormat(): void {
   check("npm scripts: no admin script; dev is plain next dev", pkg.scripts?.admin === undefined && pkg.scripts?.dev === "next dev");
 }
 
+// ------------------------------------------------------------------ 7. warm paths on the Usage tab
+
+async function testWarmPathRows(): Promise<void> {
+  section("7. warm paths: the twitterapi.io card, the Unipile card's two accounts, and the new rows");
+  local();
+
+  // --- names, colours and units
+  check("twitterapi is a provider with a card: 'twitterapi.io (X follows)'", USAGE_PROVIDERS.includes("twitterapi") && USAGE_PROVIDER_LABELS.twitterapi === "twitterapi.io (X follows)" && SHORT_LABELS.twitterapi === "twitterapi.io");
+  check("chart: twitterapi.io folds into Other (no new colour)", seriesOf("twitterapi") === "other" && SERIES.length === 7 && !SERIES.some((x) => (x.id as string) === "twitterapi"));
+  check("chart: the legend can say what Other holds", otherLabels(["anthropic", "twitterapi", "exa"]).join() === "twitterapi.io" && otherLabels(["hubspot", "twitterapi", "unipile"]).join() === "Unipile,HubSpot,twitterapi.io" && otherLabels(["anthropic"]).length === 0);
+  check("card units: '54 requests · 34.4K credits'", keyUnitsLine("twitterapi", { requests: 54, credits: 34_400, items: 9_000 }) === "54 requests · 34.4K credits", keyUnitsLine("twitterapi", { requests: 54, credits: 34_400, items: 9_000 }));
+  check("per-lead unit: credits, else requests", mainUnit("twitterapi", { requests: 15, credits: 18_440 }) === "18.4K credits" && mainUnit("twitterapi", { requests: 2 }) === "2 requests" && mainUnit("twitterapi", { requests: 1, credits: 1 }) === "1 credit" && mainUnit("twitterapi", {}) === "");
+  check("a call's units line", unitsLine({ requests: 1, credits: 200, items: 200 }) === "1 request · 200 items · 200 credits", unitsLine({ requests: 1, credits: 200, items: 200 }));
+
+  // --- the twitterapi.io card: today's X budget and this month's estimated spend, from the app's own tables
+  const x = twitterapiBalanceFrom({ usedCredits: 18_000, limitCredits: 100_000, monthUsd: 0.3443, monthCalls: 54 });
+  check("twitterapi.io card: '$0.18 of $1.00 X budget used today', 18% used, from the ledger", x.summary === "$0.18 of $1.00 X budget used today" && Math.abs((x.usedShare ?? 0) - 0.18) < 1e-9 && x.source === "ledger" && validBalance(x), x);
+  check("twitterapi.io card: this month's estimated spend and calls in the note", /^This month: \$0\.3443 \(est\.\) over 54 calls\./.test(x.note ?? "") && x.numbers.monthUsd === 0.3443, x.note);
+  const paused = twitterapiBalanceFrom({ usedCredits: 0, limitCredits: 0, monthUsd: null, monthCalls: null });
+  check("twitterapi.io card: paused budget, no meter", paused.summary === "X checks are paused (WARM_PATH_X_USD_PER_DAY is 0)" && paused.usedShare === null && validBalance(paused));
+  check("twitterapi.io card: over budget never shows more than 100%", twitterapiBalanceFrom({ usedCredits: 130_000, limitCredits: 100_000, monthUsd: 2, monthCalls: 9 }).usedShare === 1);
+
+  // --- the Unipile card: the research account and yours
+  const TWO = { object: "AccountList", items: [
+    { object: "Account", type: "LINKEDIN", id: "acc_research", name: "Someone", sources: [{ id: "a", status: "OK" }] },
+    { object: "Account", type: "LINKEDIN", id: "acc_owner", name: "Owner Person", sources: [{ id: "b", status: "OK" }] },
+  ] };
+  const before = { network: env.UNIPILE_NETWORK_ACCOUNT_ID, pinned: env.UNIPILE_ACCOUNT_ID };
+  try {
+    env.UNIPILE_NETWORK_ACCOUNT_ID = "acc_owner";
+    env.UNIPILE_ACCOUNT_ID = "acc_research";
+    const u = unipileBalanceFrom(TWO, 12, null, { networkRequestsToday: 4, warmPathChecks: { used: 3, limit: 10 } });
+    check(
+      "unipile card: '12 of ~100 LinkedIn requests today (research account) · 4 on your account · 3 of 10 warm-path checks'",
+      u.summary === "12 of ~100 LinkedIn requests today (research account) · 4 on your account · 3 of 10 warm-path checks" && validBalance(u) && !JSON.stringify(u).includes("Owner Person"),
+      u.summary,
+    );
+    check("unipile card: the meter is the research account's share only", Math.abs((u.usedShare ?? 0) - 0.12) < 1e-9);
+    const rows = unipileSplit(u);
+    check(
+      "unipile card: shown as three rows (research account, your account, warm-path checks)",
+      rows?.map((r) => `${r.label}: ${r.value}`).join(" | ") === "Research account: 12 of ~100 requests today | Your account: 4 requests today | Warm-path checks: 3 of 10 today",
+      rows,
+    );
+    const down = unipileBalanceFrom(null, 9, "Could not reach the provider.", { networkRequestsToday: 1, warmPathChecks: { used: 0, limit: 0 } });
+    check("unipile card: Unipile unreachable still splits the ledger's counts; a zero limit reads Paused", unipileSplit(down)?.map((r) => r.value).join(" | ") === "9 of ~100 requests today | 1 request today | Paused", unipileSplit(down));
+    delete env.UNIPILE_NETWORK_ACCOUNT_ID;
+    const single = unipileBalanceFrom(UNIPILE_OK, 12, null, { networkRequestsToday: 4, warmPathChecks: { used: 3, limit: 10 } });
+    check("unipile card: without your account set up, the plain line and no split", single.summary === "12 of ~100 LinkedIn requests today" && unipileSplit(single) === null);
+    check("unipile card: only Unipile's card is ever split", unipileSplit({ provider: "hunter", numbers: { networkRequestsToday: 1, linkedinRequestsToday: 1 } }) === null);
+  } finally {
+    if (before.network === undefined) delete env.UNIPILE_NETWORK_ACCOUNT_ID;
+    else env.UNIPILE_NETWORK_ACCOUNT_ID = before.network;
+    if (before.pinned === undefined) delete env.UNIPILE_ACCOUNT_ID;
+    else env.UNIPILE_ACCOUNT_ID = before.pinned;
+  }
+  check(
+    "calls on your account in a window: the network-* operations of Unipile only",
+    ownAccountCalls([
+      { provider: "unipile", operation: "profile", calls: 7 },
+      { provider: "unipile", operation: "network-profile", calls: 7 },
+      { provider: "unipile", operation: "network-search", calls: 4 },
+      { provider: "unipile", operation: "network-me", calls: 1 },
+      { provider: "twitterapi", operation: "network-like", calls: 50 },
+    ]) === 12,
+  );
+
+  // --- the new rows through GET /api/usage: per request, a run's cost, per lead, the daily chart
+  const run = `usagewarm-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+  const op = (name: string) => `${run}:${name}`;
+  const T = Date.now() - 2 * 86_400_000;
+  const at = (ms: number) => new Date(T + ms).toISOString();
+  const day = at(0).slice(0, 10);
+  let leadId: string | null = null;
+  let runId: string | null = null;
+  try {
+    const [lead] = await query<{ id: string }>("insert into le_leads (linkedin_url, linkedin_slug, name, company_name) values ($1, $2, $3, $4) returning id", [
+      `https://www.linkedin.com/in/${run}`,
+      run,
+      `Warm Rows ${run}`,
+      "Usage Warm Test Co",
+    ]);
+    leadId = lead.id;
+    const add = (provider: string, operation: string, units: Record<string, number>, cost: number | null, basis: string, ms: number, when: number, ok = true) =>
+      query(
+        `insert into le_usage (lead_id, lead_name, provider, operation, units, cost_usd, cost_basis, ok, ms, created_at)
+         values ($1::uuid, $2, $3, $4, $5::jsonb, $6::numeric, $7, $8, $9::integer, $10::timestamptz)`,
+        [leadId, `Warm Rows ${run}`, provider, operation, JSON.stringify(units), cost, basis, ok, ms, at(when)],
+      );
+    const [r] = await query<{ id: string }>("insert into le_run_starts (lead_id, kind, created_at) values ($1::uuid, 'research', $2::timestamptz) returning id", [leadId, at(0)]);
+    runId = r.id;
+    // A research run: gather, then warm paths alongside the rest (X follows and your LinkedIn account).
+    await add("anthropic", op("messages.parse"), { inputTokens: 20_000, outputTokens: 2_000 }, 0.003, "estimated", 9_000, 20_000);
+    await add("twitterapi", op("user-info"), { requests: 1, credits: 18, items: 1 }, 0.00018, "estimated", 400, 16_000);
+    await add("twitterapi", op("followings"), { requests: 1, credits: 200, items: 200 }, 0.002, "estimated", 600, 17_000);
+    await add("twitterapi", op("followings"), { requests: 1, credits: 360, items: 180 }, 0.0036, "estimated", 1_000, 18_000);
+    await add("twitterapi", op("followers-ids"), { requests: 1, credits: 1_500, items: 1_500 }, 0.015, "estimated", 2_600, 19_000);
+    await add("twitterapi", op("follow-check"), { requests: 1 }, null, "unknown", 300, 21_000, false);
+    await add("unipile", op("network-profile"), { requests: 1 }, 0, "free", 800, 18_500);
+    await add("unipile", op("network-search"), { requests: 1 }, 0, "free", 2_100, 21_500);
+    await query("insert into le_events (lead_id, type, message, created_at) values ($1::uuid, 'done', $2, $3::timestamptz)", [leadId, "Research done in 70s: 30 findings, 2 angles", at(70_000)]);
+
+    const res = await usageRoute.GET(request("/api/usage?window=7d"));
+    const body = await jsonOf<UsageResponse>(res);
+    const ops = (body?.operations ?? []).filter((o) => o.operation.startsWith(`${run}:`));
+    const followings = ops.find((o) => o.operation === op("followings"));
+    check("per request: twitterapi.io operations with median, 95th percentile and estimated cost", followings?.provider === "twitterapi" && followings.calls === 2 && followings.medianMs === 800 && followings.p95Ms === 980 && followings.totalCostUsd === 0.0056 && followings.avgCostUsd === 0.0028 && followings.costEstimated === true, followings);
+    const failedCheck = ops.find((o) => o.operation === op("follow-check"));
+    check("per request: a failed follow check counts as failed, with no cost", failedCheck?.failed === 1 && failedCheck.pricedCalls === 0 && failedCheck.avgCostUsd === null, failedCheck);
+    check("per request: your account's operations are listed with their times, free", ops.filter((o) => o.provider === "unipile").map((o) => `${o.operation.split(":")[1]} ${o.medianMs} ${o.totalCostUsd}`).sort().join() === "network-profile 800 0,network-search 2100 0", ops.filter((o) => o.provider === "unipile"));
+    check("per request: calls on your account in the window", ownAccountCalls(ops.map((o) => ({ ...o, operation: o.operation.split(":")[1] }))) === 2);
+    const mine = body?.leads.find((l) => l.leadId === leadId);
+    const cell = mine?.byProvider.twitterapi;
+    check("per lead: a twitterapi.io column with cost and credits", cell?.calls === 5 && Math.abs((cell.costUsd ?? 0) - 0.02078) < 1e-9 && cell.units.credits === 2_078 && mainUnit("twitterapi", cell.units) === "2.1K credits", cell);
+    check("per lead: the total includes the X rows; your account's requests are counted under Unipile", Math.abs((mine?.totalCostUsd ?? 0) - 0.02378) < 1e-9 && mine?.byProvider.unipile?.units.requests === 2, mine);
+    const mineRun = body?.runs.find((x) => String(x.id) === runId);
+    check("runs: the run's cost and calls include its warm-path rows", mineRun?.outcome === "done" && mineRun.calls === 8 && mineRun.failedCalls === 1 && Math.abs((mineRun.costUsd ?? 0) - 0.02378) < 1e-9 && mineRun.costEstimated === true, mineRun);
+    const spent = body?.daily.find((d) => d.day === day);
+    check("daily chart: the day's twitterapi.io spend is there, to be folded into Other", (spent?.byProvider.twitterapi ?? 0) >= 0.02078 - 1e-9 && otherLabels(Object.keys(spent?.byProvider ?? {}) as (typeof USAGE_PROVIDERS)[number][]).includes("twitterapi.io"), spent);
+    const tw = body?.summary.providers.find((x) => x.provider === "twitterapi");
+    check("summary: the twitterapi.io card's window totals (calls, failures, credits, estimated)", (tw?.calls ?? 0) >= 5 && (tw?.failed ?? 0) >= 1 && (tw?.units.credits ?? 0) >= 2_078 && tw?.costEstimated === true, tw);
+    const calls = await jsonOf<CallsResponse>(await callsRoute.GET(request(`/api/usage/calls?window=7d&sort=costliest&provider=twitterapi&operation=${encodeURIComponent(op("followers-ids"))}`)));
+    check("calls: the list filters to a twitterapi.io operation", calls?.total === 1 && calls.calls[0].costUsd === 0.015 && calls.calls[0].units.items === 1_500 && calls.calls[0].costBasis === "estimated", calls?.calls[0]);
+  } finally {
+    try {
+      await query("delete from le_usage where operation like $1", [`${run}:%`]);
+      if (runId) await query("delete from le_run_starts where id = $1::bigint", [runId]);
+      if (leadId) await query("delete from le_leads where id = $1::uuid and linkedin_slug = $2", [leadId, run]);
+      const [{ n }] = await query<{ n: string }>(
+        "select (select count(*) from le_usage where operation like $1) + (select count(*) from le_leads where linkedin_slug = $2) + (select count(*) from le_run_starts where lead_id = $3::uuid) as n",
+        [`${run}:%`, run, leadId ?? randomUUID()],
+      );
+      check("cleanup: no warm-path test rows, run or lead left", Number(n) === 0, n);
+    } catch (err) {
+      check("cleanup", false, err instanceof Error ? err.message.slice(0, 160) : "error");
+    }
+  }
+}
+
 // ------------------------------------------------------------------ live (opt-in)
 
 async function liveBalances(): Promise<void> {
@@ -881,6 +1026,7 @@ async function main(): Promise<void> {
     await testRoutes();
     await testQueries();
     await testBalances();
+    await testWarmPathRows();
     if (process.argv.includes("--live")) await liveBalances();
   } finally {
     restoreEnv();

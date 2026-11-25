@@ -7,6 +7,7 @@ import { hubStatus } from "./huggingface";
 import { hubspotStatus } from "./hubspot";
 import { hunterStatus } from "./hunter";
 import { linkedinStatus } from "./linkedin";
+import { xGraphStatus } from "./xgraph";
 import { xStatus } from "./xsearch";
 
 /** One row per integration for the Settings page. Never throws. */
@@ -20,6 +21,7 @@ export function providerStatuses(): ProviderStatus[] {
     ["huggingface", hubStatus],
     ["abstract", abstractStatus],
     ["hubspot", hubspotStatus],
+    ["twitterapi", xGraphStatus],
   ];
   return fns.map(([id, fn]) => {
     try {

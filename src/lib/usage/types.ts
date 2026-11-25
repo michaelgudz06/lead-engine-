@@ -14,6 +14,7 @@ export const USAGE_PROVIDERS = [
   "huggingface",
   "abstract",
   "hubspot",
+  "twitterapi",
 ] as const;
 export type UsageProvider = (typeof USAGE_PROVIDERS)[number];
 
@@ -28,6 +29,7 @@ export const USAGE_PROVIDER_LABELS: Record<UsageProvider, string> = {
   huggingface: "Hugging Face",
   abstract: "Abstract inspect",
   hubspot: "HubSpot",
+  twitterapi: "twitterapi.io (X follows)",
 };
 
 /**
@@ -35,12 +37,13 @@ export const USAGE_PROVIDER_LABELS: Record<UsageProvider, string> = {
  * Usage tab can label and sum them.
  * - anthropic: inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens
  * - exa: searches, contents, results
- * - unipile: requests
+ * - unipile: requests (operations network-* are the owner's own account, for warm paths)
  * - apify: runs, items
  * - apollo: credits
  * - hunter: lookups, credits (finder: 1 when an email was found; Domain Search: 1; verifier: 0.5)
  * - openrouter: requests, xPosts, xProfiles, promptTokens, completionTokens
  * - huggingface, abstract, hubspot: requests
+ * - twitterapi: requests, credits (estimated from the credit table), items (accounts or ids returned)
  */
 export type UsageUnits = Record<string, number>;
 

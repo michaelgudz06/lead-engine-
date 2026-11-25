@@ -28,6 +28,12 @@ export const KEYS = [
   "RUN_LIMIT_PER_DAY",
   "IMPORT_LIMIT_PER_DAY",
   "HUNTER_CREDITS_PER_DAY",
+  // Warm paths: X follows through twitterapi.io, and the owner's own LinkedIn on Unipile (step 2,
+  // off until set). Both daily budgets are whole numbers; 0 pauses that source.
+  "TWITTERAPI_IO_KEY",
+  "UNIPILE_NETWORK_ACCOUNT_ID",
+  "WARM_PATH_LINKEDIN_CHECKS_PER_DAY",
+  "WARM_PATH_X_USD_PER_DAY",
   "NEXT_PUBLIC_POSTHOG_KEY",
   "NEXT_PUBLIC_POSTHOG_HOST",
 ] as const;

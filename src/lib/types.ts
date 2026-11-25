@@ -3,6 +3,7 @@
  * Database columns are snake_case; these types are camelCase. The repo layer
  * (src/lib/repo) is the only place that maps between them.
  */
+import type { WarmPathSummary, WarmPaths } from "./paths/types";
 
 /**
  * "unqualified" is last and apart from the rest: the lead stays in the database (a re-import
@@ -275,6 +276,8 @@ export interface Lead {
   approach: Approach | null;
   /** Running totals, e.g. { claudeInputTokens, claudeOutputTokens, xPosts }. */
   usage: Record<string, number>;
+  /** The best Strong or Medium warm path, for the list chips; null when there is none (src/lib/paths/types.ts). */
+  warmPath: WarmPathSummary | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -312,6 +315,14 @@ export interface Settings {
   /** Plain-English rules. Findings that break one stay out of the brief. */
   criteria: string[];
   followUpDays: number;
+  /**
+   * The owner's public usernames for warm paths ("" when not given): their X handle (without "@",
+   * [A-Za-z0-9_]{1,15}), Instagram handle ([A-Za-z0-9._]{1,30}, only shows an Instagram row) and
+   * LinkedIn profile URL (their roles and schools are read from it). Never a list or a token.
+   */
+  xHandle: string;
+  instagramHandle: string;
+  linkedinUrl: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -319,6 +330,9 @@ export const DEFAULT_SETTINGS: Settings = {
   senderEmail: "",
   calendlyUrl: "",
   signature: "",
+  xHandle: "",
+  instagramHandle: "",
+  linkedinUrl: "",
   criteria: [
     "Keep to professional signals. Leave out family, health, relationships, religion, politics and home life.",
     "Prefer the last 12 months. Older items only for career history.",
@@ -336,9 +350,10 @@ export interface ProviderStatus {
   detail: string;
 }
 
-/** Shape returned by GET /api/leads/[id]. */
+/** Shape returned by GET /api/leads/[id]. paths: the warm-paths panel (null when there is nothing to show yet). */
 export interface LeadDetail {
   lead: Lead;
   findings: Finding[];
   events: LeadEvent[];
+  paths?: WarmPaths | null;
 }

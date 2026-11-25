@@ -162,6 +162,7 @@ function fakeLead(overrides: Partial<Lead> = {}): Lead {
     angles: [],
     approach: null,
     usage: {},
+    warmPath: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...overrides,

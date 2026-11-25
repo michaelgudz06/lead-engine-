@@ -4,16 +4,21 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { daysFromNow, track } from "@/lib/analytics";
-import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, rerunResearch, restoreLeads, steerLead, unqualifyLeads, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
+import { ApiError, deleteLead, errorMessage, getLead, getStatusCached, pushToHubspot, rerunResearch, restoreLeads, setInstagramHandle, steerLead, unqualifyLeads, updateLead, type LeadPatch, type StatusResponse } from "@/lib/api-client";
+import { cleanInstagramHandle, isReservedInstagramPath } from "@/lib/paths/links";
+import type { WarmPaths } from "@/lib/paths/types";
+import { cleanXHandle } from "@/lib/research/util";
 import { justMarked } from "@/lib/qualify";
 import { STAGE_LABELS, UNQUALIFIED_REASONS, type Finding, type Lead, type LeadDetail, type Stage, type UnqualifiedReasonKey } from "@/lib/types";
 import { formatDate, formatDateTime, fromDateInput, hostOf, isRunning, leadName, safeUrl, settleLostRun, titleAtCompany, toDateInput } from "@/components/format";
 import { AnglesSection } from "@/components/lead/angles";
 import { AddLinkedinCard, EmailControl, LinkedinForm, NoLinkedinChip, emailKindText } from "@/components/lead/contact";
+import { HandleField } from "@/components/lead/handles";
 import { Panel } from "@/components/lead/panel";
 import { RerunPanel } from "@/components/lead/rerun";
 import { leadAction } from "@/components/lead/status";
 import { ReasonChips, UnqualifyDialog, reasonLabel, unqualifiedSummary } from "@/components/lead/unqualify";
+import { WarmPathsPanel, warmPathHeadline } from "@/components/lead/warm-paths";
 import { ActivitySection, BriefSection, CompanySection, FindingsSection, PendingPanel, ResearchProgress } from "@/components/lead/sections";
 import { Button, Chip, ConfirmDialog, ErrorState, ExternalLink, Label, Modal, Notice, Skeleton, StageSelect } from "@/components/ui";
 import { useLoad } from "@/components/use-load";
@@ -24,8 +29,9 @@ export default function LeadPage() {
   const params = useParams<{ id: string }>();
   const id = typeof params?.id === "string" ? params.id : "";
 
-  // Poll every 2 seconds while research runs so progress shows live. A lost run
-  // (see isRunning) never finishes, so polling stops for it.
+  // Poll every 2 seconds while research or a warm-path check runs, so progress shows live. A lost
+  // run (see isRunning) never finishes, so polling stops for it; a check started more than 90
+  // seconds ago comes back as failed, so polling stops for that too.
   const { data, error, loading, reload, setData } = useLoad<Loaded>(
     async () => {
       try {
@@ -35,7 +41,7 @@ export default function LeadPage() {
         throw err;
       }
     },
-    (d) => (d && d !== "missing" && isRunning(d.lead) ? 2000 : null),
+    (d) => (d && d !== "missing" && (isRunning(d.lead) || d.paths?.status === "running") ? 2000 : null),
   );
 
   if (loading) return <PageSkeleton />;
@@ -47,11 +53,25 @@ export default function LeadPage() {
   if (!data) return <ErrorState title="This lead did not load" message={error ?? "Please try again."} onRetry={reload} />;
 
   const setLead = (lead: Lead) => setData((prev) => (prev && prev !== "missing" ? { ...prev, lead } : prev));
-  return <LeadView detail={data} refreshError={error} reload={reload} setLead={setLead} />;
+  const setPaths = (paths: WarmPaths | null) => setData((prev) => (prev && prev !== "missing" ? { ...prev, paths } : prev));
+  return <LeadView detail={data} refreshError={error} reload={reload} setLead={setLead} setPaths={setPaths} />;
 }
 
-function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetail; refreshError: string | null; reload: () => Promise<void>; setLead: (lead: Lead) => void }) {
+function LeadView({
+  detail,
+  refreshError,
+  reload,
+  setLead,
+  setPaths,
+}: {
+  detail: LeadDetail;
+  refreshError: string | null;
+  reload: () => Promise<void>;
+  setLead: (lead: Lead) => void;
+  setPaths: (paths: WarmPaths | null) => void;
+}) {
   const { lead, findings, events } = detail;
+  const paths = detail.paths ?? null;
   const router = useRouter();
   const running = isRunning(lead);
   // A run that never finished (server time limit or restart) is a failed run: it can be retried.
@@ -326,6 +346,8 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
   const hasResearch = Boolean(lead.brief || lead.companyPicture || lead.angles.length > 0);
   const emailKind = emailKindText(lead, "short");
   const unqualifiedNote = unqualifiedSummary(lead);
+  // The header points to the best way in, once nothing is running: a direct tie, or a Strong or Medium path.
+  const warmHeadline = running ? null : warmPathHeadline(paths);
 
   return (
     <>
@@ -360,6 +382,11 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
             )}
             {xHandle && <ExternalLink href={`https://x.com/${encodeURIComponent(xHandle)}`}>@{xHandle} ↗</ExternalLink>}
             {companyUrl && <ExternalLink href={companyUrl}>{hostOf(companyUrl)} ↗</ExternalLink>}
+            {warmHeadline && (
+              <a href="#warm-paths" className="rounded text-ink underline decoration-hairline underline-offset-[3px] hover:decoration-ink">
+                {warmHeadline} <span aria-hidden>↓</span>
+              </a>
+            )}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -433,7 +460,7 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
             <div className="card px-5 py-8 text-center">
               <h2 className="font-serif text-[21px]">No research yet</h2>
               <p className="mx-auto mt-1.5 max-w-md text-quiet">
-                Run research to get a sourced brief, a picture of the company and drafted outreach.
+                Run research to get a sourced brief, a picture of the company, people who can introduce you and drafted outreach.
                 {!lead.linkedinUrl && " It starts by looking for their LinkedIn profile."}
               </p>
               <div className="mt-4">
@@ -445,6 +472,10 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
           )}
 
           {lead.brief ? <BriefSection brief={lead.brief} findings={findingMap} /> : running && <PendingPanel title="Brief" lines={5} />}
+          {/* Not before the first research run (a typed Instagram handle makes a row, not a panel), unless a check ran or runs. */}
+          {paths && (lead.researchFinishedAt || running || paths.checkedAt || paths.status === "running") && (
+            <WarmPathsPanel lead={lead} paths={paths} researchRunning={running} hasAngles={lead.angles.length > 0} onPaths={setPaths} onActivity={() => void reload()} />
+          )}
           {lead.companyPicture ? <CompanySection company={lead.companyPicture} findings={findingMap} /> : running && <PendingPanel title="Company picture" lines={3} />}
           {lead.angles.length > 0 ? (
             <AnglesSection lead={lead} findings={findingMap} locked={running} onLeadChange={onAnglesChange} onActivity={() => void reload()} />
@@ -496,6 +527,47 @@ function LeadView({ detail, refreshError, reload, setLead }: { detail: LeadDetai
                   )}
                 </div>
               )}
+              <HandleField
+                id="lead-x-handle"
+                label="X handle"
+                initial={xHandle ?? ""}
+                placeholder="username"
+                maxLength={120}
+                clean={cleanXHandle}
+                invalid={() => "That does not look like an X handle: letters, digits and _, up to 15."}
+                onSave={async (handle) => {
+                  try {
+                    setLead(await updateLead(lead.id, { xHandle: handle }));
+                    // The warm paths follow the handle: bring them in.
+                    void reload();
+                    return null;
+                  } catch (err) {
+                    return errorMessage(err);
+                  }
+                }}
+              />
+              <HandleField
+                id="lead-instagram-handle"
+                label="Instagram handle"
+                initial={paths?.instagram?.handle ?? ""}
+                placeholder="username"
+                maxLength={120}
+                note={paths?.instagram?.source === "profile" ? "From their LinkedIn profile. Only used as a link." : "Only used as a link. Nothing is read from Instagram."}
+                clean={cleanInstagramHandle}
+                invalid={(value) =>
+                  isReservedInstagramPath(value) ? "That is an Instagram page, not a profile. Enter their username, such as @ada.kim." : "Enter their Instagram username: letters, digits, dots and _, up to 30."
+                }
+                onSave={async (handle) => {
+                  try {
+                    const next = await setInstagramHandle(lead.id, handle);
+                    if (next) setPaths(next);
+                    else void reload();
+                    return null;
+                  } catch (err) {
+                    return errorMessage(err);
+                  }
+                }}
+              />
               <SavedField
                 id="owner"
                 label="Owner"

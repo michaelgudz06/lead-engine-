@@ -206,7 +206,7 @@ export function UsageDashboard({ initialWindow }: { initialWindow: UsageWindow }
           </div>
           <p className="text-[12.5px] leading-relaxed text-quiet">
             <Est className="mr-1 align-[1px]" /> marks a cost worked out from usage and the price table (prices as of {data.pricesAsOf}), not
-            billed by the provider: Claude tokens, Apify items, and older rows filled in from before the ledger. Exa and OpenRouter report
+            billed by the provider: Claude tokens, Apify items, twitterapi.io credits, and older rows filled in from before the ledger. Exa and OpenRouter report
             their own costs. Durations are measured by this app around each call. Days are UTC. Live balances are checked at most once a
             minute, or every 30 seconds with Refresh balances, and are never written to the ledger.
           </p>
@@ -300,6 +300,7 @@ function Panel({
         <ProviderCards
           window={data.window}
           totals={summary.providers}
+          operations={data.operations}
           balances={balances.data?.balances ?? null}
           balancesLoading={!balances.data && !balances.error}
           balancesError={balances.error}
